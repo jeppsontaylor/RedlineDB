@@ -1,0 +1,8 @@
+[package]
+name = "redlinedb-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+redlinedb-sql = { path = "../sql" }
+tempfile = "3"

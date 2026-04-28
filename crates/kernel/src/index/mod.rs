@@ -1,0 +1,1403 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex};
+
+use smallvec::SmallVec;
+
+use crate::format::bytes::{read_u16, read_u32, read_u64, write_u16, write_u32, write_u64};
+use crate::format::{
+    PAGE_HEADER_LEN, Page, PageGeneration, PageId, PageKind, RelId, SLOT_LEN, TuplePtr,
+};
+use crate::storage::BufferPool;
+use crate::wal::{WalCoordinator, WalPayload, WalRecordKind};
+use crate::{Error, Result};
+
+pub const INDEX_SPECIAL_LEN: usize = 256;
+const INDEX_MAGIC: u32 = 0x5244_4958; // "RDIX"
+const INDEX_VERSION: u16 = 1;
+const PAGE_META_KIND: u8 = 1;
+const PAGE_LEAF_KIND: u8 = 2;
+const PAGE_INTERNAL_KIND: u8 = 3;
+const META_ROOT_PAGE_OFF: usize = 16;
+const META_ROOT_LEVEL_OFF: usize = 24;
+const META_UNIQUENESS_OFF: usize = 26;
+const META_HIGH_KEY_LEN_OFF: usize = 32;
+const META_HIGH_KEY_OFF: usize = 34;
+const PAGE_LEVEL_OFF: usize = 8;
+const PAGE_INDEX_ID_OFF: usize = 10;
+const PAGE_LEFT_OFF: usize = 18;
+const PAGE_RIGHT_OFF: usize = 26;
+const PAGE_HIGH_KEY_LEN_OFF: usize = 34;
+const PAGE_HIGH_KEY_OFF: usize = 36;
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IndexId(pub u64);
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexUniqueness {
+    NonUnique = 0,
+    Unique = 1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexDescriptor {
+    pub index_id: IndexId,
+    pub rel_id: RelId,
+    pub uniqueness: IndexUniqueness,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IndexRowRef {
+    pub row_id: crate::format::RowId,
+    pub tuple: TuplePtr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyBuf {
+    bytes: SmallVec<[u8; 96]>,
+    logical_len: usize,
+}
+
+impl KeyBuf {
+    pub fn new() -> Self {
+        Self {
+            bytes: SmallVec::new(),
+            logical_len: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.bytes.clear();
+        self.logical_len = 0;
+    }
+
+    pub fn extend_logical(&mut self, key: &[u8]) {
+        self.logical_len = key.len();
+        self.bytes.extend_from_slice(key);
+    }
+
+    pub fn append_row_ref_suffix(&mut self, row: IndexRowRef) {
+        self.bytes.extend_from_slice(&row.row_id.0.to_be_bytes());
+        self.bytes
+            .extend_from_slice(&row.tuple.page_id.0.to_be_bytes());
+        self.bytes.extend_from_slice(&row.tuple.slot.to_be_bytes());
+        self.bytes
+            .extend_from_slice(&row.tuple.generation.0.to_be_bytes());
+    }
+
+    pub fn logical_len(&self) -> usize {
+        self.logical_len
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexValidationReport {
+    pub pages_seen: usize,
+    pub leaf_pages: usize,
+    pub internal_pages: usize,
+    pub errors: Vec<&'static str>,
+}
+
+#[derive(Debug, Default)]
+pub struct UniqueKeyLockTable {
+    shards: Vec<Mutex<HashMap<Vec<u8>, UniqueKeyLockState>>>,
+    cvars: Vec<Condvar>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct UniqueKeyLockState {
+    owner: Option<u64>,
+    depth: usize,
+}
+
+pub struct UniqueKeyGuard<'a> {
+    table: &'a UniqueKeyLockTable,
+    shard: usize,
+    key: Vec<u8>,
+    owner: u64,
+}
+
+impl UniqueKeyLockTable {
+    pub fn new(shards: usize) -> Self {
+        let shards = shards.max(1);
+        let mut locks = Vec::with_capacity(shards);
+        let mut cvars = Vec::with_capacity(shards);
+        for _ in 0..shards {
+            locks.push(Mutex::new(HashMap::new()));
+            cvars.push(Condvar::new());
+        }
+        Self {
+            shards: locks,
+            cvars,
+        }
+    }
+
+    pub fn lock(&self, key: &[u8], owner: u64) -> Result<UniqueKeyGuard<'_>> {
+        let shard = self.shard(key);
+        let mut map = self.shards[shard]
+            .lock()
+            .map_err(|_| Error::CorruptPage("unique lock shard poisoned"))?;
+        let key = key.to_vec();
+        loop {
+            let state = map.entry(key.clone()).or_default();
+            match state.owner {
+                None => {
+                    state.owner = Some(owner);
+                    state.depth = 1;
+                    return Ok(UniqueKeyGuard {
+                        table: self,
+                        shard,
+                        key,
+                        owner,
+                    });
+                }
+                Some(current) if current == owner => {
+                    state.depth += 1;
+                    return Ok(UniqueKeyGuard {
+                        table: self,
+                        shard,
+                        key,
+                        owner,
+                    });
+                }
+                Some(_) => {
+                    map = self.cvars[shard]
+                        .wait(map)
+                        .map_err(|_| Error::CorruptPage("unique lock wait poisoned"))?;
+                }
+            }
+        }
+    }
+
+    fn unlock(&self, shard: usize, key: Vec<u8>, owner: u64) {
+        if let Ok(mut map) = self.shards[shard].lock() {
+            if let Some(state) = map.get_mut(&key) {
+                if state.owner == Some(owner) {
+                    state.depth = state.depth.saturating_sub(1);
+                    if state.depth == 0 {
+                        map.remove(&key);
+                    }
+                }
+            }
+            self.cvars[shard].notify_all();
+        }
+    }
+
+    fn shard(&self, key: &[u8]) -> usize {
+        let mut hash = 0_u64;
+        for byte in key {
+            hash = hash.wrapping_mul(131).wrapping_add(*byte as u64);
+        }
+        hash as usize % self.shards.len().max(1)
+    }
+}
+
+impl Drop for UniqueKeyGuard<'_> {
+    fn drop(&mut self) {
+        self.table
+            .unlock(self.shard, std::mem::take(&mut self.key), self.owner);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MetaHeader {
+    index_id: IndexId,
+    root_page_id: PageId,
+    root_level: u16,
+    uniqueness: IndexUniqueness,
+}
+
+#[derive(Clone, Debug)]
+struct PageHeader {
+    kind: u8,
+    level: u16,
+    index_id: IndexId,
+    left: Option<PageId>,
+    right: Option<PageId>,
+    high_key: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct IndexInner {
+    buffer: Arc<BufferPool>,
+    meta_page_id: PageId,
+    desc: Mutex<IndexDescriptor>,
+    unique_locks: Arc<UniqueKeyLockTable>,
+    wal: Option<Arc<WalCoordinator>>,
+    structure_lock: Mutex<()>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BtreeIndex {
+    inner: Arc<IndexInner>,
+}
+
+impl BtreeIndex {
+    pub fn create(buffer: Arc<BufferPool>, desc: IndexDescriptor) -> Result<Self> {
+        Self::create_with_wal(buffer, desc, None)
+    }
+
+    pub fn create_with_wal(
+        buffer: Arc<BufferPool>,
+        desc: IndexDescriptor,
+        wal: Option<Arc<WalCoordinator>>,
+    ) -> Result<Self> {
+        let meta_guard = buffer.allocate(PageKind::BtreeMeta, desc.rel_id)?;
+        let root_guard = buffer.allocate(PageKind::BtreeLeaf, desc.rel_id)?;
+
+        meta_guard.with_page_mut(|page| {
+            page.reinitialize_with_special(
+                PageKind::BtreeMeta,
+                meta_guard.page_id(),
+                desc.rel_id,
+                PageGeneration::ONE,
+                INDEX_SPECIAL_LEN,
+            )?;
+            Self::write_meta(
+                page,
+                &MetaHeader {
+                    index_id: desc.index_id,
+                    root_page_id: root_guard.page_id(),
+                    root_level: 0,
+                    uniqueness: desc.uniqueness,
+                },
+            )
+        })?;
+        meta_guard.mark_dirty(crate::format::Lsn::ZERO)?;
+        root_guard.with_page_mut(|page| {
+            page.reinitialize_with_special(
+                PageKind::BtreeLeaf,
+                root_guard.page_id(),
+                desc.rel_id,
+                PageGeneration::ONE,
+                INDEX_SPECIAL_LEN,
+            )?;
+            Self::write_page_header(
+                page,
+                &PageHeader {
+                    kind: PAGE_LEAF_KIND,
+                    level: 0,
+                    index_id: desc.index_id,
+                    left: None,
+                    right: None,
+                    high_key: Vec::new(),
+                },
+            )
+        })?;
+        root_guard.mark_dirty(crate::format::Lsn::ZERO)?;
+
+        Ok(Self {
+            inner: Arc::new(IndexInner {
+                buffer,
+                meta_page_id: meta_guard.page_id(),
+                desc: Mutex::new(desc),
+                unique_locks: Arc::new(UniqueKeyLockTable::new(128)),
+                wal,
+                structure_lock: Mutex::new(()),
+            }),
+        })
+    }
+
+    pub fn open(
+        buffer: Arc<BufferPool>,
+        meta_page_id: PageId,
+        desc: IndexDescriptor,
+    ) -> Result<Self> {
+        Self::open_with_wal(buffer, meta_page_id, desc, None)
+    }
+
+    pub fn open_with_wal(
+        buffer: Arc<BufferPool>,
+        meta_page_id: PageId,
+        desc: IndexDescriptor,
+        wal: Option<Arc<WalCoordinator>>,
+    ) -> Result<Self> {
+        let index = Self {
+            inner: Arc::new(IndexInner {
+                buffer,
+                meta_page_id,
+                desc: Mutex::new(desc),
+                unique_locks: Arc::new(UniqueKeyLockTable::new(128)),
+                wal,
+                structure_lock: Mutex::new(()),
+            }),
+        };
+        index.validate()?;
+        Ok(index)
+    }
+
+    pub fn insert(&self, logical_key: &[u8], row: IndexRowRef) -> Result<()> {
+        self.insert_tx(crate::format::TxId::ZERO, logical_key, row)
+    }
+
+    pub fn insert_tx(
+        &self,
+        tx_id: crate::format::TxId,
+        logical_key: &[u8],
+        row: IndexRowRef,
+    ) -> Result<()> {
+        let _structure = self
+            .inner
+            .structure_lock
+            .lock()
+            .map_err(|_| Error::CorruptPage("index structure mutex poisoned"))?;
+        let mut physical = KeyBuf::new();
+        physical.extend_logical(logical_key);
+        physical.append_row_ref_suffix(row);
+        loop {
+            let root = self.meta()?.root_page_id;
+            let path = self.find_leaf_path(root, logical_key)?;
+            let leaf_id = *path.last().ok_or(Error::CorruptPage("empty search path"))?;
+            let guard = self.inner.buffer.pin(leaf_id)?;
+            let mut page = guard.mutable_frame()?;
+            let page_ref = page
+                .page
+                .as_mut()
+                .ok_or(Error::CorruptPage("resident frame missing page"))?;
+            let header = Self::read_page_header(page_ref)?;
+            if header.kind != PAGE_LEAF_KIND {
+                return Err(Error::CorruptPage("expected leaf page"));
+            }
+            if !header.high_key.is_empty() && logical_key >= header.high_key.as_slice() {
+                continue;
+            }
+            let mut entries = self.read_entries(page_ref)?;
+            let candidate = Entry::Leaf {
+                logical_key: logical_key.to_vec(),
+                row,
+                physical: physical.as_slice().to_vec(),
+                dead: false,
+            };
+            match entries.binary_search_by(|entry| entry.compare(&candidate)) {
+                Ok(pos) => {
+                    if self.meta()?.uniqueness == IndexUniqueness::Unique {
+                        return Err(Error::WriteConflict);
+                    }
+                    entries.insert(pos, candidate);
+                }
+                Err(pos) => entries.insert(pos, candidate),
+            }
+            let body_capacity = page_ref
+                .as_bytes()
+                .len()
+                .saturating_sub(PAGE_HEADER_LEN + INDEX_SPECIAL_LEN);
+            let required = Self::encoded_entries_len(&entries) + entries.len() * SLOT_LEN;
+            if required > body_capacity {
+                drop(page);
+                let path = self.find_leaf_path(self.meta()?.root_page_id, logical_key)?;
+                let leaf_id = *path.last().ok_or(Error::CorruptPage("empty search path"))?;
+                self.split_leaf_and_insert(
+                    &path[..path.len().saturating_sub(1)],
+                    leaf_id,
+                    logical_key,
+                    row,
+                    physical.as_slice().to_vec(),
+                    tx_id,
+                )?;
+                return Ok(());
+            }
+            Self::rewrite_leaf(
+                page_ref,
+                self.descriptor().index_id,
+                &entries,
+                header.left,
+                header.right,
+                header.high_key,
+            )?;
+            drop(page);
+            guard.mark_dirty(crate::format::Lsn::ZERO)?;
+            self.record_page_image(leaf_id, tx_id)?;
+            return Ok(());
+        }
+    }
+
+    pub fn insert_unique(&self, owner: u64, logical_key: &[u8], row: IndexRowRef) -> Result<()> {
+        let _guard = self.lock_unique_key(owner, logical_key)?;
+        if !self.point_lookup(logical_key)?.is_empty() {
+            return Err(Error::WriteConflict);
+        }
+        self.insert(logical_key, row)
+    }
+
+    pub fn delete_mark(&self, logical_key: &[u8], row: IndexRowRef) -> Result<()> {
+        self.delete_mark_tx(crate::format::TxId::ZERO, logical_key, row)
+    }
+
+    pub fn delete_mark_tx(
+        &self,
+        tx_id: crate::format::TxId,
+        logical_key: &[u8],
+        row: IndexRowRef,
+    ) -> Result<()> {
+        let _structure = self
+            .inner
+            .structure_lock
+            .lock()
+            .map_err(|_| Error::CorruptPage("index structure mutex poisoned"))?;
+        let path = self.find_leaf_path(self.meta()?.root_page_id, logical_key)?;
+        let leaf_id = *path.last().ok_or(Error::CorruptPage("empty search path"))?;
+        let guard = self.inner.buffer.pin(leaf_id)?;
+        let mut page = guard.mutable_frame()?;
+        let page_ref = page
+            .page
+            .as_mut()
+            .ok_or(Error::CorruptPage("resident frame missing page"))?;
+        let header = Self::read_page_header(page_ref)?;
+        if header.kind != PAGE_LEAF_KIND {
+            return Err(Error::CorruptPage("expected leaf page"));
+        }
+        let mut entries = self.read_entries(page_ref)?;
+        let mut changed = false;
+        for entry in &mut entries {
+            if let Entry::Leaf {
+                logical_key: key,
+                row: entry_row,
+                dead,
+                ..
+            } = entry
+            {
+                if !*dead && key.as_slice() == logical_key && *entry_row == row {
+                    *dead = true;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if changed {
+            Self::rewrite_leaf(
+                page_ref,
+                self.descriptor().index_id,
+                &entries,
+                header.left,
+                header.right,
+                header.high_key,
+            )?;
+            drop(page);
+            guard.mark_dirty(crate::format::Lsn::ZERO)?;
+            self.record_page_image(leaf_id, tx_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn compact_leaf_page(&self, page_id: PageId) -> Result<()> {
+        let guard = self.inner.buffer.pin(page_id)?;
+        let mut page = guard.mutable_frame()?;
+        let page_ref = page
+            .page
+            .as_mut()
+            .ok_or(Error::CorruptPage("resident frame missing page"))?;
+        let header = Self::read_page_header(page_ref)?;
+        if header.kind != PAGE_LEAF_KIND {
+            return Err(Error::CorruptPage("expected leaf page"));
+        }
+        let entries = self.read_entries(page_ref)?;
+        let live: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| !entry.is_dead_leaf())
+            .collect();
+        if live.len() == self.read_entries(page_ref)?.len() {
+            return Ok(());
+        }
+        Self::rewrite_leaf(
+            page_ref,
+            self.descriptor().index_id,
+            &live,
+            header.left,
+            header.right,
+            header.high_key,
+        )?;
+        drop(page);
+        guard.mark_dirty(crate::format::Lsn::ZERO)?;
+        Ok(())
+    }
+
+    pub fn lock_unique_key(&self, owner: u64, logical_key: &[u8]) -> Result<UniqueKeyGuard<'_>> {
+        self.inner.unique_locks.lock(logical_key, owner)
+    }
+
+    pub fn redo_page_image(&self, page: Page) -> Result<()> {
+        self.inner.buffer.write_page_direct(&page)?;
+        let page_id = page.header()?.page_id;
+        if let Ok(guard) = self.inner.buffer.pin(page_id) {
+            guard.with_page_mut(|resident| {
+                *resident = page.clone();
+                Ok(())
+            })?;
+            guard.mark_dirty(page.header()?.page_lsn)?;
+        }
+        Ok(())
+    }
+
+    fn record_page_image(&self, page_id: PageId, tx_id: crate::format::TxId) -> Result<()> {
+        if tx_id == crate::format::TxId::ZERO {
+            return Ok(());
+        }
+        let Some(wal) = &self.inner.wal else {
+            return Ok(());
+        };
+        let guard = self.inner.buffer.pin(page_id)?;
+        let page = guard.with_page(|page| Ok(page.clone()))?;
+        let payload = WalPayload::PageImage {
+            page_id,
+            page_lsn: page.header()?.page_lsn,
+            page_bytes: page.as_bytes().to_vec(),
+        };
+        wal.append(WalRecordKind::PageImage, tx_id, payload.encode()?)?;
+        Ok(())
+    }
+
+    pub fn point_lookup(&self, logical_key: &[u8]) -> Result<Vec<IndexRowRef>> {
+        let mut page_id = self.meta()?.root_page_id;
+        loop {
+            page_id = self.find_leaf(page_id, logical_key)?;
+            let guard = self.inner.buffer.pin(page_id)?;
+            let next = guard.with_page(|page| {
+                let header = Self::read_page_header(page)?;
+                if !header.high_key.is_empty() && logical_key >= header.high_key.as_slice() {
+                    return Ok::<Option<Vec<IndexRowRef>>, Error>(None);
+                }
+                let mut out = Vec::new();
+                for entry in self.read_entries(page)? {
+                    if let Entry::Leaf {
+                        logical_key: key,
+                        row,
+                        dead,
+                        ..
+                    } = entry
+                    {
+                        if dead {
+                            continue;
+                        }
+                        if key.as_slice() == logical_key {
+                            out.push(row);
+                        } else if !out.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(out))
+            })?;
+            match next {
+                Some(rows) => return Ok(rows),
+                None => {
+                    let guard = self.inner.buffer.pin(page_id)?;
+                    let right = guard.with_page(|page| {
+                        let header = Self::read_page_header(page)?;
+                        Ok(header.right)
+                    })?;
+                    match right {
+                        Some(next_page) => page_id = next_page,
+                        None => return Ok(Vec::new()),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<IndexRowRef>> {
+        let mut out = Vec::new();
+        let mut leaf_id = self.find_leaf(self.meta()?.root_page_id, start)?;
+        loop {
+            let guard = self.inner.buffer.pin(leaf_id)?;
+            let next = guard.with_page(|page| {
+                let header = Self::read_page_header(page)?;
+                for entry in self.read_entries(page)? {
+                    if let Entry::Leaf {
+                        logical_key,
+                        row,
+                        dead,
+                        ..
+                    } = entry
+                    {
+                        if dead {
+                            continue;
+                        }
+                        if logical_key.as_slice() >= start && logical_key.as_slice() < end {
+                            out.push(row);
+                        }
+                    }
+                }
+                Ok(header.right)
+            })?;
+            match next {
+                Some(next_id) => {
+                    leaf_id = next_id;
+                }
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn validate(&self) -> Result<IndexValidationReport> {
+        let meta = self.meta()?;
+        let mut report = IndexValidationReport {
+            pages_seen: 0,
+            leaf_pages: 0,
+            internal_pages: 0,
+            errors: Vec::new(),
+        };
+        self.validate_page(meta.root_page_id, meta.root_level, &mut report)?;
+        Ok(report)
+    }
+
+    pub fn descriptor(&self) -> IndexDescriptor {
+        self.inner
+            .desc
+            .lock()
+            .expect("descriptor mutex poisoned")
+            .clone()
+    }
+
+    fn split_leaf_and_insert(
+        &self,
+        ancestors: &[PageId],
+        leaf_id: PageId,
+        logical_key: &[u8],
+        row: IndexRowRef,
+        physical: Vec<u8>,
+        tx_id: crate::format::TxId,
+    ) -> Result<()> {
+        let rel_id = self.descriptor().rel_id;
+        let index_id = self.descriptor().index_id;
+        let guard = self.inner.buffer.pin(leaf_id)?;
+        let (left_entries, right_entries, left_high, header) = guard.with_page(|page| {
+            let mut entries = self.read_entries(page)?;
+            entries.push(Entry::Leaf {
+                logical_key: logical_key.to_vec(),
+                row,
+                physical,
+                dead: false,
+            });
+            entries.sort_by(|a, b| a.compare(b));
+            let split = entries.len() / 2;
+            let right_entries = entries.split_off(split);
+            let left_high = right_entries
+                .first()
+                .and_then(|entry| entry.logical_key())
+                .unwrap_or_default()
+                .to_vec();
+            let header = Self::read_page_header(page)?;
+            Ok((entries, right_entries, left_high, header))
+        })?;
+        let right_guard = self.inner.buffer.allocate(PageKind::BtreeLeaf, rel_id)?;
+        guard.with_page_mut(|page| {
+            Self::rewrite_leaf(
+                page,
+                index_id,
+                &left_entries,
+                header.left,
+                Some(right_guard.page_id()),
+                left_high.clone(),
+            )
+        })?;
+        right_guard.with_page_mut(|right_page| {
+            right_page.reinitialize_with_special(
+                PageKind::BtreeLeaf,
+                right_guard.page_id(),
+                rel_id,
+                PageGeneration::ONE,
+                INDEX_SPECIAL_LEN,
+            )?;
+            Self::rewrite_leaf(
+                right_page,
+                index_id,
+                &right_entries,
+                Some(leaf_id),
+                header.right,
+                header.high_key.clone(),
+            )
+        })?;
+        guard.mark_dirty(crate::format::Lsn::ZERO)?;
+        right_guard.mark_dirty(crate::format::Lsn::ZERO)?;
+        self.record_page_image(leaf_id, tx_id)?;
+        self.record_page_image(right_guard.page_id(), tx_id)?;
+
+        self.propagate_split(
+            ancestors,
+            leaf_id,
+            right_guard.page_id(),
+            left_high,
+            1,
+            tx_id,
+        )?;
+        Ok(())
+    }
+
+    fn propagate_split(
+        &self,
+        ancestors: &[PageId],
+        left_page: PageId,
+        right_page: PageId,
+        separator: Vec<u8>,
+        mut left_level: u16,
+        tx_id: crate::format::TxId,
+    ) -> Result<()> {
+        let meta = self.meta()?;
+        let mut ancestors = ancestors.to_vec();
+        let mut current_left = left_page;
+        let mut current_right = right_page;
+        let mut current_separator = separator;
+
+        loop {
+            if let Some(parent_id) = ancestors.pop() {
+                let guard = self.inner.buffer.pin(parent_id)?;
+                let (header, mut entries) = guard.with_page(|page| {
+                    let header = Self::read_page_header(page)?;
+                    let entries = self.read_entries(page)?;
+                    Ok((header, entries))
+                })?;
+                if header.kind != PAGE_INTERNAL_KIND {
+                    return Err(Error::CorruptPage("expected internal page"));
+                }
+                let parent_level = header.level;
+                entries.push(Entry::Internal {
+                    separator: current_separator.clone(),
+                    child: current_right,
+                });
+                entries.sort_by(|a, b| a.compare(b));
+                let body_capacity = self.page_body_capacity(parent_id)?;
+                let required = Self::encoded_entries_len(&entries) + entries.len() * SLOT_LEN;
+                if required <= body_capacity {
+                    guard.with_page_mut(|page| {
+                        Self::rewrite_internal(
+                            page,
+                            meta.index_id,
+                            header.level,
+                            &entries,
+                            header.left,
+                            header.right,
+                            header.high_key.clone(),
+                        )
+                    })?;
+                    guard.mark_dirty(crate::format::Lsn::ZERO)?;
+                    self.record_page_image(parent_id, tx_id)?;
+                    return Ok(());
+                }
+
+                let split = entries.len() / 2;
+                let right_entries = entries.split_off(split);
+                let left_entries = entries;
+                let right_guard = self
+                    .inner
+                    .buffer
+                    .allocate(PageKind::BtreeInternal, self.descriptor().rel_id)?;
+                let right_left_child = match right_entries.first() {
+                    Some(Entry::Internal { child, .. }) => *child,
+                    _ => {
+                        return Err(Error::CorruptPage(
+                            "internal split produced empty right side",
+                        ));
+                    }
+                };
+                let right_separator = self.min_key_for_page(right_left_child)?;
+                guard.with_page_mut(|page| {
+                    Self::rewrite_internal(
+                        page,
+                        meta.index_id,
+                        parent_level,
+                        &left_entries,
+                        header.left,
+                        Some(right_guard.page_id()),
+                        right_separator.clone(),
+                    )
+                })?;
+                right_guard.with_page_mut(|page| {
+                    page.reinitialize_with_special(
+                        PageKind::BtreeInternal,
+                        right_guard.page_id(),
+                        self.descriptor().rel_id,
+                        PageGeneration::ONE,
+                        INDEX_SPECIAL_LEN,
+                    )?;
+                    Self::rewrite_internal(
+                        page,
+                        meta.index_id,
+                        parent_level,
+                        &right_entries,
+                        Some(right_left_child),
+                        header.right,
+                        header.high_key.clone(),
+                    )
+                })?;
+                guard.mark_dirty(crate::format::Lsn::ZERO)?;
+                right_guard.mark_dirty(crate::format::Lsn::ZERO)?;
+                self.record_page_image(parent_id, tx_id)?;
+                self.record_page_image(right_guard.page_id(), tx_id)?;
+                current_left = parent_id;
+                current_right = right_guard.page_id();
+                current_separator = right_separator;
+                left_level = parent_level.saturating_add(1);
+                continue;
+            }
+
+            let rel_id = self.descriptor().rel_id;
+            let root_guard = self
+                .inner
+                .buffer
+                .allocate(PageKind::BtreeInternal, rel_id)?;
+            root_guard.with_page_mut(|page| {
+                page.reinitialize_with_special(
+                    PageKind::BtreeInternal,
+                    root_guard.page_id(),
+                    rel_id,
+                    PageGeneration::ONE,
+                    INDEX_SPECIAL_LEN,
+                )?;
+                Self::write_page_header(
+                    page,
+                    &PageHeader {
+                        kind: PAGE_INTERNAL_KIND,
+                        level: left_level,
+                        index_id: meta.index_id,
+                        left: Some(current_left),
+                        right: None,
+                        high_key: Vec::new(),
+                    },
+                )?;
+                let entries = vec![Entry::Internal {
+                    separator: current_separator.clone(),
+                    child: current_right,
+                }];
+                Self::rewrite_internal(
+                    page,
+                    meta.index_id,
+                    left_level,
+                    &entries,
+                    Some(current_left),
+                    None,
+                    Vec::new(),
+                )
+            })?;
+            root_guard.mark_dirty(crate::format::Lsn::ZERO)?;
+            self.record_page_image(root_guard.page_id(), tx_id)?;
+            self.set_meta_root(root_guard.page_id(), left_level)?;
+            return Ok(());
+        }
+    }
+
+    fn validate_page(
+        &self,
+        page_id: PageId,
+        expected_level: u16,
+        report: &mut IndexValidationReport,
+    ) -> Result<()> {
+        let guard = self.inner.buffer.pin(page_id)?;
+        let (header, entries) = guard.with_page(|page| {
+            let header = Self::read_page_header(page)?;
+            let entries = self.read_entries(page)?;
+            Ok((header, entries))
+        })?;
+        report.pages_seen += 1;
+        match header.kind {
+            PAGE_LEAF_KIND => report.leaf_pages += 1,
+            PAGE_INTERNAL_KIND => report.internal_pages += 1,
+            _ => report.errors.push("unexpected page kind"),
+        }
+        if header.level != expected_level {
+            report.errors.push("level mismatch");
+        }
+        if header.index_id != self.descriptor().index_id {
+            report.errors.push("index id mismatch");
+        }
+        if header.kind == PAGE_INTERNAL_KIND && header.left.is_none() {
+            report.errors.push("internal page missing leftmost child");
+        }
+        let mut last: Option<Vec<u8>> = None;
+        let mut children = Vec::new();
+        let entry_count = entries.len();
+        for entry in entries {
+            match entry {
+                Entry::Leaf { physical, dead, .. } => {
+                    if dead {
+                        continue;
+                    }
+                    if let Some(prev) = &last {
+                        if prev.as_slice() > physical.as_slice() {
+                            report.errors.push("leaf entries out of order");
+                        }
+                    }
+                    last = Some(physical);
+                }
+                Entry::Internal { child, .. } => children.push(child),
+            }
+        }
+        if header.kind == PAGE_INTERNAL_KIND {
+            if let Some(left) = header.left {
+                children.insert(0, left);
+            }
+            if children.len() != entry_count + 1 {
+                report.errors.push("internal child count mismatch");
+            }
+        }
+        drop(guard);
+        for child in children {
+            self.validate_page(child, expected_level.saturating_sub(1), report)?;
+        }
+        Ok(())
+    }
+
+    fn find_leaf(&self, page_id: PageId, key: &[u8]) -> Result<PageId> {
+        Ok(*self
+            .find_leaf_path(page_id, key)?
+            .last()
+            .ok_or(Error::CorruptPage("empty search path"))?)
+    }
+
+    fn find_leaf_path(&self, mut page_id: PageId, key: &[u8]) -> Result<Vec<PageId>> {
+        let mut path = Vec::new();
+        loop {
+            path.push(page_id);
+            let guard = self.inner.buffer.pin(page_id)?;
+            let next = guard.with_page(|page| {
+                let header = Self::read_page_header(page)?;
+                if !header.high_key.is_empty() && key >= header.high_key.as_slice() {
+                    return Ok(header.right);
+                }
+                if header.kind == PAGE_LEAF_KIND {
+                    return Ok(None);
+                }
+                let mut chosen = header.left;
+                if chosen.is_none() {
+                    return Err(Error::CorruptPage("internal page missing leftmost child"));
+                }
+                for entry in self.read_entries(page)? {
+                    if let Entry::Internal { separator, child } = entry {
+                        if key < separator.as_slice() {
+                            break;
+                        }
+                        chosen = Some(child);
+                    }
+                }
+                Ok(chosen)
+            })?;
+            match next {
+                Some(next_id) if next_id != page_id => page_id = next_id,
+                _ => return Ok(path),
+            }
+        }
+    }
+
+    fn min_key_for_page(&self, page_id: PageId) -> Result<Vec<u8>> {
+        let guard = self.inner.buffer.pin(page_id)?;
+        let (header, entries) = guard.with_page(|page| {
+            let header = Self::read_page_header(page)?;
+            let entries = self.read_entries(page)?;
+            Ok((header, entries))
+        })?;
+        if header.kind == PAGE_INTERNAL_KIND {
+            let child = header
+                .left
+                .ok_or(Error::CorruptPage("internal page missing leftmost child"))?;
+            return self.min_key_for_page(child);
+        }
+        for entry in entries {
+            if let Some(key) = entry.logical_key() {
+                return Ok(key.to_vec());
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn page_body_capacity(&self, page_id: PageId) -> Result<usize> {
+        let guard = self.inner.buffer.pin(page_id)?;
+        guard.with_page(|page| {
+            Ok(page
+                .as_bytes()
+                .len()
+                .saturating_sub(PAGE_HEADER_LEN + INDEX_SPECIAL_LEN))
+        })
+    }
+
+    fn meta(&self) -> Result<MetaHeader> {
+        let guard = self.inner.buffer.pin(self.inner.meta_page_id)?;
+        guard.with_page(|page| Self::read_meta(page))
+    }
+
+    fn set_meta_root(&self, root_page_id: PageId, root_level: u16) -> Result<()> {
+        let guard = self.inner.buffer.pin(self.inner.meta_page_id)?;
+        guard.with_page_mut(|page| {
+            let mut meta = Self::read_meta(page)?;
+            meta.root_page_id = root_page_id;
+            meta.root_level = root_level;
+            Self::write_meta(page, &meta)
+        })?;
+        guard.mark_dirty(crate::format::Lsn::ZERO)?;
+        Ok(())
+    }
+
+    fn read_entries(&self, page: &Page) -> Result<Vec<Entry>> {
+        let header = page.header()?;
+        let mut entries = Vec::new();
+        for slot in 0..page.slot_count()? {
+            let cell = page.cell(slot)?;
+            match header.kind {
+                PageKind::BtreeLeaf => entries.push(LeafCell::decode(cell)?),
+                PageKind::BtreeInternal => entries.push(InternalCell::decode(cell)?),
+                _ => return Err(Error::CorruptPage("unsupported index page kind")),
+            }
+        }
+        Ok(entries)
+    }
+
+    fn rewrite_leaf(
+        page: &mut Page,
+        index_id: IndexId,
+        entries: &[Entry],
+        left: Option<PageId>,
+        right: Option<PageId>,
+        high_key: Vec<u8>,
+    ) -> Result<()> {
+        let page_id = page.header()?.page_id;
+        let rel_id = page.header()?.rel_id;
+        page.reinitialize_with_special(
+            PageKind::BtreeLeaf,
+            page_id,
+            rel_id,
+            PageGeneration::ONE,
+            INDEX_SPECIAL_LEN,
+        )?;
+        Self::write_page_header(
+            page,
+            &PageHeader {
+                kind: PAGE_LEAF_KIND,
+                level: 0,
+                index_id,
+                left,
+                right,
+                high_key,
+            },
+        )?;
+        for entry in entries {
+            if let Entry::Leaf {
+                logical_key,
+                row,
+                physical,
+                dead,
+            } = entry
+            {
+                page.insert_cell(&LeafCell::encode(logical_key, *row, physical, *dead))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rewrite_internal(
+        page: &mut Page,
+        index_id: IndexId,
+        level: u16,
+        entries: &[Entry],
+        left: Option<PageId>,
+        right: Option<PageId>,
+        high_key: Vec<u8>,
+    ) -> Result<()> {
+        let page_id = page.header()?.page_id;
+        let rel_id = page.header()?.rel_id;
+        page.reinitialize_with_special(
+            PageKind::BtreeInternal,
+            page_id,
+            rel_id,
+            PageGeneration::ONE,
+            INDEX_SPECIAL_LEN,
+        )?;
+        Self::write_page_header(
+            page,
+            &PageHeader {
+                kind: PAGE_INTERNAL_KIND,
+                level,
+                index_id,
+                left,
+                right,
+                high_key,
+            },
+        )?;
+        for entry in entries {
+            if let Entry::Internal { separator, child } = entry {
+                page.insert_cell(&InternalCell::encode(separator, *child))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_page_header(page: &Page) -> Result<PageHeader> {
+        let special = page.special_bytes()?;
+        if special.len() < META_HIGH_KEY_OFF {
+            return Err(Error::CorruptPage("index special header too small"));
+        }
+        let kind = special[6];
+        let level = read_u16(special, PAGE_LEVEL_OFF)?;
+        let index_id = IndexId(read_u64(special, PAGE_INDEX_ID_OFF)?);
+        let left = decode_opt_page_id(read_u64(special, PAGE_LEFT_OFF)?);
+        let right = decode_opt_page_id(read_u64(special, PAGE_RIGHT_OFF)?);
+        let high_key_len = read_u16(special, PAGE_HIGH_KEY_LEN_OFF)? as usize;
+        let high_key = if high_key_len == 0 {
+            Vec::new()
+        } else {
+            special[PAGE_HIGH_KEY_OFF..PAGE_HIGH_KEY_OFF + high_key_len].to_vec()
+        };
+        Ok(PageHeader {
+            kind,
+            level,
+            index_id,
+            left,
+            right,
+            high_key,
+        })
+    }
+
+    fn write_page_header(page: &mut Page, header: &PageHeader) -> Result<()> {
+        let special = page.special_bytes_mut()?;
+        special.fill(0);
+        crate::format::bytes::write_u32(special, 0, INDEX_MAGIC)?;
+        crate::format::bytes::write_u16(special, 4, INDEX_VERSION)?;
+        special[6] = header.kind;
+        special[7] = 0;
+        write_u16(special, PAGE_LEVEL_OFF, header.level)?;
+        write_u64(special, PAGE_INDEX_ID_OFF, header.index_id.0)?;
+        write_u64(
+            special,
+            PAGE_LEFT_OFF,
+            header.left.map(|p| p.0).unwrap_or(u64::MAX),
+        )?;
+        write_u64(
+            special,
+            PAGE_RIGHT_OFF,
+            header.right.map(|p| p.0).unwrap_or(u64::MAX),
+        )?;
+        write_u16(special, PAGE_HIGH_KEY_LEN_OFF, header.high_key.len() as u16)?;
+        if !header.high_key.is_empty() {
+            crate::format::bytes::write_bytes(special, PAGE_HIGH_KEY_OFF, &header.high_key)?;
+        }
+        Ok(())
+    }
+
+    fn read_meta(page: &Page) -> Result<MetaHeader> {
+        let special = page.special_bytes()?;
+        if read_u16(special, 4)? != INDEX_VERSION {
+            return Err(Error::UnsupportedVersion(read_u16(special, 4)?));
+        }
+        let index_id = IndexId(read_u64(special, 8)?);
+        let root_page_id = PageId(read_u64(special, META_ROOT_PAGE_OFF)?);
+        let root_level = read_u16(special, META_ROOT_LEVEL_OFF)?;
+        let uniqueness = match special[META_UNIQUENESS_OFF] {
+            0 => IndexUniqueness::NonUnique,
+            1 => IndexUniqueness::Unique,
+            _ => return Err(Error::CorruptPage("unknown uniqueness")),
+        };
+        Ok(MetaHeader {
+            index_id,
+            root_page_id,
+            root_level,
+            uniqueness,
+        })
+    }
+
+    fn write_meta(page: &mut Page, meta: &MetaHeader) -> Result<()> {
+        let special = page.special_bytes_mut()?;
+        special.fill(0);
+        write_u32(special, 0, INDEX_MAGIC)?;
+        write_u16(special, 4, INDEX_VERSION)?;
+        special[6] = PAGE_META_KIND;
+        special[7] = 0;
+        write_u64(special, 8, meta.index_id.0)?;
+        write_u64(special, META_ROOT_PAGE_OFF, meta.root_page_id.0)?;
+        write_u16(special, META_ROOT_LEVEL_OFF, meta.root_level)?;
+        special[META_UNIQUENESS_OFF] = meta.uniqueness as u8;
+        write_u16(special, META_HIGH_KEY_LEN_OFF, 0)?;
+        Ok(())
+    }
+}
+
+fn decode_opt_page_id(raw: u64) -> Option<PageId> {
+    if raw == u64::MAX {
+        None
+    } else {
+        Some(PageId(raw))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Entry {
+    Leaf {
+        logical_key: Vec<u8>,
+        row: IndexRowRef,
+        physical: Vec<u8>,
+        dead: bool,
+    },
+    Internal {
+        separator: Vec<u8>,
+        child: PageId,
+    },
+}
+
+impl Entry {
+    fn compare(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (
+                Entry::Leaf { physical: left, .. },
+                Entry::Leaf {
+                    physical: right, ..
+                },
+            ) => left.cmp(right),
+            (
+                Entry::Internal {
+                    separator: left, ..
+                },
+                Entry::Internal {
+                    separator: right, ..
+                },
+            ) => left.cmp(right),
+            _ => Ordering::Equal,
+        }
+    }
+
+    fn logical_key(&self) -> Option<&[u8]> {
+        match self {
+            Entry::Leaf { logical_key, .. } => Some(logical_key),
+            Entry::Internal { separator, .. } => Some(separator),
+        }
+    }
+
+    fn is_dead_leaf(&self) -> bool {
+        matches!(self, Entry::Leaf { dead: true, .. })
+    }
+}
+
+struct LeafCell;
+struct InternalCell;
+
+const LEAF_DEAD_FLAG: u16 = 0x8000;
+
+impl LeafCell {
+    fn encode(logical_key: &[u8], row: IndexRowRef, physical: &[u8], dead: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(26 + logical_key.len() + physical.len());
+        out.extend_from_slice(&(logical_key.len() as u16).to_le_bytes());
+        let physical_len = (physical.len() as u16) | if dead { LEAF_DEAD_FLAG } else { 0 };
+        out.extend_from_slice(&physical_len.to_le_bytes());
+        out.extend_from_slice(&row.row_id.0.to_le_bytes());
+        out.extend_from_slice(&row.tuple.page_id.0.to_le_bytes());
+        out.extend_from_slice(&row.tuple.slot.to_le_bytes());
+        out.extend_from_slice(&row.tuple.generation.0.to_le_bytes());
+        out.extend_from_slice(logical_key);
+        out.extend_from_slice(physical);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Entry> {
+        if bytes.len() < 26 {
+            return Err(Error::BufferTooSmall {
+                needed: 26,
+                actual: bytes.len(),
+            });
+        }
+        let logical_len = read_u16(bytes, 0)? as usize;
+        let physical_len_raw = read_u16(bytes, 2)?;
+        let dead = physical_len_raw & LEAF_DEAD_FLAG != 0;
+        let physical_len = (physical_len_raw & !LEAF_DEAD_FLAG) as usize;
+        let row = IndexRowRef {
+            row_id: crate::format::RowId(read_u64(bytes, 4)?),
+            tuple: TuplePtr::new_with_generation(
+                PageId(read_u64(bytes, 12)?),
+                read_u16(bytes, 20)?,
+                PageGeneration(read_u32(bytes, 22)?),
+            ),
+        };
+        let logical_start = 26;
+        let physical_start = logical_start + logical_len;
+        let physical_end = physical_start + physical_len;
+        if physical_end > bytes.len() {
+            return Err(Error::CorruptPage("leaf cell overflow"));
+        }
+        Ok(Entry::Leaf {
+            logical_key: bytes[logical_start..physical_start].to_vec(),
+            row,
+            physical: bytes[physical_start..physical_end].to_vec(),
+            dead,
+        })
+    }
+}
+
+impl InternalCell {
+    fn encode(separator: &[u8], child: PageId) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + separator.len());
+        out.extend_from_slice(&(separator.len() as u16).to_le_bytes());
+        out.extend_from_slice(&child.0.to_le_bytes());
+        out.extend_from_slice(separator);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Entry> {
+        if bytes.len() < 10 {
+            return Err(Error::BufferTooSmall {
+                needed: 10,
+                actual: bytes.len(),
+            });
+        }
+        let len = read_u16(bytes, 0)? as usize;
+        let child = PageId(read_u64(bytes, 2)?);
+        let end = 10 + len;
+        if end > bytes.len() {
+            return Err(Error::CorruptPage("internal cell overflow"));
+        }
+        Ok(Entry::Internal {
+            separator: bytes[10..end].to_vec(),
+            child,
+        })
+    }
+}
+
+impl IndexDescriptor {
+    pub fn new(index_id: IndexId, rel_id: RelId, uniqueness: IndexUniqueness) -> Self {
+        Self {
+            index_id,
+            rel_id,
+            uniqueness,
+        }
+    }
+}
+
+impl IndexRowRef {
+    pub fn new(tuple: TuplePtr) -> Self {
+        Self {
+            row_id: crate::format::RowId::ZERO,
+            tuple,
+        }
+    }
+
+    pub fn with_row_id(row_id: crate::format::RowId, tuple: TuplePtr) -> Self {
+        Self { row_id, tuple }
+    }
+}
+
+pub fn compare_physical_key(left: &[u8], right: &[u8]) -> Ordering {
+    left.cmp(right)
+}
+
+pub fn encode_physical_key(logical_key: &[u8], row: IndexRowRef) -> KeyBuf {
+    let mut key = KeyBuf::new();
+    key.extend_logical(logical_key);
+    key.append_row_ref_suffix(row);
+    key
+}
+
+impl BtreeIndex {
+    fn encoded_entries_len(entries: &[Entry]) -> usize {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                Entry::Leaf {
+                    logical_key,
+                    physical,
+                    ..
+                } => 18 + logical_key.len() + physical.len(),
+                Entry::Internal { separator, .. } => 10 + separator.len(),
+            })
+            .sum()
+    }
+}

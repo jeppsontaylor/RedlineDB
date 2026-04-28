@@ -1,0 +1,16 @@
+[package]
+name = "redlinedb-sql"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arc-swap = "1.7"
+parking_lot = "0.12"
+sqlparser = "0.61"
+thiserror = "2.0"
+redlinedb-kernel = { path = "../kernel" }
+
+[dev-dependencies]
+tempfile = "3.23"

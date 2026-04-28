@@ -1,0 +1,1694 @@
+use std::sync::Arc;
+
+use redlinedb_kernel::catalog::{
+    ColumnConstraintSpec, ColumnSpec, ConflictAction, CreateIndexSpec, CreateTableSpec, DbName,
+    DropIndexSpec, DropTableSpec, ExprAst, IndexColumnSpec, IndexOrigin, OwnedValue, QualifiedName,
+    SchemaEpoch, SchemaSnapshot, SortDir, TableConstraintSpec, lookup_table,
+};
+use redlinedb_kernel::engine::Engine;
+use sqlparser::ast::{
+    Analyze as SqlAnalyze, AnalyzeFormat, AnalyzeFormatKind, BinaryOperator, ColumnDef,
+    ColumnOption, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    IndexColumn, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
+    OrderByExpr, OrderByKind, Query, SelectItem, SetExpr, Statement as SqlStatement, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, Value, ValueWithSpan,
+};
+use sqlparser::dialect::SQLiteDialect;
+use sqlparser::parser::Parser;
+
+use crate::error::{Error, Result};
+use crate::session::BeginMode;
+use crate::statement::{
+    BoundTable, DeletePlan, InsertPlan, ParamLayout, PreparedKind, PreparedTemplate, SelectPlan,
+    SelectSource, UpdatePlan,
+};
+
+pub fn parse_prepared_template(engine: &Engine, sql: &str) -> Result<PreparedTemplate> {
+    let trimmed = sql.trim();
+    let lower = trimmed.trim_end_matches(';').trim().to_ascii_lowercase();
+    let schema = engine.schema_snapshot();
+    let schema_epoch = engine.schema_epoch();
+
+    if lower == "begin" || lower == "begin deferred" {
+        return Ok(template(
+            trimmed,
+            schema_epoch,
+            false,
+            PreparedKind::Begin(BeginMode::Deferred),
+        ));
+    }
+    if lower == "begin immediate" {
+        return Ok(template(
+            trimmed,
+            schema_epoch,
+            false,
+            PreparedKind::Begin(BeginMode::Immediate),
+        ));
+    }
+    if lower == "begin exclusive" {
+        return Ok(template(
+            trimmed,
+            schema_epoch,
+            false,
+            PreparedKind::Begin(BeginMode::Exclusive),
+        ));
+    }
+    if lower == "commit" {
+        return Ok(template(trimmed, schema_epoch, false, PreparedKind::Commit));
+    }
+    if lower == "rollback" {
+        return Ok(template(
+            trimmed,
+            schema_epoch,
+            false,
+            PreparedKind::Rollback,
+        ));
+    }
+
+    let dialect = SQLiteDialect {};
+    let mut statements = Parser::parse_sql(&dialect, sql)?;
+    if statements.len() != 1 {
+        return Err(Error::UnsupportedSql(
+            "only single-statement prepares are supported".to_owned(),
+        ));
+    }
+
+    bind_statement(engine, schema, schema_epoch, trimmed, statements.remove(0))
+}
+
+fn bind_statement(
+    engine: &Engine,
+    schema: Arc<SchemaSnapshot>,
+    schema_epoch: SchemaEpoch,
+    sql: &str,
+    statement: SqlStatement,
+) -> Result<PreparedTemplate> {
+    match statement {
+        SqlStatement::Query(query) => bind_query(engine, schema, schema_epoch, sql, *query),
+        SqlStatement::Insert(insert) => bind_insert(schema, schema_epoch, sql, insert),
+        SqlStatement::Update(update) => bind_update(schema, schema_epoch, sql, update),
+        SqlStatement::Delete(delete) => bind_delete(schema, schema_epoch, sql, delete),
+        SqlStatement::CreateTable(create_table) => {
+            bind_create_table(schema_epoch, sql, create_table)
+        }
+        SqlStatement::CreateIndex(create_index) => {
+            bind_create_index(schema_epoch, sql, create_index)
+        }
+        SqlStatement::Drop {
+            object_type,
+            if_exists,
+            names,
+            ..
+        } => bind_drop(sql, schema_epoch, object_type, if_exists, names),
+        SqlStatement::Analyze(analyze) => bind_analyze(schema, schema_epoch, sql, analyze),
+        SqlStatement::Explain {
+            analyze,
+            verbose: _,
+            query_plan,
+            estimate: _,
+            statement,
+            format,
+            ..
+        } => bind_explain(
+            engine,
+            schema,
+            schema_epoch,
+            sql,
+            analyze,
+            query_plan,
+            format,
+            *statement,
+        ),
+        SqlStatement::ExplainTable { .. } => Err(Error::UnsupportedSql(
+            "EXPLAIN TABLE is not supported".to_owned(),
+        )),
+        other => Err(Error::UnsupportedSql(format!(
+            "statement not supported yet: {other:?}"
+        ))),
+    }
+}
+
+fn template(
+    sql: &str,
+    schema_epoch: SchemaEpoch,
+    readonly: bool,
+    kind: PreparedKind,
+) -> PreparedTemplate {
+    PreparedTemplate {
+        sql: Arc::from(sql),
+        schema_epoch,
+        stats_epoch: 0,
+        optimizer_hash: 0,
+        param_layout: ParamLayout::default(),
+        output_columns: Arc::from([]),
+        readonly,
+        kind,
+    }
+}
+
+fn bind_query(
+    _engine: &Engine,
+    schema: Arc<SchemaSnapshot>,
+    schema_epoch: SchemaEpoch,
+    sql: &str,
+    query: Query,
+) -> Result<PreparedTemplate> {
+    let Query {
+        body,
+        order_by,
+        limit_clause,
+        ..
+    } = query;
+    let select = match *body {
+        SetExpr::Select(select) => select,
+        _ => {
+            return Err(Error::UnsupportedSql(
+                "only simple SELECT queries are supported".to_owned(),
+            ));
+        }
+    };
+
+    let mut params = ParamLayout::default();
+    let mut projection = Vec::new();
+    let mut output_columns = Vec::new();
+
+    let (source, mut selection) = bind_select_from(&schema, select.from, &mut params)?;
+
+    for item in select.projection {
+        let item = normalize_select_item(item, &mut params)?;
+        match &item {
+            SelectItem::Wildcard(_) => push_projection_columns(&source, &mut output_columns),
+            SelectItem::QualifiedWildcard(_, _) => {
+                push_projection_columns(&source, &mut output_columns)
+            }
+            SelectItem::UnnamedExpr(expr) => output_columns.push(render_expr_name(expr)),
+            SelectItem::ExprWithAlias { alias, .. } => output_columns.push(alias.value.clone()),
+        }
+        projection.push(item);
+    }
+    if projection.is_empty() {
+        push_projection_columns(&source, &mut output_columns);
+    }
+
+    if let Some(expr) = select.selection {
+        selection = Some(match selection {
+            Some(join_expr) => and_expr(join_expr, normalize_expr(expr, &mut params)?),
+            None => normalize_expr(expr, &mut params)?,
+        });
+    }
+
+    let group_by = match select.group_by {
+        GroupByExpr::All(_) => {
+            return Err(Error::UnsupportedSql(
+                "GROUP BY ALL is not supported".to_owned(),
+            ));
+        }
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(Error::UnsupportedSql(
+                    "GROUP BY modifiers are not supported".to_owned(),
+                ));
+            }
+            exprs
+                .into_iter()
+                .map(|expr| normalize_expr(expr, &mut params))
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+
+    let having = match select.having {
+        Some(expr) => Some(normalize_expr(expr, &mut params)?),
+        None => None,
+    };
+
+    let order_by = match order_by {
+        Some(order_by) => match order_by.kind {
+            OrderByKind::Expressions(exprs) => exprs
+                .into_iter()
+                .map(|expr| {
+                    let options = expr.options;
+                    let with_fill = expr.with_fill;
+                    let expr = normalize_expr(expr.expr, &mut params)?;
+                    Ok(OrderByExpr {
+                        expr,
+                        options,
+                        with_fill,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            OrderByKind::All(_) => {
+                return Err(Error::UnsupportedSql(
+                    "ORDER BY ALL is not supported".to_owned(),
+                ));
+            }
+        },
+        None => Vec::new(),
+    };
+
+    let (limit, offset) = match limit_clause {
+        Some(LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by: _,
+        }) => {
+            let limit = match limit {
+                Some(expr) => Some(normalize_expr(expr, &mut params)?),
+                None => None,
+            };
+            let offset = match offset {
+                Some(offset) => Some(normalize_expr(offset.value, &mut params)?),
+                None => None,
+            };
+            (limit, offset)
+        }
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => (
+            Some(normalize_expr(limit, &mut params)?),
+            Some(normalize_expr(offset, &mut params)?),
+        ),
+        None => (None, None),
+    };
+
+    let readonly = true;
+    if params.count() == 0 {
+        scan_sql_parameters(sql, &mut params);
+    }
+    Ok(PreparedTemplate {
+        sql: Arc::from(sql),
+        schema_epoch,
+        stats_epoch: 0,
+        optimizer_hash: 0,
+        param_layout: params,
+        output_columns: output_columns.into(),
+        readonly,
+        kind: PreparedKind::Select(SelectPlan {
+            source,
+            projection,
+            selection,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+        }),
+    })
+}
+
+fn bind_insert(
+    schema: Arc<SchemaSnapshot>,
+    schema_epoch: SchemaEpoch,
+    sql: &str,
+    insert: sqlparser::ast::Insert,
+) -> Result<PreparedTemplate> {
+    if !insert.assignments.is_empty() {
+        return Err(Error::UnsupportedSql(
+            "INSERT ... SET is not supported".to_owned(),
+        ));
+    }
+    if insert.returning.is_some() {
+        return Err(Error::UnsupportedSql(
+            "RETURNING is not supported".to_owned(),
+        ));
+    }
+    let table = bind_table_object(&schema, &insert.table)?;
+    let mut params = ParamLayout::default();
+    let columns = if insert.columns.is_empty() {
+        (0..table.columns.len()).collect::<Vec<_>>()
+    } else {
+        insert
+            .columns
+            .into_iter()
+            .map(|column| resolve_column_ordinal_in_table(&table, &column.value))
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let mut rows = Vec::new();
+    let mut default_values = false;
+    if let Some(source) = insert.source {
+        match *source.body {
+            SetExpr::Values(values) => {
+                for row in values.rows {
+                    let mut exprs = Vec::with_capacity(row.len());
+                    for expr in row {
+                        exprs.push(normalize_expr(expr, &mut params)?);
+                    }
+                    rows.push(exprs);
+                }
+            }
+            _ => {
+                return Err(Error::UnsupportedSql(
+                    "INSERT source must be VALUES".to_owned(),
+                ));
+            }
+        }
+    } else {
+        default_values = true;
+    }
+
+    if params.count() == 0 {
+        scan_sql_parameters(sql, &mut params);
+    }
+    Ok(PreparedTemplate {
+        sql: Arc::from(sql),
+        schema_epoch,
+        stats_epoch: 0,
+        optimizer_hash: 0,
+        param_layout: params,
+        output_columns: Arc::from([]),
+        readonly: false,
+        kind: PreparedKind::Insert(InsertPlan {
+            table,
+            columns,
+            rows,
+            default_values,
+        }),
+    })
+}
+
+fn bind_update(
+    schema: Arc<SchemaSnapshot>,
+    schema_epoch: SchemaEpoch,
+    sql: &str,
+    update: sqlparser::ast::Update,
+) -> Result<PreparedTemplate> {
+    if update.returning.is_some() {
+        return Err(Error::UnsupportedSql(
+            "RETURNING is not supported".to_owned(),
+        ));
+    }
+    if update.from.is_some() {
+        return Err(Error::UnsupportedSql(
+            "UPDATE ... FROM is not supported".to_owned(),
+        ));
+    }
+    if update.limit.is_some() {
+        return Err(Error::UnsupportedSql(
+            "UPDATE LIMIT is not supported".to_owned(),
+        ));
+    }
+
+    let table = bind_table_with_joins(&schema, &update.table)?;
+    let mut params = ParamLayout::default();
+    let mut assignments = Vec::new();
+    for assignment in update.assignments {
+        let ordinal = match assignment.target {
+            sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                resolve_column_ordinal_in_object_name(&table, &name)?
+            }
+            sqlparser::ast::AssignmentTarget::Tuple(_) => {
+                return Err(Error::UnsupportedSql(
+                    "tuple assignment is not supported".to_owned(),
+                ));
+            }
+        };
+        assignments.push((ordinal, normalize_expr(assignment.value, &mut params)?));
+    }
+    let selection = match update.selection {
+        Some(expr) => Some(normalize_expr(expr, &mut params)?),
+        None => None,
+    };
+    if params.count() == 0 {
+        scan_sql_parameters(sql, &mut params);
+    }
+    Ok(PreparedTemplate {
+        sql: Arc::from(sql),
+        schema_epoch,
+        stats_epoch: 0,
+        optimizer_hash: 0,
+        param_layout: params,
+        output_columns: Arc::from([]),
+        readonly: false,
+        kind: PreparedKind::Update(UpdatePlan {
+            table,
+            assignments,
+            selection,
+        }),
+    })
+}
+
+fn bind_delete(
+    schema: Arc<SchemaSnapshot>,
+    schema_epoch: SchemaEpoch,
+    sql: &str,
+    delete: sqlparser::ast::Delete,
+) -> Result<PreparedTemplate> {
+    if delete.using.is_some() {
+        return Err(Error::UnsupportedSql(
+            "DELETE ... USING is not supported".to_owned(),
+        ));
+    }
+    if !delete.order_by.is_empty() {
+        return Err(Error::UnsupportedSql(
+            "DELETE ORDER BY is not supported".to_owned(),
+        ));
+    }
+    if delete.limit.is_some() {
+        return Err(Error::UnsupportedSql(
+            "DELETE LIMIT is not supported".to_owned(),
+        ));
+    }
+
+    let from = match delete.from {
+        sqlparser::ast::FromTable::WithFromKeyword(from)
+        | sqlparser::ast::FromTable::WithoutKeyword(from) => from,
+    };
+    if from.len() != 1 {
+        return Err(Error::UnsupportedSql(
+            "only single-table DELETE is supported".to_owned(),
+        ));
+    }
+    let table = bind_table_with_joins(&schema, &from[0])?;
+    let mut params = ParamLayout::default();
+    let selection = match delete.selection {
+        Some(expr) => Some(normalize_expr(expr, &mut params)?),
+        None => None,
+    };
+    Ok(PreparedTemplate {
+        sql: Arc::from(sql),
+        schema_epoch,
+        stats_epoch: 0,
+        optimizer_hash: 0,
+        param_layout: params,
+        output_columns: Arc::from([]),
+        readonly: false,
+        kind: PreparedKind::Delete(DeletePlan { table, selection }),
+    })
+}
+
+fn bind_create_table(
+    schema_epoch: SchemaEpoch,
+    sql: &str,
+    create_table: sqlparser::ast::CreateTable,
+) -> Result<PreparedTemplate> {
+    if create_table.query.is_some() {
+        return Err(Error::UnsupportedSql(
+            "CREATE TABLE AS SELECT is not supported".to_owned(),
+        ));
+    }
+    if create_table.or_replace
+        || create_table.temporary
+        || create_table.external
+        || create_table.dynamic
+        || create_table.global.is_some()
+        || create_table.transient
+        || create_table.volatile
+        || create_table.iceberg
+        || create_table.query.is_some()
+        || create_table.like.is_some()
+        || create_table.clone.is_some()
+        || create_table.version.is_some()
+        || create_table.comment.is_some()
+        || create_table.on_commit.is_some()
+        || create_table.on_cluster.is_some()
+        || create_table.primary_key.is_some()
+        || create_table.order_by.is_some()
+        || create_table.partition_by.is_some()
+        || create_table.cluster_by.is_some()
+        || create_table.clustered_by.is_some()
+        || create_table.inherits.is_some()
+        || create_table.partition_of.is_some()
+        || create_table.for_values.is_some()
+        || create_table.copy_grants
+        || create_table.enable_schema_evolution.is_some()
+        || create_table.change_tracking.is_some()
+    {
+        return Err(Error::UnsupportedSql(
+            "CREATE TABLE modifiers are not supported".to_owned(),
+        ));
+    }
+
+    let (schema, name) = split_name(create_table.name)?;
+    let mut columns = Vec::with_capacity(create_table.columns.len());
+    let mut column_lookup = std::collections::HashMap::new();
+    for (ordinal, column) in create_table.columns.iter().enumerate() {
+        column_lookup.insert(column.name.value.to_ascii_lowercase(), ordinal);
+    }
+
+    for (ordinal, column) in create_table.columns.into_iter().enumerate() {
+        columns.push(convert_column_def(column, ordinal, &column_lookup)?);
+    }
+
+    let mut constraints = Vec::new();
+    for constraint in create_table.constraints {
+        constraints.push(convert_table_constraint(constraint, &column_lookup)?);
+    }
+
+    Ok(PreparedTemplate {
+        sql: Arc::from(sql),
+        schema_epoch,
+        stats_epoch: 0,
+        optimizer_hash: 0,
+        param_layout: ParamLayout::default(),
+        output_columns: Arc::from([]),
+        readonly: false,
+        kind: PreparedKind::CreateTable(CreateTableSpec {
+            schema,
+            name,
+            if_not_exists: create_table.if_not_exists,
+            columns,
+            constraints,
+            strict: create_table.strict,
+            without_rowid: create_table.without_rowid,
+            normalized_sql: Some(sql.to_owned()),
+        }),
+    })
+}
+
+fn bind_create_index(
+    schema_epoch: SchemaEpoch,
+    sql: &str,
+    create_index: sqlparser::ast::CreateIndex,
+) -> Result<PreparedTemplate> {
+    if create_index.concurrently
+        || create_index.using.is_some()
+        || !create_index.include.is_empty()
+        || create_index.nulls_distinct.is_some()
+        || !create_index.with.is_empty()
+        || create_index.predicate.is_some()
+        || !create_index.index_options.is_empty()
+        || !create_index.alter_options.is_empty()
+    {
+        return Err(Error::UnsupportedSql(
+            "CREATE INDEX modifiers are not supported".to_owned(),
+        ));
+    }
+    let name = create_index
+        .name
+        .ok_or_else(|| Error::UnsupportedSql("CREATE INDEX requires a name".to_owned()))?;
+    let (schema, name) = split_name(name)?;
+    let table = parse_qualified_name(create_index.table_name)?;
+    let mut columns = Vec::with_capacity(create_index.columns.len());
+    for column in create_index.columns {
+        columns.push(convert_index_column(column)?);
+    }
+
+    Ok(PreparedTemplate {
+        sql: Arc::from(sql),
+        schema_epoch,
+        stats_epoch: 0,
+        optimizer_hash: 0,
+        param_layout: ParamLayout::default(),
+        output_columns: Arc::from([]),
+        readonly: false,
+        kind: PreparedKind::CreateIndex(CreateIndexSpec {
+            schema,
+            name,
+            table,
+            unique: create_index.unique,
+            columns,
+            origin: IndexOrigin::User,
+            normalized_sql: Some(sql.to_owned()),
+        }),
+    })
+}
+
+fn bind_drop(
+    sql: &str,
+    schema_epoch: SchemaEpoch,
+    object_type: sqlparser::ast::ObjectType,
+    if_exists: bool,
+    names: Vec<ObjectName>,
+) -> Result<PreparedTemplate> {
+    if names.len() != 1 {
+        return Err(Error::UnsupportedSql(
+            "only single-object DROP is supported".to_owned(),
+        ));
+    }
+    let name = parse_qualified_name(names.into_iter().next().unwrap())?;
+    let kind = match object_type {
+        sqlparser::ast::ObjectType::Table => {
+            PreparedKind::DropTable(DropTableSpec { name, if_exists })
+        }
+        sqlparser::ast::ObjectType::Index => {
+            PreparedKind::DropIndex(DropIndexSpec { name, if_exists })
+        }
+        _ => {
+            return Err(Error::UnsupportedSql(
+                "only DROP TABLE and DROP INDEX are supported".to_owned(),
+            ));
+        }
+    };
+    Ok(PreparedTemplate {
+        sql: Arc::from(sql),
+        schema_epoch,
+        stats_epoch: 0,
+        optimizer_hash: 0,
+        param_layout: ParamLayout::default(),
+        output_columns: Arc::from([]),
+        readonly: false,
+        kind,
+    })
+}
+
+fn bind_analyze(
+    schema: Arc<SchemaSnapshot>,
+    schema_epoch: SchemaEpoch,
+    sql: &str,
+    analyze: SqlAnalyze,
+) -> Result<PreparedTemplate> {
+    let table = match analyze.table_name {
+        Some(name) => Some(bind_table_name(&schema, &name)?),
+        None => None,
+    };
+    Ok(PreparedTemplate {
+        sql: Arc::from(sql),
+        schema_epoch,
+        stats_epoch: 0,
+        optimizer_hash: 0,
+        param_layout: ParamLayout::default(),
+        output_columns: Arc::from([]),
+        readonly: false,
+        kind: PreparedKind::Analyze(crate::statement::AnalyzePlan { table }),
+    })
+}
+
+fn bind_explain(
+    engine: &Engine,
+    schema: Arc<SchemaSnapshot>,
+    schema_epoch: SchemaEpoch,
+    sql: &str,
+    analyze: bool,
+    query_plan: bool,
+    format: Option<AnalyzeFormatKind>,
+    statement: SqlStatement,
+) -> Result<PreparedTemplate> {
+    let inner = Arc::new(bind_statement(
+        engine,
+        Arc::clone(&schema),
+        schema_epoch,
+        sql,
+        statement,
+    )?);
+    let explain_format = if query_plan {
+        crate::statement::ExplainFormat::QueryPlan
+    } else {
+        match format {
+            Some(AnalyzeFormatKind::Keyword(AnalyzeFormat::JSON))
+            | Some(AnalyzeFormatKind::Assignment(AnalyzeFormat::JSON)) => {
+                crate::statement::ExplainFormat::Json
+            }
+            _ => crate::statement::ExplainFormat::Text,
+        }
+    };
+    let output_columns = match explain_format {
+        crate::statement::ExplainFormat::QueryPlan => Arc::from([
+            "id".to_owned(),
+            "parent".to_owned(),
+            "notused".to_owned(),
+            "detail".to_owned(),
+        ]),
+        crate::statement::ExplainFormat::Text | crate::statement::ExplainFormat::Json => {
+            Arc::from(["explain".to_owned()])
+        }
+    };
+    Ok(PreparedTemplate {
+        sql: Arc::from(sql),
+        schema_epoch,
+        stats_epoch: 0,
+        optimizer_hash: 0,
+        param_layout: inner.param_layout.clone(),
+        output_columns,
+        readonly: true,
+        kind: PreparedKind::Explain(crate::statement::ExplainPlan {
+            format: explain_format,
+            analyze,
+            inner,
+        }),
+    })
+}
+
+fn normalize_select_item(item: SelectItem, params: &mut ParamLayout) -> Result<SelectItem> {
+    Ok(match item {
+        SelectItem::UnnamedExpr(expr) => SelectItem::UnnamedExpr(normalize_expr(expr, params)?),
+        SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
+            expr: normalize_expr(expr, params)?,
+            alias,
+        },
+        other => other,
+    })
+}
+
+fn normalize_expr(expr: Expr, params: &mut ParamLayout) -> Result<Expr> {
+    Ok(match expr {
+        Expr::Value(v) => match &v.value {
+            Value::Placeholder(name) => {
+                let name = normalize_placeholder(name, params)?;
+                Expr::Value(ValueWithSpan {
+                    value: Value::Placeholder(name),
+                    span: v.span,
+                })
+            }
+            _ => Expr::Value(v),
+        },
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(normalize_expr(*left, params)?),
+            op,
+            right: Box::new(normalize_expr(*right, params)?),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op,
+            expr: Box::new(normalize_expr(*expr, params)?),
+        },
+        Expr::Nested(expr) => Expr::Nested(Box::new(normalize_expr(*expr, params)?)),
+        Expr::Function(mut func) => {
+            normalize_function_args(&mut func.args, params)?;
+            normalize_function_args(&mut func.parameters, params)?;
+            Expr::Function(func)
+        }
+        Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Expr::Like {
+            negated,
+            any,
+            expr: Box::new(normalize_expr(*expr, params)?),
+            pattern: Box::new(normalize_expr(*pattern, params)?),
+            escape_char,
+        },
+        Expr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Expr::ILike {
+            negated,
+            any,
+            expr: Box::new(normalize_expr(*expr, params)?),
+            pattern: Box::new(normalize_expr(*pattern, params)?),
+            escape_char,
+        },
+        Expr::Cast {
+            expr,
+            data_type,
+            kind,
+            format,
+            array,
+        } => Expr::Cast {
+            expr: Box::new(normalize_expr(*expr, params)?),
+            data_type,
+            kind,
+            format,
+            array,
+        },
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: Box::new(normalize_expr(*expr, params)?),
+            negated,
+            low: Box::new(normalize_expr(*low, params)?),
+            high: Box::new(normalize_expr(*high, params)?),
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(normalize_expr(*expr, params)?),
+            list: list
+                .into_iter()
+                .map(|expr| normalize_expr(expr, params))
+                .collect::<Result<Vec<_>>>()?,
+            negated,
+        },
+        Expr::IsNull(expr) => Expr::IsNull(Box::new(normalize_expr(*expr, params)?)),
+        Expr::IsNotNull(expr) => Expr::IsNotNull(Box::new(normalize_expr(*expr, params)?)),
+        Expr::IsDistinctFrom(left, right) => Expr::IsDistinctFrom(
+            Box::new(normalize_expr(*left, params)?),
+            Box::new(normalize_expr(*right, params)?),
+        ),
+        Expr::IsNotDistinctFrom(left, right) => Expr::IsNotDistinctFrom(
+            Box::new(normalize_expr(*left, params)?),
+            Box::new(normalize_expr(*right, params)?),
+        ),
+        Expr::IsTrue(expr) => Expr::IsTrue(Box::new(normalize_expr(*expr, params)?)),
+        Expr::IsNotTrue(expr) => Expr::IsNotTrue(Box::new(normalize_expr(*expr, params)?)),
+        Expr::IsFalse(expr) => Expr::IsFalse(Box::new(normalize_expr(*expr, params)?)),
+        Expr::IsNotFalse(expr) => Expr::IsNotFalse(Box::new(normalize_expr(*expr, params)?)),
+        Expr::IsUnknown(expr) => Expr::IsUnknown(Box::new(normalize_expr(*expr, params)?)),
+        Expr::IsNotUnknown(expr) => Expr::IsNotUnknown(Box::new(normalize_expr(*expr, params)?)),
+        Expr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => Expr::Case {
+            case_token,
+            end_token,
+            operand: operand
+                .map(|expr| normalize_expr(*expr, params))
+                .transpose()?
+                .map(Box::new),
+            conditions: conditions
+                .into_iter()
+                .map(|when| {
+                    Ok(sqlparser::ast::CaseWhen {
+                        condition: normalize_expr(when.condition, params)?,
+                        result: normalize_expr(when.result, params)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_result: else_result
+                .map(|expr| normalize_expr(*expr, params))
+                .transpose()?
+                .map(Box::new),
+        },
+        other => other,
+    })
+}
+
+fn normalize_function_args(args: &mut FunctionArguments, params: &mut ParamLayout) -> Result<()> {
+    if let FunctionArguments::List(list) = args {
+        for arg in &mut list.args {
+            match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                    *expr = normalize_expr(expr.clone(), params)?;
+                }
+                FunctionArg::Named {
+                    arg: FunctionArgExpr::Expr(expr),
+                    ..
+                } => {
+                    *expr = normalize_expr(expr.clone(), params)?;
+                }
+                FunctionArg::ExprNamed {
+                    arg: FunctionArgExpr::Expr(expr),
+                    ..
+                } => {
+                    *expr = normalize_expr(expr.clone(), params)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_placeholder(name: &str, params: &mut ParamLayout) -> Result<String> {
+    if name == "?" {
+        let slot = params.push_anonymous();
+        return Ok(format!("?{slot}"));
+    }
+    if let Some(rest) = name.strip_prefix('?') {
+        let slot = rest
+            .parse::<usize>()
+            .map_err(|_| Error::Parse(format!("invalid parameter {name}")))?;
+        if slot == 0 {
+            return Err(Error::Parse("parameter indices are 1-based".to_owned()));
+        }
+        params.push_numbered(slot);
+        return Ok(format!("?{slot}"));
+    }
+    if name.starts_with(':') || name.starts_with('@') || name.starts_with('$') {
+        let slot = params.push_named(name.to_owned());
+        return Ok(format!("?{slot}"));
+    }
+    Err(Error::Parse(format!(
+        "unsupported parameter syntax: {name}"
+    )))
+}
+
+fn scan_sql_parameters(sql: &str, params: &mut ParamLayout) {
+    enum State {
+        Default,
+        Single,
+        Double,
+        LineComment,
+        BlockComment,
+    }
+
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut state = State::Default;
+    while i < bytes.len() {
+        match state {
+            State::Default => match bytes[i] {
+                b'\'' => {
+                    state = State::Single;
+                    i += 1;
+                }
+                b'"' => {
+                    state = State::Double;
+                    i += 1;
+                }
+                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                    state = State::LineComment;
+                    i += 2;
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    state = State::BlockComment;
+                    i += 2;
+                }
+                b'?' => {
+                    i += 1;
+                    let start = i;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if i > start {
+                        if let Ok(index) = sql[start..i].parse::<usize>() {
+                            if index > 0 {
+                                params.push_numbered(index);
+                            }
+                        }
+                    } else {
+                        params.push_anonymous();
+                    }
+                }
+                b':' | b'@' | b'$' => {
+                    let prefix = bytes[i] as char;
+                    i += 1;
+                    let start = i;
+                    while i < bytes.len() && is_param_char(bytes[i]) {
+                        i += 1;
+                    }
+                    if i > start {
+                        let name = format!("{prefix}{}", &sql[start..i]);
+                        params.push_named(name);
+                    }
+                }
+                _ => i += 1,
+            },
+            State::Single => {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                    } else {
+                        state = State::Default;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            State::Double => {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                    } else {
+                        state = State::Default;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            State::LineComment => {
+                if bytes[i] == b'\n' {
+                    state = State::Default;
+                }
+                i += 1;
+            }
+            State::BlockComment => {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    state = State::Default;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+fn is_param_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn convert_column_def(
+    column: ColumnDef,
+    _ordinal: usize,
+    column_lookup: &std::collections::HashMap<String, usize>,
+) -> Result<ColumnSpec> {
+    let mut constraints = Vec::new();
+    let mut collation = None;
+    let mut default_value = None;
+    let declared_type = if column.data_type == sqlparser::ast::DataType::Unspecified {
+        None
+    } else {
+        Some(column.data_type.to_string())
+    };
+
+    for option in column.options {
+        match option.option {
+            ColumnOption::Null => {}
+            ColumnOption::NotNull => constraints.push(ColumnConstraintSpec::NotNull {
+                conflict: ConflictAction::Abort,
+            }),
+            ColumnOption::Default(expr) => {
+                let expr_ast = expr_to_kernel_ast(&expr, column_lookup)?;
+                if let ExprAst::Const(value) = &expr_ast {
+                    default_value = Some(value.clone());
+                }
+                constraints.push(ColumnConstraintSpec::Default {
+                    expr: expr_ast,
+                    normalized_sql: expr.to_string(),
+                });
+            }
+            ColumnOption::PrimaryKey(_) => constraints.push(ColumnConstraintSpec::PrimaryKey {
+                sort_dir: SortDir::Asc,
+                conflict: ConflictAction::Abort,
+            }),
+            ColumnOption::Unique(_) => constraints.push(ColumnConstraintSpec::Unique {
+                conflict: ConflictAction::Abort,
+            }),
+            ColumnOption::Check(check) => {
+                constraints.push(ColumnConstraintSpec::Check {
+                    expr: expr_to_kernel_ast(&check.expr, column_lookup)?,
+                    normalized_sql: check.expr.to_string(),
+                });
+            }
+            ColumnOption::Collation(name) => {
+                collation = Some(name.to_string());
+            }
+            ColumnOption::ForeignKey(_)
+            | ColumnOption::DialectSpecific(_)
+            | ColumnOption::CharacterSet(_)
+            | ColumnOption::Comment(_)
+            | ColumnOption::OnUpdate(_)
+            | ColumnOption::Generated { .. }
+            | ColumnOption::Options(_)
+            | ColumnOption::Identity(_)
+            | ColumnOption::OnConflict(_)
+            | ColumnOption::Policy(_)
+            | ColumnOption::Tags(_)
+            | ColumnOption::Srid(_)
+            | ColumnOption::Invisible => {
+                return Err(Error::UnsupportedSql(format!(
+                    "column option not supported yet: {option:?}"
+                )));
+            }
+            ColumnOption::Materialized(_) | ColumnOption::Ephemeral(_) | ColumnOption::Alias(_) => {
+                return Err(Error::UnsupportedSql(
+                    "generated/alias column options are not supported".to_owned(),
+                ));
+            }
+        }
+    }
+
+    Ok(ColumnSpec {
+        name: DbName::new(column.name.value),
+        declared_type,
+        constraints,
+        collation,
+        default_value,
+    })
+}
+
+fn convert_table_constraint(
+    constraint: sqlparser::ast::TableConstraint,
+    column_lookup: &std::collections::HashMap<String, usize>,
+) -> Result<TableConstraintSpec> {
+    match constraint {
+        sqlparser::ast::TableConstraint::PrimaryKey(pk) => Ok(TableConstraintSpec::PrimaryKey {
+            name: pk.name.map(|name| DbName::new(name.value)),
+            columns: pk
+                .columns
+                .into_iter()
+                .map(|col| index_column_name(&col).map(DbName::new))
+                .collect::<Result<Vec<_>>>()?,
+            conflict: ConflictAction::Abort,
+        }),
+        sqlparser::ast::TableConstraint::Unique(uniq) => Ok(TableConstraintSpec::Unique {
+            name: uniq.name.map(|name| DbName::new(name.value)),
+            columns: uniq
+                .columns
+                .into_iter()
+                .map(|col| index_column_name(&col).map(DbName::new))
+                .collect::<Result<Vec<_>>>()?,
+            conflict: ConflictAction::Abort,
+        }),
+        sqlparser::ast::TableConstraint::Check(check) => Ok(TableConstraintSpec::Check {
+            name: check.name.map(|name| DbName::new(name.value)),
+            expr: expr_to_kernel_ast(&check.expr, column_lookup)?,
+            normalized_sql: check.expr.to_string(),
+        }),
+        sqlparser::ast::TableConstraint::ForeignKey(_)
+        | sqlparser::ast::TableConstraint::Index(_)
+        | sqlparser::ast::TableConstraint::FulltextOrSpatial(_) => Err(Error::UnsupportedSql(
+            "table constraint not supported yet".to_owned(),
+        )),
+    }
+}
+
+fn convert_index_column(column: IndexColumn) -> Result<IndexColumnSpec> {
+    Ok(IndexColumnSpec {
+        name: DbName::new(index_column_name(&column)?),
+        sort_dir: match column.column.options.asc {
+            Some(false) => SortDir::Desc,
+            _ => SortDir::Asc,
+        },
+        collation: None,
+    })
+}
+
+fn index_column_name(column: &IndexColumn) -> Result<String> {
+    match &column.column.expr {
+        Expr::Identifier(ident) => Ok(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) if parts.len() == 1 => Ok(parts[0].value.clone()),
+        Expr::CompoundIdentifier(parts) => Ok(parts
+            .last()
+            .ok_or_else(|| Error::UnsupportedSql("empty index column".to_owned()))?
+            .value
+            .clone()),
+        other => Err(Error::UnsupportedSql(format!(
+            "unsupported index column expression: {other:?}"
+        ))),
+    }
+}
+
+fn expr_to_kernel_ast(
+    expr: &Expr,
+    column_lookup: &std::collections::HashMap<String, usize>,
+) -> Result<ExprAst> {
+    Ok(match expr {
+        Expr::Value(v) => sql_value_to_kernel_ast(v)?,
+        Expr::Identifier(ident) => {
+            ExprAst::Column(resolve_column_ordinal_name(column_lookup, &ident.value)? as u16)
+        }
+        Expr::CompoundIdentifier(parts) => ExprAst::Column(resolve_column_ordinal_name(
+            column_lookup,
+            parts
+                .last()
+                .ok_or_else(|| Error::UnknownColumn("empty identifier".to_owned()))?
+                .value
+                .as_str(),
+        )? as u16),
+        Expr::Nested(expr) => expr_to_kernel_ast(expr, column_lookup)?,
+        Expr::UnaryOp { op, expr } => match op {
+            UnaryOperator::Not => ExprAst::Not(Box::new(expr_to_kernel_ast(expr, column_lookup)?)),
+            UnaryOperator::Plus => expr_to_kernel_ast(expr, column_lookup)?,
+            UnaryOperator::Minus => {
+                return Err(Error::UnsupportedSql(
+                    "negative numeric expressions are not supported in DDL".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(Error::UnsupportedSql(format!(
+                    "unsupported unary operator in DDL: {op:?}"
+                )));
+            }
+        },
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => ExprAst::And(
+                Box::new(expr_to_kernel_ast(left, column_lookup)?),
+                Box::new(expr_to_kernel_ast(right, column_lookup)?),
+            ),
+            BinaryOperator::Or => ExprAst::Or(
+                Box::new(expr_to_kernel_ast(left, column_lookup)?),
+                Box::new(expr_to_kernel_ast(right, column_lookup)?),
+            ),
+            BinaryOperator::Eq => ExprAst::Eq(
+                Box::new(expr_to_kernel_ast(left, column_lookup)?),
+                Box::new(expr_to_kernel_ast(right, column_lookup)?),
+            ),
+            BinaryOperator::NotEq | BinaryOperator::Spaceship => ExprAst::Ne(
+                Box::new(expr_to_kernel_ast(left, column_lookup)?),
+                Box::new(expr_to_kernel_ast(right, column_lookup)?),
+            ),
+            BinaryOperator::Lt => ExprAst::Lt(
+                Box::new(expr_to_kernel_ast(left, column_lookup)?),
+                Box::new(expr_to_kernel_ast(right, column_lookup)?),
+            ),
+            BinaryOperator::LtEq => ExprAst::Le(
+                Box::new(expr_to_kernel_ast(left, column_lookup)?),
+                Box::new(expr_to_kernel_ast(right, column_lookup)?),
+            ),
+            BinaryOperator::Gt => ExprAst::Gt(
+                Box::new(expr_to_kernel_ast(left, column_lookup)?),
+                Box::new(expr_to_kernel_ast(right, column_lookup)?),
+            ),
+            BinaryOperator::GtEq => ExprAst::Ge(
+                Box::new(expr_to_kernel_ast(left, column_lookup)?),
+                Box::new(expr_to_kernel_ast(right, column_lookup)?),
+            ),
+            _ => {
+                return Err(Error::UnsupportedSql(format!(
+                    "unsupported binary operator in DDL: {op:?}"
+                )));
+            }
+        },
+        Expr::IsNull(expr) => ExprAst::Eq(
+            Box::new(expr_to_kernel_ast(expr, column_lookup)?),
+            Box::new(ExprAst::Const(OwnedValue::Null)),
+        ),
+        Expr::IsNotNull(expr) => ExprAst::Ne(
+            Box::new(expr_to_kernel_ast(expr, column_lookup)?),
+            Box::new(ExprAst::Const(OwnedValue::Null)),
+        ),
+        Expr::Cast { expr, .. } => expr_to_kernel_ast(expr, column_lookup)?,
+        other => {
+            return Err(Error::UnsupportedSql(format!(
+                "unsupported DDL expression: {other:?}"
+            )));
+        }
+    })
+}
+
+fn sql_value_to_kernel_ast(v: &ValueWithSpan) -> Result<ExprAst> {
+    Ok(ExprAst::Const(match &v.value {
+        Value::Null => OwnedValue::Null,
+        Value::Boolean(v) => OwnedValue::Integer(if *v { 1 } else { 0 }),
+        Value::Number(num, _) => parse_numeric_value(num)?,
+        Value::SingleQuotedString(s)
+        | Value::DoubleQuotedString(s)
+        | Value::EscapedStringLiteral(s)
+        | Value::TripleSingleQuotedString(s)
+        | Value::TripleDoubleQuotedString(s)
+        | Value::UnicodeStringLiteral(s)
+        | Value::SingleQuotedRawStringLiteral(s)
+        | Value::DoubleQuotedRawStringLiteral(s)
+        | Value::TripleSingleQuotedRawStringLiteral(s)
+        | Value::TripleDoubleQuotedRawStringLiteral(s)
+        | Value::DollarQuotedString(sqlparser::ast::DollarQuotedString { value: s, .. }) => {
+            OwnedValue::Text(Arc::from(s.as_str()))
+        }
+        Value::SingleQuotedByteStringLiteral(s)
+        | Value::DoubleQuotedByteStringLiteral(s)
+        | Value::TripleSingleQuotedByteStringLiteral(s)
+        | Value::TripleDoubleQuotedByteStringLiteral(s) => {
+            OwnedValue::Blob(Arc::from(s.as_bytes()))
+        }
+        Value::HexStringLiteral(s) => OwnedValue::Blob(hex_string_to_bytes(s)?),
+        Value::Placeholder(name) => {
+            return Err(Error::UnsupportedSql(format!(
+                "placeholders are not allowed in DDL expressions: {name}"
+            )));
+        }
+        other => {
+            return Err(Error::UnsupportedSql(format!(
+                "unsupported SQL literal: {other:?}"
+            )));
+        }
+    }))
+}
+
+fn parse_numeric_value(input: &str) -> Result<OwnedValue> {
+    if let Ok(v) = input.parse::<i64>() {
+        return Ok(OwnedValue::Integer(v));
+    }
+    if let Ok(v) = input.parse::<f64>() {
+        return Ok(OwnedValue::Real(v));
+    }
+    Err(Error::UnsupportedSql(format!(
+        "invalid numeric literal: {input}"
+    )))
+}
+
+fn hex_string_to_bytes(input: &str) -> Result<Arc<[u8]>> {
+    if input.len() % 2 != 0 {
+        return Err(Error::UnsupportedSql(format!(
+            "invalid hex string literal: {input}"
+        )));
+    }
+    let mut out = Vec::with_capacity(input.len() / 2);
+    for pair in input.as_bytes().chunks_exact(2) {
+        let hi = hex_digit(pair[0])?;
+        let lo = hex_digit(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(Arc::from(out))
+}
+
+fn hex_digit(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(Error::UnsupportedSql(format!(
+            "invalid hex digit in blob literal: {}",
+            byte as char
+        ))),
+    }
+}
+
+fn resolve_column_ordinal_name(
+    column_lookup: &std::collections::HashMap<String, usize>,
+    name: &str,
+) -> Result<usize> {
+    column_lookup
+        .get(&name.to_ascii_lowercase())
+        .copied()
+        .ok_or_else(|| Error::UnknownColumn(name.to_owned()))
+}
+
+fn resolve_column_ordinal_in_table(
+    table: &Arc<redlinedb_kernel::catalog::TableDef>,
+    name: &str,
+) -> Result<usize> {
+    table
+        .columns
+        .iter()
+        .position(|column| column.folded.as_ref().eq_ignore_ascii_case(name))
+        .ok_or_else(|| Error::UnknownColumn(name.to_owned()))
+}
+
+fn resolve_column_ordinal_in_object_name(
+    table: &Arc<redlinedb_kernel::catalog::TableDef>,
+    name: &ObjectName,
+) -> Result<usize> {
+    match name.0.as_slice() {
+        [part] => resolve_column_ordinal_in_table(table, &object_name_part_to_string(part)?),
+        _ => Err(Error::UnsupportedSql(format!(
+            "unsupported column name: {name}"
+        ))),
+    }
+}
+
+fn split_name(name: ObjectName) -> Result<(Option<DbName>, DbName)> {
+    let display = name.to_string();
+    let parts = name.0;
+    match parts.as_slice() {
+        [part] => Ok((None, DbName::new(object_name_part_to_string(part)?))),
+        [schema, name] => Ok((
+            Some(DbName::new(object_name_part_to_string(schema)?)),
+            DbName::new(object_name_part_to_string(name)?),
+        )),
+        _ => Err(Error::UnsupportedSql(format!(
+            "unsupported qualified name: {display}"
+        ))),
+    }
+}
+
+fn parse_qualified_name(name: ObjectName) -> Result<QualifiedName> {
+    let (schema, name) = split_name(name)?;
+    Ok(QualifiedName {
+        schema: schema.unwrap_or_else(|| DbName::new("main")),
+        name,
+    })
+}
+
+fn bind_table_name(
+    schema: &SchemaSnapshot,
+    name: &ObjectName,
+) -> Result<Arc<redlinedb_kernel::catalog::TableDef>> {
+    let qualified = parse_qualified_name(name.clone())?;
+    Ok(lookup_table(schema, &qualified)?)
+}
+
+fn bind_table_object(
+    schema: &SchemaSnapshot,
+    table: &TableObject,
+) -> Result<Arc<redlinedb_kernel::catalog::TableDef>> {
+    match table {
+        TableObject::TableName(name) => bind_table_name(schema, name),
+        TableObject::TableFunction(_) => Err(Error::UnsupportedSql(
+            "table functions are not supported".to_owned(),
+        )),
+    }
+}
+
+fn bind_select_from(
+    schema: &SchemaSnapshot,
+    from: Vec<TableWithJoins>,
+    params: &mut ParamLayout,
+) -> Result<(SelectSource, Option<Expr>)> {
+    if from.is_empty() {
+        return Ok((SelectSource::Empty, None));
+    }
+
+    let mut tables: Vec<BoundTable> = Vec::new();
+    let mut selection = None;
+    let mut saw_sqlite_schema = false;
+
+    for table in from {
+        match &table.relation {
+            TableFactor::Table { name, .. } if is_sqlite_schema_name(name) => {
+                if !table.joins.is_empty() {
+                    return Err(Error::UnsupportedSql(
+                        "sqlite_schema cannot participate in joins".to_owned(),
+                    ));
+                }
+                saw_sqlite_schema = true;
+                continue;
+            }
+            _ => {}
+        }
+        if table.joins.is_empty() {
+            let bound = bind_select_table_factor(schema, table.relation)?;
+            tables.push(bound);
+        } else {
+            let (mut more, join_selection) = bind_select_table_with_joins(schema, table, params)?;
+            tables.append(&mut more);
+            if let Some(expr) = join_selection {
+                selection = Some(match selection {
+                    Some(prev) => and_expr(prev, expr),
+                    None => expr,
+                });
+            }
+        }
+    }
+
+    let source = if saw_sqlite_schema && tables.is_empty() {
+        SelectSource::SqliteSchema
+    } else if tables.len() == 1 && tables[0].alias.is_none() && selection.is_none() {
+        SelectSource::Table(Arc::clone(&tables[0].table))
+    } else if tables.len() == 1 {
+        SelectSource::Tables(tables)
+    } else {
+        SelectSource::Tables(tables)
+    };
+
+    Ok((source, selection))
+}
+
+fn bind_select_table_with_joins(
+    schema: &SchemaSnapshot,
+    table: TableWithJoins,
+    params: &mut ParamLayout,
+) -> Result<(Vec<BoundTable>, Option<Expr>)> {
+    let base = bind_select_table_factor(schema, table.relation)?;
+    let mut tables = vec![base];
+    let mut selection = None;
+    for join in table.joins {
+        let right = bind_select_join_relation(schema, join.relation)?;
+        let join_selection = match join.join_operator {
+            JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+                bind_join_constraint(&tables, &right, constraint, params)?
+            }
+            JoinOperator::CrossJoin(constraint) => match constraint {
+                JoinConstraint::None => None,
+                _ => {
+                    return Err(Error::UnsupportedSql(
+                        "CROSS JOIN cannot have a constraint".to_owned(),
+                    ));
+                }
+            },
+            JoinOperator::Left(_)
+            | JoinOperator::LeftOuter(_)
+            | JoinOperator::Right(_)
+            | JoinOperator::RightOuter(_)
+            | JoinOperator::FullOuter(_)
+            | JoinOperator::Semi(_)
+            | JoinOperator::LeftSemi(_)
+            | JoinOperator::RightSemi(_)
+            | JoinOperator::Anti(_)
+            | JoinOperator::LeftAnti(_)
+            | JoinOperator::RightAnti(_)
+            | JoinOperator::CrossApply
+            | JoinOperator::OuterApply
+            | JoinOperator::AsOf { .. }
+            | JoinOperator::StraightJoin(_) => {
+                return Err(Error::UnsupportedSql(
+                    "only INNER and CROSS joins are supported".to_owned(),
+                ));
+            }
+        };
+        if let Some(expr) = join_selection {
+            selection = Some(match selection {
+                Some(prev) => and_expr(prev, expr),
+                None => expr,
+            });
+        }
+        tables.push(right);
+    }
+
+    Ok((tables, selection))
+}
+
+fn bind_select_table_factor(schema: &SchemaSnapshot, relation: TableFactor) -> Result<BoundTable> {
+    match relation {
+        TableFactor::Table {
+            name, alias, args, ..
+        } => {
+            if args.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "table-valued functions are not supported".to_owned(),
+                ));
+            }
+            Ok(BoundTable {
+                table: bind_table_name(schema, &name)?,
+                alias: alias.map(|alias| Arc::from(alias.name.value)),
+            })
+        }
+        _ => Err(Error::UnsupportedSql(
+            "only direct table scans are supported".to_owned(),
+        )),
+    }
+}
+
+fn bind_select_join_relation(schema: &SchemaSnapshot, relation: TableFactor) -> Result<BoundTable> {
+    bind_select_table_factor(schema, relation)
+}
+
+fn bind_join_constraint(
+    left: &[BoundTable],
+    right: &BoundTable,
+    constraint: JoinConstraint,
+    params: &mut ParamLayout,
+) -> Result<Option<Expr>> {
+    match constraint {
+        JoinConstraint::None => Ok(None),
+        JoinConstraint::On(expr) => Ok(Some(normalize_expr(expr, params)?)),
+        JoinConstraint::Using(columns) => {
+            let right_name = right
+                .alias
+                .as_ref()
+                .map(|alias| alias.to_string())
+                .unwrap_or_else(|| right.table.name.to_string());
+            let left_name = left
+                .last()
+                .map(|table| {
+                    table
+                        .alias
+                        .as_ref()
+                        .map(|alias| alias.to_string())
+                        .unwrap_or_else(|| table.table.name.to_string())
+                })
+                .ok_or_else(|| Error::UnsupportedSql("USING requires a left table".to_owned()))?;
+            let mut expr = None;
+            for column in columns {
+                let column_name = object_name_part_to_string(
+                    column
+                        .0
+                        .last()
+                        .ok_or_else(|| Error::UnsupportedSql("empty USING column".to_owned()))?,
+                )?;
+                let left_col = Expr::CompoundIdentifier(vec![
+                    Ident::new(left_name.clone()),
+                    Ident::new(column_name.clone()),
+                ]);
+                let right_col = Expr::CompoundIdentifier(vec![
+                    Ident::new(right_name.clone()),
+                    Ident::new(column_name),
+                ]);
+                let eq = Expr::BinaryOp {
+                    left: Box::new(left_col),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(right_col),
+                };
+                expr = Some(match expr {
+                    Some(prev) => and_expr(prev, eq),
+                    None => eq,
+                });
+            }
+            Ok(expr)
+        }
+        JoinConstraint::Natural => Err(Error::UnsupportedSql(
+            "NATURAL joins are not supported".to_owned(),
+        )),
+    }
+}
+
+fn and_expr(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinaryOperator::And,
+        right: Box::new(right),
+    }
+}
+
+fn bind_table_with_joins(
+    schema: &SchemaSnapshot,
+    table: &TableWithJoins,
+) -> Result<Arc<redlinedb_kernel::catalog::TableDef>> {
+    if !table.joins.is_empty() {
+        return Err(Error::UnsupportedSql(
+            "joins are not supported in UPDATE/DELETE targets yet".to_owned(),
+        ));
+    }
+    match &table.relation {
+        TableFactor::Table { name, args, .. } => {
+            if args.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "table-valued functions are not supported".to_owned(),
+                ));
+            }
+            bind_table_name(schema, name)
+        }
+        _ => Err(Error::UnsupportedSql(
+            "only direct table scans are supported".to_owned(),
+        )),
+    }
+}
+
+fn push_projection_columns(source: &SelectSource, out: &mut Vec<String>) {
+    match source {
+        SelectSource::Table(table) => {
+            out.extend(table.columns.iter().map(|column| column.name.to_string()));
+        }
+        SelectSource::Tables(tables) => {
+            for table in tables {
+                out.extend(table.table.columns.iter().map(|column| {
+                    if let Some(alias) = &table.alias {
+                        format!("{}.{}", alias, column.name)
+                    } else {
+                        format!("{}.{}", table.table.name, column.name)
+                    }
+                }));
+            }
+        }
+        SelectSource::SqliteSchema => {
+            out.extend(
+                ["type", "name", "tbl_name", "rootpage", "sql"]
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+        }
+        SelectSource::Empty => {}
+    }
+}
+
+fn render_expr_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|ident| ident.value.clone())
+            .unwrap_or_else(|| expr.to_string()),
+        _ => expr.to_string(),
+    }
+}
+
+fn is_sqlite_schema_name(name: &ObjectName) -> bool {
+    match name.0.as_slice() {
+        [part] => object_name_part_to_string(part)
+            .map(|s| {
+                s.eq_ignore_ascii_case("sqlite_schema") || s.eq_ignore_ascii_case("sqlite_master")
+            })
+            .unwrap_or(false),
+        [schema, table] => {
+            let schema = object_name_part_to_string(schema).ok();
+            let table = object_name_part_to_string(table).ok();
+            matches!(
+                (schema.as_deref(), table.as_deref()),
+                (Some("main"), Some("sqlite_schema")) | (Some("main"), Some("sqlite_master"))
+            )
+        }
+        _ => false,
+    }
+}
+
+fn object_name_part_to_string(part: &ObjectNamePart) -> Result<String> {
+    match part {
+        ObjectNamePart::Identifier(ident) => Ok(ident.value.clone()),
+        ObjectNamePart::Function(_) => Err(Error::UnsupportedSql(
+            "function-style object names are not supported".to_owned(),
+        )),
+    }
+}
