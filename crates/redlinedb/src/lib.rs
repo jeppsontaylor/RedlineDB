@@ -3,6 +3,7 @@ mod error;
 mod machine;
 mod options;
 mod params;
+mod phase8;
 mod registry;
 mod value;
 
@@ -25,6 +26,12 @@ pub use options::{
     OpenOptions, OptimizerOptions, QueryMemoryOptions, VacuumStats,
 };
 pub use params::Params;
+pub use phase8::{
+    ArchiveMode, ArchiveStats, PhysicalBackupOptions, PhysicalBackupStats, ReplicationSlot,
+    ReplicationSlotStats, RestoreOptions, RestoreStats, RetentionHorizon, SlotKind, WalLevel,
+};
+pub use redlinedb_kernel::format::{BackupId, Csn, DbId, Lsn, TimelineId, WalSegmentNo};
+pub use redlinedb_sql::RecoveryTarget;
 pub use value::{Value, ValueRef};
 
 pub use redlinedb_sql::BeginMode;
@@ -127,6 +134,7 @@ impl Database {
 
     pub fn checkpoint(&self) -> Result<CheckpointStats> {
         let checkpoint = self.inner.db.checkpoint()?;
+        let _ = phase8::update_retention(self);
         Ok(CheckpointStats {
             generation: checkpoint.control.generation,
             checkpoint_lsn: checkpoint.control.checkpoint_lsn.0,
@@ -168,6 +176,50 @@ impl Database {
         options: BackupOptions,
     ) -> Result<BackupStats> {
         backup::backup_to_path(self, dst, options)
+    }
+
+    pub fn backup_physical_to_path(
+        &self,
+        dst: impl AsRef<Path>,
+        options: PhysicalBackupOptions,
+    ) -> Result<PhysicalBackupStats> {
+        phase8::backup_physical_to_path(self, dst, options)
+    }
+
+    pub fn restore_from_backup(
+        src: impl AsRef<Path>,
+        dst: impl AsRef<Path>,
+        options: RestoreOptions,
+    ) -> Result<RestoreStats> {
+        phase8::restore_from_backup(src, dst, options)
+    }
+
+    pub fn create_physical_slot(&self, name: &str) -> Result<ReplicationSlot> {
+        phase8::create_physical_slot(self, name, true)
+    }
+
+    pub fn create_logical_slot(&self, name: &str) -> Result<ReplicationSlot> {
+        phase8::create_logical_slot(self, name, true)
+    }
+
+    pub fn drop_replication_slot(&self, name: &str) -> Result<()> {
+        phase8::drop_replication_slot(self, name)
+    }
+
+    pub fn archive_stats(&self) -> Result<ArchiveStats> {
+        phase8::archive_stats(self)
+    }
+
+    pub fn replication_slots(&self) -> Result<Vec<ReplicationSlotStats>> {
+        phase8::replication_slots(self)
+    }
+
+    pub fn retention_horizon(&self) -> Result<RetentionHorizon> {
+        phase8::retention_horizon(self)
+    }
+
+    pub fn database_id(&self) -> Result<DbId> {
+        phase8::current_database_id(self)
     }
 
     pub fn interrupt_all(&self) {

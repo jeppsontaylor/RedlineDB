@@ -27,6 +27,28 @@ id_type!(TxId);
 id_type!(Csn);
 id_type!(RowId);
 id_type!(UndoPtr);
+id_type!(DbId);
+id_type!(TimelineId);
+id_type!(WalSegmentNo);
+id_type!(ReplicationSlotId);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct BackupId(pub u128);
+
+impl BackupId {
+    pub const ZERO: Self = Self(0);
+
+    #[inline]
+    pub const fn new(value: u128) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PageGeneration(pub u32);

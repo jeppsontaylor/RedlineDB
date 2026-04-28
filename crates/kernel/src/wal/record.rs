@@ -22,6 +22,11 @@ pub enum WalRecordKind {
     Abort = 6,
     CheckpointBegin = 7,
     CheckpointEnd = 8,
+    SegmentSeal = 9,
+    BackupBegin = 10,
+    BackupEnd = 11,
+    TimelineFork = 12,
+    Logical = 13,
 }
 
 impl WalRecordKind {
@@ -35,6 +40,11 @@ impl WalRecordKind {
             6 => Ok(Self::Abort),
             7 => Ok(Self::CheckpointBegin),
             8 => Ok(Self::CheckpointEnd),
+            9 => Ok(Self::SegmentSeal),
+            10 => Ok(Self::BackupBegin),
+            11 => Ok(Self::BackupEnd),
+            12 => Ok(Self::TimelineFork),
+            13 => Ok(Self::Logical),
             _ => Err(Error::CorruptWal("unknown record kind")),
         }
     }

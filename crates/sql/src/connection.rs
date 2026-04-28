@@ -7,7 +7,9 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use redlinedb_kernel::catalog::{SchemaSnapshot, StatsEpoch, StatsSnapshot, StatsStore};
 use redlinedb_kernel::engine::page_heap::VacuumStats;
-use redlinedb_kernel::engine::{CheckpointStats, Engine, EngineConfig, StorageStatsSnapshot, Txn};
+use redlinedb_kernel::engine::{
+    CheckpointStats, Engine, EngineConfig, RecoveryTarget, StorageStatsSnapshot, Txn,
+};
 use redlinedb_kernel::txn::Isolation;
 
 use crate::error::{Error, Result};
@@ -197,6 +199,31 @@ impl Database {
         }))
     }
 
+    pub fn open_with_recovery_target(
+        path: impl AsRef<Path>,
+        opts: DbOptions,
+        target: RecoveryTarget,
+    ) -> Result<Arc<Self>> {
+        let base = path.as_ref();
+        let engine = Engine::open_with_recovery_target(base, opts.engine, target)?;
+        let stats_store = StatsStore::new(base);
+        let stats = stats_store
+            .load()?
+            .unwrap_or_else(|| Arc::new(StatsSnapshot::default()));
+        let optimizer_hash = hash_optimizer(&opts.optimizer, &opts.query_memory);
+        Ok(Arc::new(Self {
+            engine,
+            unique_locks: UniqueLockTable::new(opts.unique_lock_shards),
+            stmt_cache: StatementCache::new(),
+            optimizer_hash,
+            stats_store,
+            stats: ArcSwap::from(stats),
+            stats_config: opts.stats,
+            query_memory: opts.query_memory,
+            optimizer: opts.optimizer,
+        }))
+    }
+
     pub fn connect(self: &Arc<Self>) -> Arc<Connection> {
         Arc::new(Connection {
             db: Arc::clone(self),
@@ -247,12 +274,20 @@ impl Database {
         Ok(self.engine.storage_stats()?)
     }
 
+    pub fn tx_status_stats(&self) -> redlinedb_kernel::engine::TxStatusStats {
+        self.engine.tx_status_stats()
+    }
+
     pub fn schema_epoch(&self) -> redlinedb_kernel::catalog::SchemaEpoch {
         self.engine.schema_epoch()
     }
 
     pub fn schema_snapshot(&self) -> Arc<SchemaSnapshot> {
         self.engine.schema_snapshot()
+    }
+
+    pub fn engine_config(&self) -> EngineConfig {
+        self.engine.config().clone()
     }
 }
 

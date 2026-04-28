@@ -12,6 +12,7 @@ pub use connection::{
     Connection, Database, DbOptions, OptimizerConfig, QueryMemoryConfig, StatsConfig,
 };
 pub use error::{Error, Result};
+pub use redlinedb_kernel::engine::RecoveryTarget;
 pub use session::BeginMode;
 pub use statement::{
     AnalyzePlan, ExplainFormat, ExplainPlan, PreparedTemplate, SelectPlan, SelectSource, Statement,

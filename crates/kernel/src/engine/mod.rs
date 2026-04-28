@@ -12,7 +12,6 @@ use crate::catalog::{
 };
 use crate::engine::lock::RowLockManager;
 use crate::engine::page_heap::{PageBackedHeap, VacuumStats};
-use crate::engine::tx::{ConcurrentTxStatus, TxStatusStats};
 use crate::format::{Csn, DEFAULT_PAGE_SIZE, Lsn, Page, RelId, RowId, TxId};
 use crate::storage::{
     BufferPool, BufferPoolStats, ControlFile, ControlStore, DEFAULT_CHECKPOINT_BATCH_PAGES,
@@ -24,7 +23,7 @@ use crate::wal::{
 };
 use crate::{Error, Result};
 
-pub use tx::Txn;
+pub use tx::{ConcurrentTxStatus, TxStatusStats, Txn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckpointStats {
@@ -53,6 +52,13 @@ pub struct RecoveryReport {
     pub legacy_mutations_redone: usize,
     pub commits_recovered: usize,
     pub replay_from_lsn: Lsn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryTarget {
+    Latest,
+    Lsn(Lsn),
+    Csn(Csn),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -106,6 +112,7 @@ impl Default for EngineConfig {
 
 #[derive(Debug)]
 pub struct Engine {
+    config: EngineConfig,
     rel_id: RelId,
     txs: ConcurrentTxStatus,
     #[allow(dead_code)]
@@ -130,7 +137,7 @@ impl Engine {
         let buffer = Arc::new(BufferPool::new(page_file, config.buffer_pool_pages)?);
         let wal = Arc::new(WalCoordinator::create(
             path.as_ref().join("wal"),
-            config.wal,
+            config.wal.clone(),
         )?);
         let control = ControlStore::new(path.as_ref())?;
         let tx_status_store = TxStatusStore::new(path.as_ref())?;
@@ -145,6 +152,7 @@ impl Engine {
         }
         let buffer = Arc::clone(&buffer);
         Ok(Arc::new(Self {
+            config: config.clone(),
             rel_id: config.rel_id,
             txs: ConcurrentTxStatus::new(),
             buffer: Arc::clone(&buffer),
@@ -172,6 +180,22 @@ impl Engine {
         path: impl AsRef<Path>,
         config: EngineConfig,
     ) -> Result<(Arc<Self>, RecoveryReport)> {
+        Self::open_with_recovery_report_and_target(path, config, RecoveryTarget::Latest)
+    }
+
+    pub fn open_with_recovery_target(
+        path: impl AsRef<Path>,
+        config: EngineConfig,
+        target: RecoveryTarget,
+    ) -> Result<Arc<Self>> {
+        Self::open_with_recovery_report_and_target(path, config, target).map(|(engine, _)| engine)
+    }
+
+    pub fn open_with_recovery_report_and_target(
+        path: impl AsRef<Path>,
+        config: EngineConfig,
+        target: RecoveryTarget,
+    ) -> Result<(Arc<Self>, RecoveryReport)> {
         let wal_dir = path.as_ref().join("wal");
         let mut reader = WalReader::new(&wal_dir, config.wal.clone());
         let scan_report = reader.scan_report()?;
@@ -187,7 +211,7 @@ impl Engine {
             Arc::new(PageFile::create(page_path, config.page_size)?)
         };
         let buffer = Arc::new(BufferPool::new(page_file, config.buffer_pool_pages)?);
-        let wal = Arc::new(WalCoordinator::open(wal_dir, config.wal)?);
+        let wal = Arc::new(WalCoordinator::open(wal_dir, config.wal.clone())?);
         let heap = PageBackedHeap::new_with_wal(
             config.rel_id,
             config.heap_lanes,
@@ -217,12 +241,13 @@ impl Engine {
         } else {
             Lsn::ZERO
         };
-        let metrics = recover_heap(&scan_report.records, replay_from_lsn, &txs, &heap)?;
+        let metrics = recover_heap(&scan_report.records, replay_from_lsn, target, &txs, &heap)?;
         let page_count = heap.page_count()?;
         heap.load_row_directory_from_pages(page_count)?;
         heap.load_reusable_pages_from_pages(page_count)?;
         let catalog = CatalogManager::new(initial_catalog);
         let engine = Arc::new(Self {
+            config: config.clone(),
             rel_id: config.rel_id,
             txs,
             buffer: Arc::clone(&buffer),
@@ -239,6 +264,10 @@ impl Engine {
             engine,
             RecoveryReport::from_scan(scan_report, metrics, replay_from_lsn),
         ))
+    }
+
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
     }
 
     pub fn begin(&self, isolation: Isolation) -> Result<Txn> {
@@ -609,6 +638,7 @@ impl Engine {
 fn recover_heap(
     records: &[WalRecord],
     replay_from_lsn: Lsn,
+    target: RecoveryTarget,
     txs: &ConcurrentTxStatus,
     heap: &PageBackedHeap,
 ) -> Result<RecoveryMetrics> {
@@ -618,9 +648,11 @@ fn recover_heap(
         if record.kind == WalRecordKind::Commit {
             match WalPayload::decode(&record.payload)? {
                 WalPayload::Commit { tx_id, csn } => {
-                    committed.insert(tx_id, csn);
-                    txs.publish_recovered_commit(tx_id, csn);
-                    metrics.commits_recovered += 1;
+                    if commit_visible(record.lsn, csn, target) {
+                        committed.insert(tx_id, csn);
+                        txs.publish_recovered_commit(tx_id, csn);
+                        metrics.commits_recovered += 1;
+                    }
                 }
                 _ => return Err(Error::CorruptWal("commit record has non-commit payload")),
             }
@@ -629,6 +661,9 @@ fn recover_heap(
 
     for record in records {
         if record.lsn < replay_from_lsn {
+            continue;
+        }
+        if matches!(target, RecoveryTarget::Lsn(limit) if record.lsn >= limit) {
             continue;
         }
         if record.kind == WalRecordKind::Commit {
@@ -674,11 +709,24 @@ fn recover_heap(
             WalPayload::HeapInsert { .. }
             | WalPayload::HeapUpdate { .. }
             | WalPayload::HeapDelete { .. } => {}
+            WalPayload::SegmentSeal { .. }
+            | WalPayload::BackupBegin { .. }
+            | WalPayload::BackupEnd { .. }
+            | WalPayload::TimelineFork { .. }
+            | WalPayload::LogicalTxn { .. } => {}
             WalPayload::Commit { .. } => unreachable!("commit records are skipped above"),
         }
     }
 
     Ok(metrics)
+}
+
+fn commit_visible(record_lsn: Lsn, csn: Csn, target: RecoveryTarget) -> bool {
+    match target {
+        RecoveryTarget::Latest => true,
+        RecoveryTarget::Lsn(limit) => record_lsn < limit,
+        RecoveryTarget::Csn(limit) => csn <= limit,
+    }
 }
 
 fn record_end_lsn(record: &WalRecord) -> Lsn {
