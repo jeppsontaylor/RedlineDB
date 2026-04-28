@@ -1,0 +1,23 @@
+{
+  "workspace": "crates/*",
+  "owners": {
+    "crates/kernel": "storage-and-catalog",
+    "crates/kernel/src/wal": "wal-archive-retention",
+    "crates/kernel/src/backup": "backup-restore",
+    "crates/kernel/src/replication": "replication-streams",
+    "crates/kernel/src/timeline.rs": "timeline-management",
+    "crates/sql": "sql-parser-planner-executor",
+    "crates/redlinedb": "public-rust-facade",
+    "crates/ffi": "c-abi",
+    "crates/cli": "cli-shell",
+    "crates/server": "framed-server",
+    "crates/bench": "bench-harness",
+    "crates/cli/src": "cli-backup-restore",
+    "crates/redlinedb/src": "rust-public-api",
+    "crates/server/src": "server-protocol"
+  },
+  "edit_zones": {
+    "active_source_max_loc": 2000,
+    "preferred_target_max_loc": 1500
+  }
+}

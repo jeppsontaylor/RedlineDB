@@ -62,7 +62,7 @@ impl ControlStore {
             checkpoint_lsn,
             page_count,
         };
-        let name = if next.generation % 2 == 0 {
+        let name = if next.generation.is_multiple_of(2) {
             CONTROL_B
         } else {
             CONTROL_A

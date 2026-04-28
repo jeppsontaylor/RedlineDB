@@ -6,6 +6,9 @@ use crate::Result;
 
 pub trait FileHandle {
     fn len(&self) -> Result<u64>;
+    fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
     fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()>;
     fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> Result<()>;
     fn sync_data(&self) -> Result<()>;

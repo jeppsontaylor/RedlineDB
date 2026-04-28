@@ -39,6 +39,12 @@ pub struct VacuumStats {
     pub oldest_active_snapshot_csn: Csn,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RelationWriteTarget {
+    pub rel_id: RelId,
+    pub row_id: RowId,
+}
+
 impl PageBackedHeap {
     pub fn new(rel_id: RelId, lanes: usize, buffer: Arc<BufferPool>) -> Result<Self> {
         Self::new_with_wal(rel_id, lanes, buffer, None)
@@ -151,13 +157,12 @@ impl PageBackedHeap {
         tx_id: TxId,
         snapshot: &Snapshot,
         tx_status: &ConcurrentTxStatus,
-        rel_id: RelId,
-        row_id: RowId,
+        target: RelationWriteTarget,
         payload: Vec<u8>,
         lsn: Lsn,
     ) -> Result<()> {
-        let current = self.visible_tuple_for_write(tx_id, snapshot, tx_status, row_id)?;
-        self.append_update_version(tx_id, rel_id, row_id, payload, current, lsn)
+        let current = self.visible_tuple_for_write(tx_id, snapshot, tx_status, target.row_id)?;
+        self.append_update_version(tx_id, target.rel_id, target.row_id, payload, current, lsn)
     }
 
     pub fn update_recovered(&self, tx_id: TxId, row_id: RowId, payload: Vec<u8>) -> Result<()> {
@@ -689,14 +694,14 @@ impl PageBackedHeap {
         let mut shard = shard
             .write()
             .map_err(|_| Error::CorruptPage("relation row dir shard poisoned"))?;
-        if let Some(entries) = shard.get_mut(&rel_id) {
-            if entries.get(&row_id).copied() == Some(expected) {
-                entries.remove(&row_id);
-                if entries.is_empty() {
-                    shard.remove(&rel_id);
-                }
-                return Ok(true);
+        if let Some(entries) = shard.get_mut(&rel_id)
+            && entries.get(&row_id).copied() == Some(expected)
+        {
+            entries.remove(&row_id);
+            if entries.is_empty() {
+                shard.remove(&rel_id);
             }
+            return Ok(true);
         }
         Ok(false)
     }

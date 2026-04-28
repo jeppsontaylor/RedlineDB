@@ -87,12 +87,12 @@ impl UniqueLockTable {
 
     fn unlock(&self, shard: usize, key: Vec<u8>, owner: u64) {
         if let Ok(mut map) = self.shards[shard].lock() {
-            if let Some(state) = map.get_mut(&key) {
-                if state.owner == owner {
-                    state.depth = state.depth.saturating_sub(1);
-                    if state.depth == 0 {
-                        map.remove(&key);
-                    }
+            if let Some(state) = map.get_mut(&key)
+                && state.owner == owner
+            {
+                state.depth = state.depth.saturating_sub(1);
+                if state.depth == 0 {
+                    map.remove(&key);
                 }
             }
             self.cvars[shard].notify_all();

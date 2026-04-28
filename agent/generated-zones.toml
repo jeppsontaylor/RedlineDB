@@ -1,0 +1,5 @@
+generated = [
+  "docs/archive/**",
+  "target/**",
+]
+

@@ -235,18 +235,18 @@ pub fn apply_create_table(
                 columns: pk_columns,
                 conflict,
             } => {
-                let (index, constraint_def) = build_table_constraint_index(
-                    &spec.name,
-                    table_id,
-                    &mut next_object_id,
-                    &mut next_relation_id,
-                    ConstraintKind::PrimaryKey,
-                    IndexOrigin::PrimaryKey,
-                    true,
-                    pk_columns,
-                    conflict,
-                    &column_lookup,
-                )?;
+                let (index, constraint_def) =
+                    build_table_constraint_index(TableConstraintIndexInput {
+                        table_name: &spec.name,
+                        table_id,
+                        next_object_id: &mut next_object_id,
+                        next_relation_id: &mut next_relation_id,
+                        origin: IndexOrigin::PrimaryKey,
+                        unique: true,
+                        columns: pk_columns,
+                        conflict,
+                        column_lookup: &column_lookup,
+                    })?;
                 constraints.push(ConstraintDef {
                     constraint_id: constraint_def,
                     table_id,
@@ -264,18 +264,18 @@ pub fn apply_create_table(
                 columns: unique_columns,
                 conflict,
             } => {
-                let (index, constraint_def) = build_table_constraint_index(
-                    &spec.name,
-                    table_id,
-                    &mut next_object_id,
-                    &mut next_relation_id,
-                    ConstraintKind::Unique,
-                    IndexOrigin::UniqueConstraint,
-                    true,
-                    unique_columns,
-                    conflict,
-                    &column_lookup,
-                )?;
+                let (index, constraint_def) =
+                    build_table_constraint_index(TableConstraintIndexInput {
+                        table_name: &spec.name,
+                        table_id,
+                        next_object_id: &mut next_object_id,
+                        next_relation_id: &mut next_relation_id,
+                        origin: IndexOrigin::UniqueConstraint,
+                        unique: true,
+                        columns: unique_columns,
+                        conflict,
+                        column_lookup: &column_lookup,
+                    })?;
                 constraints.push(ConstraintDef {
                     constraint_id: constraint_def,
                     table_id,
@@ -443,39 +443,52 @@ pub fn apply_drop_index(
     Ok(snapshot)
 }
 
-fn build_table_constraint_index(
-    table_name: &DbName,
+struct TableConstraintIndexInput<'a> {
+    table_name: &'a DbName,
     table_id: TableId,
-    next_object_id: &mut ObjectId,
-    next_relation_id: &mut RelId,
-    _constraint_kind: ConstraintKind,
+    next_object_id: &'a mut ObjectId,
+    next_relation_id: &'a mut RelId,
     origin: IndexOrigin,
     unique: bool,
-    columns: &[DbName],
-    conflict: &ConflictAction,
-    column_lookup: &HashMap<Box<str>, u16>,
+    columns: &'a [DbName],
+    conflict: &'a ConflictAction,
+    column_lookup: &'a HashMap<Box<str>, u16>,
+}
+
+fn build_table_constraint_index(
+    input: TableConstraintIndexInput<'_>,
 ) -> Result<(IndexDef, ConstraintId)> {
-    let constraint_id = ConstraintId(next_object_id.0);
-    next_object_id.0 += 1;
-    let index_id = IndexId(next_object_id.0);
-    next_object_id.0 += 1;
-    let keys = build_index_keys_from_names(columns, column_lookup)?;
+    let constraint_id = ConstraintId(input.next_object_id.0);
+    input.next_object_id.0 += 1;
+    let index_id = IndexId(input.next_object_id.0);
+    input.next_object_id.0 += 1;
+    let keys = build_index_keys_from_names(input.columns, input.column_lookup)?;
     let index = IndexDef {
         index_id,
-        table_id,
-        relation_id: *next_relation_id,
+        table_id: input.table_id,
+        relation_id: *input.next_relation_id,
         meta_page_id: None,
-        name: format!("sqlite_autoindex_{}_{}", table_name.folded(), index_id.0).into_boxed_str(),
-        folded: format!("sqlite_autoindex_{}_{}", table_name.folded(), index_id.0).into_boxed_str(),
-        unique,
-        primary: matches!(origin, IndexOrigin::PrimaryKey),
-        origin,
+        name: format!(
+            "sqlite_autoindex_{}_{}",
+            input.table_name.folded(),
+            index_id.0
+        )
+        .into_boxed_str(),
+        folded: format!(
+            "sqlite_autoindex_{}_{}",
+            input.table_name.folded(),
+            index_id.0
+        )
+        .into_boxed_str(),
+        unique: input.unique,
+        primary: matches!(input.origin, IndexOrigin::PrimaryKey),
+        origin: input.origin,
         keys,
         flags: 0,
         normalized_sql: None,
     };
-    next_relation_id.0 += 1;
-    let _ = conflict;
+    input.next_relation_id.0 += 1;
+    let _ = input.conflict;
     Ok((index, constraint_id))
 }
 

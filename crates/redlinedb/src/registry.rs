@@ -126,10 +126,10 @@ fn normalize_path(path: &Path, create: bool) -> Result<PathBuf> {
         return Ok(fs::canonicalize(path)?);
     }
     if create {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
         fs::create_dir_all(path)?;
         return Ok(fs::canonicalize(path)?);

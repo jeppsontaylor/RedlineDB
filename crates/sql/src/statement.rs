@@ -48,10 +48,10 @@ impl ParamLayout {
     }
 
     pub fn slot_for_name(&self, name: &str) -> Option<usize> {
-        if let Some(rest) = name.strip_prefix('?') {
-            if let Ok(slot) = rest.parse::<usize>() {
-                return Some(slot);
-            }
+        if let Some(rest) = name.strip_prefix('?')
+            && let Ok(slot) = rest.parse::<usize>()
+        {
+            return Some(slot);
         }
         self.named
             .get(name)
@@ -78,6 +78,7 @@ pub struct PreparedTemplate {
     pub kind: PreparedKind,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum PreparedKind {
     Begin(BeginMode),
@@ -161,6 +162,7 @@ pub struct DeletePlan {
     pub selection: Option<Expr>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Default)]
 pub(crate) enum RuntimeState {
     #[default]
@@ -264,7 +266,7 @@ impl Statement {
             .template
             .param_layout
             .slot_for_name(name)
-            .ok_or_else(|| Error::ParameterOutOfRange(0))?;
+            .ok_or(Error::ParameterOutOfRange(0))?;
         self.set_binding(slot, value)
     }
 

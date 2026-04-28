@@ -113,17 +113,12 @@ fn sqlite_schema_lists_created_objects() {
         .expect("prepare schema query");
 
     let mut rows = Vec::new();
-    loop {
-        match stmt.step().expect("step") {
-            Step::Row => {
-                rows.push((
-                    stmt.column_text(0).expect("type").to_owned(),
-                    stmt.column_text(1).expect("name").to_owned(),
-                    stmt.column_text(2).expect("tbl").to_owned(),
-                ));
-            }
-            Step::Done => break,
-        }
+    while let Step::Row = stmt.step().expect("step") {
+        rows.push((
+            stmt.column_text(0).expect("type").to_owned(),
+            stmt.column_text(1).expect("name").to_owned(),
+            stmt.column_text(2).expect("tbl").to_owned(),
+        ));
     }
 
     assert!(

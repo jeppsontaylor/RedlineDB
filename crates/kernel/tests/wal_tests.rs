@@ -535,10 +535,11 @@ fn wal_segment_count(path: &std::path::Path) -> usize {
         let entry = entry.unwrap();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(number) = name.strip_suffix(".wal") {
-            if number.len() == 20 && number.bytes().all(|byte| byte.is_ascii_digit()) {
-                count += 1;
-            }
+        if let Some(number) = name.strip_suffix(".wal")
+            && number.len() == 20
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            count += 1;
         }
     }
     count
@@ -553,12 +554,12 @@ fn wal_segment_numbers(path: &std::path::Path) -> Vec<u64> {
         let entry = entry.unwrap();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(number) = name.strip_suffix(".wal") {
-            if number.len() == 20 && number.bytes().all(|byte| byte.is_ascii_digit()) {
-                if let Ok(segment) = number.parse::<u64>() {
-                    segments.push(segment);
-                }
-            }
+        if let Some(number) = name.strip_suffix(".wal")
+            && number.len() == 20
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+            && let Ok(segment) = number.parse::<u64>()
+        {
+            segments.push(segment);
         }
     }
     segments.sort_unstable();

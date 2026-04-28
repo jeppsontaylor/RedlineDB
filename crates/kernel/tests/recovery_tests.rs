@@ -570,12 +570,11 @@ fn wal_segment_count(path: &std::path::Path) -> Vec<u64> {
         let entry = entry.unwrap();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(number) = name.strip_suffix(".wal") {
-            if number.len() == 20 {
-                if let Ok(segment) = number.parse() {
-                    segments.push(segment);
-                }
-            }
+        if let Some(number) = name.strip_suffix(".wal")
+            && number.len() == 20
+            && let Ok(segment) = number.parse()
+        {
+            segments.push(segment);
         }
     }
     segments.sort_unstable();

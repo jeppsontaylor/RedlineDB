@@ -1,0 +1,51 @@
+[fast]
+commands = [
+  "rtk cargo fmt --check",
+  "./scripts/check_file_sizes.sh",
+  "rtk cargo check --workspace --locked",
+  "rtk cargo test --workspace --quiet --locked",
+]
+
+[hygiene]
+commands = [
+  "rtk cargo fmt --check",
+  "./scripts/check_file_sizes.sh",
+]
+
+[clippy]
+commands = [
+  "rtk cargo clippy --workspace --all-targets --locked -- -D warnings",
+]
+
+[medium]
+commands = [
+  "rtk cargo test --workspace --quiet --locked",
+  "rtk cargo run -p redlinedb-cli -- --help",
+  "rtk cargo run -p redlinedb-server -- --help",
+]
+
+[phase8-smoke]
+commands = [
+  "rtk cargo test --workspace --quiet --locked",
+  "rtk cargo run -p redlinedb-cli -- --help",
+  "rtk cargo run -p redlinedb-server -- --help",
+]
+
+[security]
+commands = [
+  "rtk cargo audit",
+  "rtk cargo deny check",
+  "rtk gitleaks detect --source .",
+]
+
+[security-local]
+commands = [
+  "rtk cargo audit",
+  "rtk cargo deny check",
+  "rtk gitleaks detect --source .",
+]
+
+[release]
+commands = [
+  "rtk cargo build --workspace --release --locked",
+]

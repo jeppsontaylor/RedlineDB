@@ -96,7 +96,7 @@ fn contains_ascii_insensitive(haystack: &str, needle: &str) -> bool {
     h.windows(n.len()).any(|w| {
         w.iter()
             .zip(n.iter())
-            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
     })
 }
 

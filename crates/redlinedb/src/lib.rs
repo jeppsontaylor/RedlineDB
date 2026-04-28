@@ -33,6 +33,13 @@ pub struct Database {
     inner: Arc<registry::DatabaseEntry>,
 }
 
+#[derive(Debug)]
+pub struct OwnedStatement {
+    inner: redlinedb_sql::Statement,
+    interrupted: Arc<AtomicBool>,
+    _marker: Rc<()>,
+}
+
 pub struct Connection {
     inner: Arc<redlinedb_sql::Connection>,
     read_only: bool,
@@ -47,9 +54,7 @@ pub struct Prepared {
 }
 
 pub struct Statement<'conn> {
-    inner: redlinedb_sql::Statement,
-    interrupted: Arc<AtomicBool>,
-    _marker: Rc<()>,
+    inner: OwnedStatement,
     _conn: std::marker::PhantomData<&'conn mut Connection>,
 }
 
@@ -59,6 +64,12 @@ pub struct Row<'stmt> {
 
 pub enum Step<'a> {
     Row(Row<'a>),
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedStep {
+    Row,
     Done,
 }
 
@@ -82,9 +93,13 @@ impl Database {
     }
 
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let mut options = OpenOptions::default();
-        options.create = true;
-        Self::open_with_options(path, options)
+        Self::open_with_options(
+            path,
+            OpenOptions {
+                create: true,
+                ..Default::default()
+            },
+        )
     }
 
     pub fn open_with_options(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
@@ -196,16 +211,22 @@ impl Prepared {
 
 impl Connection {
     pub fn prepare<'c>(&'c mut self, sql: &str) -> Result<Statement<'c>> {
+        Ok(Statement {
+            inner: self.prepare_owned(sql)?,
+            _conn: std::marker::PhantomData,
+        })
+    }
+
+    pub fn prepare_owned(&mut self, sql: &str) -> Result<OwnedStatement> {
         self.check_interrupt()?;
         let stmt = self.inner.prepare(sql)?;
         if self.read_only && !stmt.is_readonly() {
             return Err(Error::new(ErrorCode::ReadOnly, "connection is read-only"));
         }
-        Ok(Statement {
+        Ok(OwnedStatement {
             inner: stmt,
             interrupted: Arc::clone(&self.interrupted),
             _marker: Rc::new(()),
-            _conn: std::marker::PhantomData,
         })
     }
 
@@ -334,23 +355,23 @@ impl<'conn> Statement<'conn> {
     }
 
     pub fn bind_null(&mut self, index: usize) -> Result<()> {
-        Ok(self.inner.bind_null(index)?)
+        self.inner.bind_null(index)
     }
 
     pub fn bind_i64(&mut self, index: usize, value: i64) -> Result<()> {
-        Ok(self.inner.bind_i64(index, value)?)
+        self.inner.bind_i64(index, value)
     }
 
     pub fn bind_f64(&mut self, index: usize, value: f64) -> Result<()> {
-        Ok(self.inner.bind_f64(index, value)?)
+        self.inner.bind_f64(index, value)
     }
 
     pub fn bind_text(&mut self, index: usize, value: impl Into<Arc<str>>) -> Result<()> {
-        Ok(self.inner.bind_text(index, value)?)
+        self.inner.bind_text(index, value)
     }
 
     pub fn bind_blob(&mut self, index: usize, value: impl Into<Arc<[u8]>>) -> Result<()> {
-        Ok(self.inner.bind_blob(index, value)?)
+        self.inner.bind_blob(index, value)
     }
 
     pub fn bind_value(&mut self, index: usize, value: Value) -> Result<()> {
@@ -364,8 +385,7 @@ impl<'conn> Statement<'conn> {
     }
 
     pub fn bind_named(&mut self, name: &str, value: Value) -> Result<()> {
-        let sql_value: redlinedb_sql::SqlValue = value.into();
-        self.inner.bind_named(name, sql_value)?;
+        self.inner.bind_named(name, value)?;
         Ok(())
     }
 
@@ -379,12 +399,9 @@ impl<'conn> Statement<'conn> {
     }
 
     pub fn step(&mut self) -> Result<Step<'_>> {
-        if self.interrupted.load(AtomicOrdering::Relaxed) {
-            return Err(Error::new(ErrorCode::Interrupt, "interrupted"));
-        }
         match self.inner.step()? {
-            redlinedb_sql::Step::Row => Ok(Step::Row(Row { stmt: self })),
-            redlinedb_sql::Step::Done => Ok(Step::Done),
+            OwnedStep::Row => Ok(Step::Row(Row { stmt: self })),
+            OwnedStep::Done => Ok(Step::Done),
         }
     }
 
@@ -417,20 +434,123 @@ impl<'conn> Statement<'conn> {
     }
 }
 
-impl<'stmt> Row<'stmt> {
-    pub fn get<T: FromValue>(&self, index: usize) -> Result<T> {
-        T::from_statement(self.stmt, index)
+impl OwnedStatement {
+    pub fn bind_null(&mut self, index: usize) -> Result<()> {
+        Ok(self.inner.bind_null(index)?)
     }
 
-    pub fn get_ref(&self, index: usize) -> Result<ValueRef<'_>> {
-        let value = self.stmt.inner.column_value(index)?;
-        Ok(match value {
+    pub fn bind_i64(&mut self, index: usize, value: i64) -> Result<()> {
+        Ok(self.inner.bind_i64(index, value)?)
+    }
+
+    pub fn bind_f64(&mut self, index: usize, value: f64) -> Result<()> {
+        Ok(self.inner.bind_f64(index, value)?)
+    }
+
+    pub fn bind_text(&mut self, index: usize, value: impl Into<Arc<str>>) -> Result<()> {
+        Ok(self.inner.bind_text(index, value)?)
+    }
+
+    pub fn bind_blob(&mut self, index: usize, value: impl Into<Arc<[u8]>>) -> Result<()> {
+        Ok(self.inner.bind_blob(index, value)?)
+    }
+
+    pub fn bind_value(&mut self, index: usize, value: Value) -> Result<()> {
+        match value {
+            Value::Null => self.bind_null(index),
+            Value::Integer(value) => self.bind_i64(index, value),
+            Value::Real(value) => self.bind_f64(index, value),
+            Value::Text(value) => self.bind_text(index, value),
+            Value::Blob(value) => self.bind_blob(index, value),
+        }
+    }
+
+    pub fn bind_named(&mut self, name: &str, value: Value) -> Result<()> {
+        self.inner.bind_named(name, value.into())?;
+        Ok(())
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
+        self.inner.reset()?;
+        Ok(())
+    }
+
+    pub fn clear_bindings(&mut self) {
+        self.inner.clear_bindings();
+    }
+
+    pub fn step(&mut self) -> Result<OwnedStep> {
+        if self.interrupted.load(AtomicOrdering::Relaxed) {
+            return Err(Error::new(ErrorCode::Interrupt, "interrupted"));
+        }
+        Ok(match self.inner.step()? {
+            redlinedb_sql::Step::Row => OwnedStep::Row,
+            redlinedb_sql::Step::Done => OwnedStep::Done,
+        })
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.inner.is_readonly()
+    }
+
+    pub fn affected_rows(&self) -> usize {
+        self.inner.affected_rows()
+    }
+
+    pub fn parameter_count(&self) -> usize {
+        self.inner.parameter_count()
+    }
+
+    pub fn parameter_index(&self, name: &str) -> Option<usize> {
+        self.inner.parameter_index(name)
+    }
+
+    pub fn column_count(&self) -> usize {
+        self.inner.column_count()
+    }
+
+    pub fn column_name(&self, index: usize) -> &str {
+        self.inner.column_name(index)
+    }
+
+    pub fn column_ref(&self, index: usize) -> Result<ValueRef<'_>> {
+        Ok(match self.inner.column_value(index)? {
             redlinedb_sql::SqlValue::Null => ValueRef::Null,
             redlinedb_sql::SqlValue::Integer(value) => ValueRef::Integer(*value),
             redlinedb_sql::SqlValue::Real(value) => ValueRef::Real(*value),
             redlinedb_sql::SqlValue::Text(value) => ValueRef::Text(value.as_ref()),
             redlinedb_sql::SqlValue::Blob(value) => ValueRef::Blob(value.as_ref()),
         })
+    }
+
+    pub fn column_i64(&self, index: usize) -> Result<i64> {
+        Ok(self.inner.column_i64(index)?)
+    }
+
+    pub fn column_f64(&self, index: usize) -> Result<f64> {
+        Ok(self.inner.column_f64(index)?)
+    }
+
+    pub fn column_text(&self, index: usize) -> Result<&str> {
+        Ok(self.inner.column_text(index)?)
+    }
+
+    pub fn column_blob(&self, index: usize) -> Result<&[u8]> {
+        Ok(self.inner.column_blob(index)?)
+    }
+
+    pub fn template(&self) -> Arc<redlinedb_sql::PreparedTemplate> {
+        self.inner.template()
+    }
+}
+
+impl<'stmt> Row<'stmt> {
+    pub fn get<T: FromValue>(&self, index: usize) -> Result<T> {
+        T::from_statement(self.stmt, index)
+    }
+
+    pub fn get_ref(&self, index: usize) -> Result<ValueRef<'_>> {
+        self.stmt.inner.column_ref(index)
     }
 }
 
@@ -490,13 +610,13 @@ pub trait FromValue: Sized {
 
 impl FromValue for i64 {
     fn from_statement(stmt: &Statement<'_>, index: usize) -> Result<Self> {
-        Ok(stmt.inner.column_i64(index)?)
+        stmt.inner.column_i64(index)
     }
 }
 
 impl FromValue for f64 {
     fn from_statement(stmt: &Statement<'_>, index: usize) -> Result<Self> {
-        Ok(stmt.inner.column_f64(index)?)
+        stmt.inner.column_f64(index)
     }
 }
 
@@ -508,21 +628,13 @@ impl FromValue for String {
 
 impl FromValue for Value {
     fn from_statement(stmt: &Statement<'_>, index: usize) -> Result<Self> {
-        Ok(
-            match match stmt.inner.column_value(index)? {
-                redlinedb_sql::SqlValue::Null => ValueRef::Null,
-                redlinedb_sql::SqlValue::Integer(value) => ValueRef::Integer(*value),
-                redlinedb_sql::SqlValue::Real(value) => ValueRef::Real(*value),
-                redlinedb_sql::SqlValue::Text(value) => ValueRef::Text(value.as_ref()),
-                redlinedb_sql::SqlValue::Blob(value) => ValueRef::Blob(value.as_ref()),
-            } {
-                ValueRef::Null => Value::Null,
-                ValueRef::Integer(value) => Value::Integer(value),
-                ValueRef::Real(value) => Value::Real(value),
-                ValueRef::Text(value) => Value::Text(Arc::from(value)),
-                ValueRef::Blob(value) => Value::Blob(Arc::from(value)),
-            },
-        )
+        Ok(match stmt.inner.column_ref(index)? {
+            ValueRef::Null => Value::Null,
+            ValueRef::Integer(value) => Value::Integer(value),
+            ValueRef::Real(value) => Value::Real(value),
+            ValueRef::Text(value) => Value::Text(Arc::from(value)),
+            ValueRef::Blob(value) => Value::Blob(Arc::from(value)),
+        })
     }
 }
 
@@ -545,4 +657,53 @@ fn sql_options(options: &OpenOptions) -> redlinedb_sql::DbOptions {
     db.stats.mcv_capacity = options.stats.mcv_capacity;
     db.stats.histogram_buckets = options.stats.histogram_buckets;
     db
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_and_borrowed_statements_return_the_same_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::create(dir.path().join("owned.redline")).expect("db");
+        let mut conn = db.connect().expect("conn");
+
+        conn.execute(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            (),
+        )
+        .expect("create");
+        conn.execute(
+            "INSERT INTO items(id, name) VALUES (?, ?)",
+            params![1_i64, "Ada"],
+        )
+        .expect("insert");
+
+        {
+            let mut borrowed = conn
+                .prepare("SELECT name FROM items WHERE id = ?")
+                .expect("borrowed");
+            borrowed.bind_all(params![1_i64]).expect("bind");
+            match borrowed.step().expect("step") {
+                Step::Row(row) => {
+                    assert_eq!(row.get_ref(0).expect("ref"), ValueRef::Text("Ada"));
+                }
+                Step::Done => panic!("expected row"),
+            }
+            assert!(matches!(borrowed.step().expect("done"), Step::Done));
+        }
+
+        let mut owned = conn
+            .prepare_owned("SELECT name FROM items WHERE id = ?")
+            .expect("owned");
+        owned.bind_value(1, Value::Integer(1)).expect("bind");
+        match owned.step().expect("step") {
+            OwnedStep::Row => {
+                assert_eq!(owned.column_ref(0).expect("ref"), ValueRef::Text("Ada"));
+            }
+            OwnedStep::Done => panic!("expected row"),
+        }
+        assert!(matches!(owned.step().expect("done"), OwnedStep::Done));
+    }
 }

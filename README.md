@@ -39,7 +39,8 @@ rtk cargo run -p redlinedb-server -- --help
 - `crates/cli` - command-line interface
 - `crates/server` - local framed server
 - `crates/bench` - benchmark harness
-- `tips/` - project notes and phase artifacts
+- `agent/` - repository-level agent routing and proof metadata
+- `docs/archive/` - historical notes and phase artifacts
 
 ## Contributing
 

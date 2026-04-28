@@ -12,7 +12,7 @@ use crate::{Error, Result};
 
 pub const DEFAULT_WAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_WAL_BUFFER_BYTES: usize = 16 * 1024 * 1024;
-pub const DEFAULT_WAL_WRITE_BATCH_BYTES: usize = 1 * 1024 * 1024;
+pub const DEFAULT_WAL_WRITE_BATCH_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_GROUP_COMMIT_DELAY_US: u64 = 200;
 pub const DEFAULT_GROUP_COMMIT_MAX_BATCH_BYTES: u64 = 4 * 1024 * 1024;
 const WAL_SEGMENT_EXT: &str = ".wal";
@@ -80,10 +80,10 @@ impl WalManager<StdFileSystem> {
         for candidate in self.segment_numbers()? {
             if candidate < segment && candidate < self.active_segment {
                 let path = segment_path(&self.dir, candidate);
-                if let Err(err) = std::fs::remove_file(path) {
-                    if err.kind() != std::io::ErrorKind::NotFound {
-                        return Err(err.into());
-                    }
+                if let Err(err) = std::fs::remove_file(path)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(err.into());
                 }
                 removed += 1;
             }
@@ -276,10 +276,10 @@ impl WalCoordinator {
         for candidate in segment_numbers_on_disk(&self.dir)? {
             if candidate < keep_segment && candidate < active_segment {
                 let path = segment_path(&self.dir, candidate);
-                if let Err(err) = std::fs::remove_file(path) {
-                    if err.kind() != std::io::ErrorKind::NotFound {
-                        return Err(err.into());
-                    }
+                if let Err(err) = std::fs::remove_file(path)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(err.into());
                 }
                 removed += 1;
             }
@@ -357,10 +357,10 @@ impl Drop for WalCoordinator {
             state.shutdown = true;
             self.shared.cvar.notify_all();
         }
-        if let Ok(mut writer) = self.writer.lock() {
-            if let Some(writer) = writer.take() {
-                let _ = writer.join();
-            }
+        if let Ok(mut writer) = self.writer.lock()
+            && let Some(writer) = writer.take()
+        {
+            let _ = writer.join();
         }
     }
 }
@@ -702,12 +702,11 @@ impl<Fs: FileSystem> WalManager<Fs> {
 
         let expected_lsn =
             Lsn((self.active_segment - 1) * self.config.segment_bytes + self.active_offset);
-        if expected_lsn != append.start_lsn {
-            if self.active_offset > 0
-                && self.active_offset + encoded.len() as u64 > self.config.segment_bytes
-            {
-                self.rotate_segment()?;
-            }
+        if expected_lsn != append.start_lsn
+            && self.active_offset > 0
+            && self.active_offset + encoded.len() as u64 > self.config.segment_bytes
+        {
+            self.rotate_segment()?;
         }
 
         let expected_lsn =
@@ -961,10 +960,10 @@ fn segment_numbers_on_disk(dir: &Path) -> Result<Vec<u64>> {
     }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if let Some(name) = entry.file_name().to_str() {
-            if let Some(segment) = parse_segment_name(name) {
-                segments.push(segment);
-            }
+        if let Some(name) = entry.file_name().to_str()
+            && let Some(segment) = parse_segment_name(name)
+        {
+            segments.push(segment);
         }
     }
     segments.sort_unstable();

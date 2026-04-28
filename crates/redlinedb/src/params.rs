@@ -21,7 +21,7 @@ impl Params for Vec<Value> {
     }
 }
 
-impl<'a> Params for &'a [Value] {
+impl Params for &[Value] {
     fn bind_into(self, stmt: &mut crate::Statement<'_>) -> Result<()> {
         stmt.clear_bindings();
         for (index, value) in self.iter().cloned().enumerate() {

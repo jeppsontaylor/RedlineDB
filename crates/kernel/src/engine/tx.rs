@@ -105,21 +105,21 @@ impl TxnLifecycle {
     }
 
     fn close(&self) {
-        if !self.closed.swap(true, Ordering::SeqCst) {
-            if let Some(inner) = self.inner.upgrade() {
-                inner.unregister_active(self.tx_id);
-            }
+        if !self.closed.swap(true, Ordering::SeqCst)
+            && let Some(inner) = self.inner.upgrade()
+        {
+            inner.unregister_active(self.tx_id);
         }
     }
 }
 
 impl Drop for TxnLifecycle {
     fn drop(&mut self) {
-        if !self.closed.swap(true, Ordering::SeqCst) {
-            if let Some(inner) = self.inner.upgrade() {
-                inner.abort(self.tx_id);
-                inner.unregister_active(self.tx_id);
-            }
+        if !self.closed.swap(true, Ordering::SeqCst)
+            && let Some(inner) = self.inner.upgrade()
+        {
+            inner.abort(self.tx_id);
+            inner.unregister_active(self.tx_id);
         }
     }
 }

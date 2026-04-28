@@ -72,11 +72,11 @@ impl RowLockManager {
     pub fn unlock(&self, rel_id: RelId, row_id: RowId, tx_id: TxId) {
         let key = RowKey { rel_id, row_id };
         let shard = self.shard(key);
-        if let Ok(mut owners) = shard.owners.lock() {
-            if owners.get(&key).copied() == Some(tx_id) {
-                owners.remove(&key);
-                shard.cvar.notify_all();
-            }
+        if let Ok(mut owners) = shard.owners.lock()
+            && owners.get(&key).copied() == Some(tx_id)
+        {
+            owners.remove(&key);
+            shard.cvar.notify_all();
         }
     }
 

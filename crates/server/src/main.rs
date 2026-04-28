@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::exit;
 use std::thread;
 
-use redlinedb::{Database, Step, Value, ValueRef};
+use redlinedb::{Database, Value, ValueRef};
 use serde::{Deserialize, Serialize};
 
 const PROTOCOL_MAGIC: [u8; 4] = *b"RLDB";
@@ -112,7 +112,7 @@ impl WireValue {
 
 struct ActiveStatement {
     id: u64,
-    stmt: redlinedb::Statement<'static>,
+    stmt: redlinedb::OwnedStatement,
 }
 
 fn main() {
@@ -210,9 +210,8 @@ fn handle_client(mut stream: TcpStream, db: Database) {
             },
             Request::Prepare { stmt_id, sql } => {
                 active = None;
-                match conn.prepare(&sql) {
+                match conn.prepare_owned(&sql) {
                     Ok(stmt) => {
-                        let stmt = erase_statement_lifetime(stmt);
                         let readonly = stmt.is_readonly();
                         let parameter_count = stmt.parameter_count();
                         let column_count = stmt.column_count();
@@ -377,7 +376,7 @@ fn handle_client(mut stream: TcpStream, db: Database) {
 }
 
 fn step_rows(
-    stmt: &mut redlinedb::Statement<'_>,
+    stmt: &mut redlinedb::OwnedStatement,
     max_rows: usize,
 ) -> redlinedb::Result<(Vec<Vec<WireValue>>, bool)> {
     let mut rows = Vec::new();
@@ -385,14 +384,14 @@ fn step_rows(
     let column_count = stmt.column_count();
     while rows.len() < max_rows {
         match stmt.step()? {
-            Step::Row(row) => {
+            redlinedb::OwnedStep::Row => {
                 let mut values = Vec::with_capacity(column_count);
                 for index in 0..column_count {
-                    values.push(WireValue::from_value_ref(row.get_ref(index)?));
+                    values.push(WireValue::from_value_ref(stmt.column_ref(index)?));
                 }
                 rows.push(values);
             }
-            Step::Done => {
+            redlinedb::OwnedStep::Done => {
                 done = true;
                 break;
             }
@@ -402,7 +401,7 @@ fn step_rows(
 }
 
 fn bind_values(
-    stmt: &mut redlinedb::Statement<'_>,
+    stmt: &mut redlinedb::OwnedStatement,
     values: Vec<WireValue>,
 ) -> redlinedb::Result<()> {
     stmt.clear_bindings();
@@ -410,12 +409,6 @@ fn bind_values(
         stmt.bind_value(index + 1, value.into_value())?;
     }
     Ok(())
-}
-
-fn erase_statement_lifetime(stmt: redlinedb::Statement<'_>) -> redlinedb::Statement<'static> {
-    // The statement wrapper owns the underlying SQL statement; the lifetime only
-    // constrains how the public Rust API may hold the handle.
-    unsafe { std::mem::transmute::<redlinedb::Statement<'_>, redlinedb::Statement<'static>>(stmt) }
 }
 
 fn error_response(err: redlinedb::Error) -> Response {

@@ -129,12 +129,12 @@ fn run_concurrency_smoke() -> Vec<BenchResult> {
         seed_index_schema(&conn, 1024);
 
         let results = vec![
-            concurrent_point_reads(&db, 1, 256),
-            concurrent_point_reads(&db, 4, 256),
-            concurrent_point_reads(&db, 16, 128),
-            concurrent_point_reads(&db, 64, 64),
-            concurrent_mixed_workload(&db),
-            concurrent_analyze_with_readers(&db),
+            concurrent_point_reads(db, 1, 256),
+            concurrent_point_reads(db, 4, 256),
+            concurrent_point_reads(db, 16, 128),
+            concurrent_point_reads(db, 64, 64),
+            concurrent_mixed_workload(db),
+            concurrent_analyze_with_readers(db),
             bench_query(
                 &conn,
                 "selective_index_nested_loop_join",

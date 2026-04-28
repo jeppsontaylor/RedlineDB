@@ -62,10 +62,7 @@ pub struct KeyBuf {
 
 impl KeyBuf {
     pub fn new() -> Self {
-        Self {
-            bytes: SmallVec::new(),
-            logical_len: 0,
-        }
+        Self::default()
     }
 
     pub fn clear(&mut self) {
@@ -93,6 +90,15 @@ impl KeyBuf {
 
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+impl Default for KeyBuf {
+    fn default() -> Self {
+        Self {
+            bytes: SmallVec::new(),
+            logical_len: 0,
+        }
     }
 }
 
@@ -177,12 +183,12 @@ impl UniqueKeyLockTable {
 
     fn unlock(&self, shard: usize, key: Vec<u8>, owner: u64) {
         if let Ok(mut map) = self.shards[shard].lock() {
-            if let Some(state) = map.get_mut(&key) {
-                if state.owner == Some(owner) {
-                    state.depth = state.depth.saturating_sub(1);
-                    if state.depth == 0 {
-                        map.remove(&key);
-                    }
+            if let Some(state) = map.get_mut(&key)
+                && state.owner == Some(owner)
+            {
+                state.depth = state.depth.saturating_sub(1);
+                if state.depth == 0 {
+                    map.remove(&key);
                 }
             }
             self.cvars[shard].notify_all();
@@ -461,12 +467,13 @@ impl BtreeIndex {
                 dead,
                 ..
             } = entry
+                && !*dead
+                && key.as_slice() == logical_key
+                && *entry_row == row
             {
-                if !*dead && key.as_slice() == logical_key && *entry_row == row {
-                    *dead = true;
-                    changed = true;
-                    break;
-                }
+                *dead = true;
+                changed = true;
+                break;
             }
         }
         if changed {
@@ -918,10 +925,10 @@ impl BtreeIndex {
                     if dead {
                         continue;
                     }
-                    if let Some(prev) = &last {
-                        if prev.as_slice() > physical.as_slice() {
-                            report.errors.push("leaf entries out of order");
-                        }
+                    if let Some(prev) = &last
+                        && prev.as_slice() > physical.as_slice()
+                    {
+                        report.errors.push("leaf entries out of order");
                     }
                     last = Some(physical);
                 }
@@ -1017,7 +1024,7 @@ impl BtreeIndex {
 
     fn meta(&self) -> Result<MetaHeader> {
         let guard = self.inner.buffer.pin(self.inner.meta_page_id)?;
-        guard.with_page(|page| Self::read_meta(page))
+        guard.with_page(Self::read_meta)
     }
 
     fn set_meta_root(&self, root_page_id: PageId, root_level: u16) -> Result<()> {

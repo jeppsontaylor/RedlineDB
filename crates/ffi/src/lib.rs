@@ -1,3 +1,5 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::{c_char, c_int, c_uchar, c_void};
@@ -575,45 +577,38 @@ pub extern "C" fn rldb_exec(
             .to_str()
             .map_err(|_| RLDB_MISMATCH)?;
         let mut stmt = sql_result(db_ref.conn.clone().prepare(sql_text))?;
-        loop {
-            match sql_result(stmt.step())? {
-                Step::Row => {
-                    if let Some(callback) = callback {
-                        let column_count = stmt.column_count();
-                        let mut value_strings: Vec<Option<CString>> =
-                            Vec::with_capacity(column_count);
-                        let mut name_strings: Vec<CString> = Vec::with_capacity(column_count);
-                        for index in 0..column_count {
-                            name_strings.push(
-                                CString::new(stmt.column_name(index)).map_err(|_| RLDB_MISMATCH)?,
-                            );
-                            value_strings.push(exec_value(&stmt, index)?);
-                        }
-                        let mut argv: Vec<*mut c_char> = value_strings
-                            .iter_mut()
-                            .map(|value| {
-                                value
-                                    .as_mut()
-                                    .map(|s| s.as_ptr() as *mut c_char)
-                                    .unwrap_or(ptr::null_mut())
-                            })
-                            .collect();
-                        let mut colnames: Vec<*mut c_char> = name_strings
-                            .iter_mut()
-                            .map(|value| value.as_ptr() as *mut c_char)
-                            .collect();
-                        let rc = callback(
-                            ctx,
-                            column_count as c_int,
-                            argv.as_mut_ptr(),
-                            colnames.as_mut_ptr(),
-                        );
-                        if rc != 0 {
-                            return Err(RLDB_ERROR);
-                        }
-                    }
+        while let Step::Row = sql_result(stmt.step())? {
+            if let Some(callback) = callback {
+                let column_count = stmt.column_count();
+                let mut value_strings: Vec<Option<CString>> = Vec::with_capacity(column_count);
+                let mut name_strings: Vec<CString> = Vec::with_capacity(column_count);
+                for index in 0..column_count {
+                    name_strings
+                        .push(CString::new(stmt.column_name(index)).map_err(|_| RLDB_MISMATCH)?);
+                    value_strings.push(exec_value(&stmt, index)?);
                 }
-                Step::Done => break,
+                let mut argv: Vec<*mut c_char> = value_strings
+                    .iter_mut()
+                    .map(|value| {
+                        value
+                            .as_mut()
+                            .map(|s| s.as_ptr() as *mut c_char)
+                            .unwrap_or(ptr::null_mut())
+                    })
+                    .collect();
+                let mut colnames: Vec<*mut c_char> = name_strings
+                    .iter_mut()
+                    .map(|value| value.as_ptr() as *mut c_char)
+                    .collect();
+                let rc = callback(
+                    ctx,
+                    column_count as c_int,
+                    argv.as_mut_ptr(),
+                    colnames.as_mut_ptr(),
+                );
+                if rc != 0 {
+                    return Err(RLDB_ERROR);
+                }
             }
         }
         Ok(RLDB_OK)

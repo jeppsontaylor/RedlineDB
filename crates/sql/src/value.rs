@@ -55,7 +55,7 @@ fn sqlite_truthy_str(value: &str) -> bool {
 
 pub fn canonicalize(value: SqlValue) -> SqlValue {
     match value {
-        OwnedValue::Real(v) if v == 0.0 => OwnedValue::Real(0.0),
+        OwnedValue::Real(0.0) => OwnedValue::Real(0.0),
         OwnedValue::Real(v) if v.is_nan() => OwnedValue::Real(f64::NAN),
         other => other,
     }

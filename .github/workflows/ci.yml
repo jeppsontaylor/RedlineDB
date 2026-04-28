@@ -13,4 +13,6 @@ jobs:
       - uses: swatinem/rust-cache@v2
       - uses: dtolnay/rust-toolchain@1.95.0
       - run: cargo fmt --check
+      - run: bash scripts/check_file_sizes.sh
+      - run: cargo check --workspace --locked
       - run: cargo test --workspace --quiet --locked

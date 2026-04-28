@@ -312,8 +312,7 @@ impl Engine {
             tx.id(),
             tx.snapshot(),
             &self.txs,
-            rel_id,
-            row_id,
+            crate::engine::page_heap::RelationWriteTarget { rel_id, row_id },
             payload,
             Lsn(1),
         )

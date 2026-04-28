@@ -180,11 +180,7 @@ impl SchemaSnapshot {
             });
             for index in &table.indexes {
                 rows.push(SqliteSchemaRow {
-                    type_name: if index.unique {
-                        "index".into()
-                    } else {
-                        "index".into()
-                    },
+                    type_name: "index".into(),
                     name: index.name.clone(),
                     tbl_name: table.name.clone(),
                     rootpage: index.relation_id.0,
