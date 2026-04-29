@@ -494,6 +494,10 @@ pub(crate) fn normalize_expr(expr: Expr, params: &mut ParamLayout) -> Result<Exp
             expr: Box::new(normalize_expr(*expr, params)?),
         },
         Expr::Nested(expr) => Expr::Nested(Box::new(normalize_expr(*expr, params)?)),
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(normalize_expr(*expr, params)?),
+            collation,
+        },
         Expr::Function(mut func) => {
             normalize_function_args(&mut func.args, params)?;
             normalize_function_args(&mut func.parameters, params)?;

@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 arc-swap = "1.7"
 parking_lot = "0.12"
+regex = { version = "1.11", default-features = false, features = ["std", "perf"] }
 sqlparser = "0.61"
 thiserror = "2.0"
 redlinedb-kernel = { path = "../kernel" }
