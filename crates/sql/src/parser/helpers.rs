@@ -396,6 +396,18 @@ pub(crate) fn bind_select_from(
         return Ok((SelectSource::Empty, None));
     }
 
+    if from.len() == 1 && !from[0].joins.is_empty() {
+        if let TableFactor::Table { name, .. } = &from[0].relation
+            && is_sqlite_schema_name(name)
+        {
+            return Err(Error::UnsupportedSql(
+                "sqlite_schema cannot participate in joins".to_owned(),
+            ));
+        }
+        let join = bind_select_join_source(schema, from.into_iter().next().expect("one"), params)?;
+        return Ok((SelectSource::Joined(join), None));
+    }
+
     let mut tables: Vec<BoundTable> = Vec::new();
     let mut selection = None;
     let mut saw_sqlite_schema = false;
@@ -416,15 +428,15 @@ pub(crate) fn bind_select_from(
         if table.joins.is_empty() {
             let bound = bind_select_table_factor(schema, table.relation)?;
             tables.push(bound);
-        } else {
-            let (mut more, join_selection) = bind_select_table_with_joins(schema, table, params)?;
-            tables.append(&mut more);
-            if let Some(expr) = join_selection {
-                selection = Some(match selection {
-                    Some(prev) => and_expr(prev, expr),
-                    None => expr,
-                });
-            }
+            continue;
+        }
+        let (mut more, join_selection) = bind_select_table_with_joins(schema, table, params)?;
+        tables.append(&mut more);
+        if let Some(expr) = join_selection {
+            selection = Some(match selection {
+                Some(prev) => and_expr(prev, expr),
+                None => expr,
+            });
         }
     }
 
@@ -439,31 +451,34 @@ pub(crate) fn bind_select_from(
     Ok((source, selection))
 }
 
-pub(crate) fn bind_select_table_with_joins(
+pub(crate) fn bind_select_join_source(
     schema: &SchemaSnapshot,
     table: TableWithJoins,
     params: &mut ParamLayout,
-) -> Result<(Vec<BoundTable>, Option<Expr>)> {
+) -> Result<JoinSource> {
     let base = bind_select_table_factor(schema, table.relation)?;
-    let mut tables = vec![base];
-    let mut selection = None;
+    let mut left_tables = vec![base.clone()];
+    let mut joins = Vec::new();
     for join in table.joins {
         let right = bind_select_join_relation(schema, join.relation)?;
-        let join_selection = match join.join_operator {
-            JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
-                bind_join_constraint(&tables, &right, constraint, params)?
-            }
+        let (kind, join_selection) = match join.join_operator {
+            JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => (
+                JoinKind::Inner,
+                bind_join_constraint(&left_tables, &right, constraint, params)?,
+            ),
             JoinOperator::CrossJoin(constraint) => match constraint {
-                JoinConstraint::None => None,
+                JoinConstraint::None => (JoinKind::Inner, None),
                 _ => {
                     return Err(Error::UnsupportedSql(
                         "CROSS JOIN cannot have a constraint".to_owned(),
                     ));
                 }
             },
-            JoinOperator::Left(_)
-            | JoinOperator::LeftOuter(_)
-            | JoinOperator::Right(_)
+            JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => (
+                JoinKind::Left,
+                bind_join_constraint(&left_tables, &right, constraint, params)?,
+            ),
+            JoinOperator::Right(_)
             | JoinOperator::RightOuter(_)
             | JoinOperator::FullOuter(_)
             | JoinOperator::Semi(_)
@@ -477,19 +492,48 @@ pub(crate) fn bind_select_table_with_joins(
             | JoinOperator::AsOf { .. }
             | JoinOperator::StraightJoin(_) => {
                 return Err(Error::UnsupportedSql(
-                    "only INNER and CROSS joins are supported".to_owned(),
+                    "only INNER, CROSS, and LEFT joins are supported".to_owned(),
                 ));
             }
         };
-        if let Some(expr) = join_selection {
+        joins.push(JoinStep {
+            right,
+            kind,
+            selection: join_selection,
+        });
+        left_tables.push(joins.last().expect("join just pushed").right.clone());
+    }
+
+    Ok(JoinSource { base, joins })
+}
+
+pub(crate) fn bind_select_table_with_joins(
+    schema: &SchemaSnapshot,
+    table: TableWithJoins,
+    params: &mut ParamLayout,
+) -> Result<(Vec<BoundTable>, Option<Expr>)> {
+    let join_source = bind_select_join_source(schema, table, params)?;
+    if join_source
+        .joins
+        .iter()
+        .any(|join| matches!(join.kind, JoinKind::Left))
+    {
+        return Err(Error::UnsupportedSql(
+            "LEFT joins require a single-table FROM source".to_owned(),
+        ));
+    }
+
+    let mut tables = vec![join_source.base];
+    let mut selection = None;
+    for join in join_source.joins {
+        if let Some(expr) = join.selection {
             selection = Some(match selection {
                 Some(prev) => and_expr(prev, expr),
                 None => expr,
             });
         }
-        tables.push(right);
+        tables.push(join.right);
     }
-
     Ok((tables, selection))
 }
 
@@ -631,6 +675,24 @@ pub(crate) fn push_projection_columns(source: &SelectSource, out: &mut Vec<Strin
                 }));
             }
         }
+        SelectSource::Joined(join) => {
+            out.extend(join.base.table.columns.iter().map(|column| {
+                if let Some(alias) = &join.base.alias {
+                    format!("{}.{}", alias, column.name)
+                } else {
+                    format!("{}.{}", join.base.table.name, column.name)
+                }
+            }));
+            for step in &join.joins {
+                out.extend(step.right.table.columns.iter().map(|column| {
+                    if let Some(alias) = &step.right.alias {
+                        format!("{}.{}", alias, column.name)
+                    } else {
+                        format!("{}.{}", step.right.table.name, column.name)
+                    }
+                }));
+            }
+        }
         SelectSource::SqliteSchema => {
             out.extend(
                 ["type", "name", "tbl_name", "rootpage", "sql"]
@@ -638,6 +700,8 @@ pub(crate) fn push_projection_columns(source: &SelectSource, out: &mut Vec<Strin
                     .map(str::to_owned),
             );
         }
+        SelectSource::StaticRows { .. } => {}
+        SelectSource::CompoundAll(_) => {}
         SelectSource::Empty => {}
     }
 }
