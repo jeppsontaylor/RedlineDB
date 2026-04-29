@@ -456,6 +456,8 @@ fn eval_binary(
                 )))
             }
         }
+        BinaryOperator::Arrow => crate::json::scalar::arrow_json(&left_value, &right_value)?,
+        BinaryOperator::LongArrow => crate::json::scalar::arrow_sql(&left_value, &right_value)?,
         other => {
             return Err(Error::UnsupportedSql(format!(
                 "unsupported binary op {other:?}"
@@ -1010,13 +1012,6 @@ fn eval_function(
             }
         }
         "round" => round_function(&values),
-        "json" => json_minify(&values),
-        "json_array" => json_array(&values),
-        "json_extract" => json_extract(&values),
-        "json_object" => json_object(&values),
-        "json_quote" => json_quote(&values),
-        "json_type" => json_type(&values),
-        "json_valid" => json_valid(&values),
         "vector" => vector_blob(&values),
         "vector_from_json" => vector_from_json(&values),
         "vector_dims" => vector_dims(&values),
@@ -1045,249 +1040,26 @@ fn eval_function(
             Some(SqlValue::Text(_)) => "text",
             Some(SqlValue::Blob(_)) => "blob",
         }))),
+        "json" => crate::json::scalar::json_func(&values),
+        "json_array" => crate::json::scalar::json_array(&values),
+        "json_array_length" => crate::json::scalar::json_array_length(&values),
+        "json_object" => crate::json::scalar::json_object(&values),
+        "json_extract" => crate::json::scalar::json_extract(&values),
+        "json_set" => crate::json::scalar::json_set(&values),
+        "json_insert" => crate::json::scalar::json_insert(&values),
+        "json_replace" => crate::json::scalar::json_replace(&values),
+        "json_remove" => crate::json::scalar::json_remove(&values),
+        "json_patch" => crate::json::scalar::json_patch(&values),
+        "json_type" => crate::json::scalar::json_type(&values),
+        "json_valid" => crate::json::scalar::json_valid(&values),
+        "json_quote" => crate::json::scalar::json_quote(&values),
+        "json_minify" => crate::json::scalar::json_minify(&values),
         _ => Err(Error::UnsupportedSql(format!(
             "unsupported function {name}"
         ))),
     }
 }
 
-fn json_minify(values: &[SqlValue]) -> Result<SqlValue> {
-    let value = values
-        .first()
-        .ok_or_else(|| Error::UnsupportedSql("json requires 1 arg".to_owned()))?;
-    if matches!(value, SqlValue::Null) {
-        return Ok(SqlValue::Null);
-    }
-    let json = parse_json_value(value)?;
-    Ok(SqlValue::Text(Arc::from(json.to_string())))
-}
-
-fn json_valid(values: &[SqlValue]) -> Result<SqlValue> {
-    let Some(value) = values.first() else {
-        return Err(Error::UnsupportedSql(
-            "json_valid requires 1 arg".to_owned(),
-        ));
-    };
-    if matches!(value, SqlValue::Null) {
-        return Ok(SqlValue::Integer(0));
-    }
-    Ok(SqlValue::Integer(if parse_json_value(value).is_ok() {
-        1
-    } else {
-        0
-    }))
-}
-
-fn json_type(values: &[SqlValue]) -> Result<SqlValue> {
-    if values.is_empty() || values.len() > 2 {
-        return Err(Error::UnsupportedSql(
-            "json_type requires 1 or 2 args".to_owned(),
-        ));
-    }
-    if matches!(values[0], SqlValue::Null) {
-        return Ok(SqlValue::Null);
-    }
-    let json = parse_json_value(&values[0])?;
-    let target = if let Some(path) = values.get(1) {
-        let Some(path) = value_as_text(path) else {
-            return Ok(SqlValue::Null);
-        };
-        json_path_lookup(&json, &path)?
-    } else {
-        Some(&json)
-    };
-    Ok(match target {
-        None => SqlValue::Null,
-        Some(serde_json::Value::Null) => SqlValue::Text(Arc::from("null")),
-        Some(serde_json::Value::Bool(_)) => SqlValue::Text(Arc::from("boolean")),
-        Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => {
-            SqlValue::Text(Arc::from("integer"))
-        }
-        Some(serde_json::Value::Number(_)) => SqlValue::Text(Arc::from("real")),
-        Some(serde_json::Value::String(_)) => SqlValue::Text(Arc::from("text")),
-        Some(serde_json::Value::Array(_)) => SqlValue::Text(Arc::from("array")),
-        Some(serde_json::Value::Object(_)) => SqlValue::Text(Arc::from("object")),
-    })
-}
-
-fn json_extract(values: &[SqlValue]) -> Result<SqlValue> {
-    if values.len() < 2 {
-        return Err(Error::UnsupportedSql(
-            "json_extract requires json and path".to_owned(),
-        ));
-    }
-    if matches!(values[0], SqlValue::Null) {
-        return Ok(SqlValue::Null);
-    }
-    let json = parse_json_value(&values[0])?;
-    let mut out = Vec::new();
-    for path in &values[1..] {
-        let Some(path) = value_as_text(path) else {
-            out.push(serde_json::Value::Null);
-            continue;
-        };
-        out.push(
-            json_path_lookup(&json, &path)?
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        );
-    }
-    if out.len() == 1 {
-        Ok(json_scalar_to_sql(out.pop().unwrap()))
-    } else {
-        Ok(SqlValue::Text(Arc::from(
-            serde_json::Value::Array(out).to_string(),
-        )))
-    }
-}
-
-fn json_array(values: &[SqlValue]) -> Result<SqlValue> {
-    let values = values.iter().map(sql_to_json_value).collect::<Vec<_>>();
-    Ok(SqlValue::Text(Arc::from(
-        serde_json::Value::Array(values).to_string(),
-    )))
-}
-
-fn json_object(values: &[SqlValue]) -> Result<SqlValue> {
-    if !values.len().is_multiple_of(2) {
-        return Err(Error::UnsupportedSql(
-            "json_object requires an even number of args".to_owned(),
-        ));
-    }
-    let mut map = serde_json::Map::new();
-    let mut iter = values.iter();
-    while let Some(key) = iter.next() {
-        let Some(value) = iter.next() else {
-            break;
-        };
-        if matches!(key, SqlValue::Null) {
-            return Err(Error::UnsupportedSql(
-                "json_object labels must not be NULL".to_owned(),
-            ));
-        }
-        map.insert(value_to_string(key), sql_to_json_value(value));
-    }
-    Ok(SqlValue::Text(Arc::from(
-        serde_json::Value::Object(map).to_string(),
-    )))
-}
-
-fn json_quote(values: &[SqlValue]) -> Result<SqlValue> {
-    let value = values
-        .first()
-        .ok_or_else(|| Error::UnsupportedSql("json_quote requires 1 arg".to_owned()))?;
-    Ok(SqlValue::Text(Arc::from(
-        sql_to_json_value(value).to_string(),
-    )))
-}
-
-fn parse_json_value(value: &SqlValue) -> Result<serde_json::Value> {
-    serde_json::from_str(&value_to_string(value)).map_err(|_| Error::DatatypeMismatch)
-}
-
-fn value_as_text(value: &SqlValue) -> Option<String> {
-    if matches!(value, SqlValue::Null) {
-        None
-    } else {
-        Some(value_to_string(value))
-    }
-}
-
-fn sql_to_json_value(value: &SqlValue) -> serde_json::Value {
-    match value {
-        SqlValue::Null => serde_json::Value::Null,
-        SqlValue::Integer(v) => serde_json::Value::Number((*v).into()),
-        SqlValue::Real(v) => serde_json::Number::from_f64(*v)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        SqlValue::Text(v) => serde_json::Value::String(v.to_string()),
-        SqlValue::Blob(v) => serde_json::Value::String(hex_value(&SqlValue::Blob(Arc::clone(v)))),
-    }
-}
-
-fn json_scalar_to_sql(value: serde_json::Value) -> SqlValue {
-    match value {
-        serde_json::Value::Null => SqlValue::Null,
-        serde_json::Value::Bool(v) => SqlValue::Integer(if v { 1 } else { 0 }),
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .map(SqlValue::Integer)
-            .or_else(|| {
-                n.as_u64()
-                    .and_then(|v| i64::try_from(v).ok())
-                    .map(SqlValue::Integer)
-            })
-            .unwrap_or_else(|| SqlValue::Real(n.as_f64().unwrap_or(0.0))),
-        serde_json::Value::String(v) => SqlValue::Text(Arc::from(v)),
-        other @ (serde_json::Value::Array(_) | serde_json::Value::Object(_)) => {
-            SqlValue::Text(Arc::from(other.to_string()))
-        }
-    }
-}
-
-fn json_path_lookup<'a>(
-    mut value: &'a serde_json::Value,
-    path: &str,
-) -> Result<Option<&'a serde_json::Value>> {
-    if path == "$" {
-        return Ok(Some(value));
-    }
-    let bytes = path.as_bytes();
-    if bytes.first() != Some(&b'$') {
-        return Err(Error::UnsupportedSql(
-            "json path must start with $".to_owned(),
-        ));
-    }
-    let mut idx = 1;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'.' => {
-                idx += 1;
-                let start = idx;
-                while idx < bytes.len() && bytes[idx] != b'.' && bytes[idx] != b'[' {
-                    idx += 1;
-                }
-                let key = &path[start..idx];
-                let serde_json::Value::Object(map) = value else {
-                    return Ok(None);
-                };
-                let Some(next) = map.get(key) else {
-                    return Ok(None);
-                };
-                value = next;
-            }
-            b'[' => {
-                idx += 1;
-                let start = idx;
-                while idx < bytes.len() && bytes[idx] != b']' {
-                    idx += 1;
-                }
-                if idx >= bytes.len() {
-                    return Err(Error::UnsupportedSql(
-                        "unterminated json path index".to_owned(),
-                    ));
-                }
-                let ordinal = path[start..idx]
-                    .parse::<usize>()
-                    .map_err(|_| Error::UnsupportedSql("invalid json path index".to_owned()))?;
-                idx += 1;
-                let serde_json::Value::Array(array) = value else {
-                    return Ok(None);
-                };
-                let Some(next) = array.get(ordinal) else {
-                    return Ok(None);
-                };
-                value = next;
-            }
-            _ => {
-                return Err(Error::UnsupportedSql(
-                    "unsupported json path syntax".to_owned(),
-                ));
-            }
-        }
-    }
-    Ok(Some(value))
-}
 
 const VECTOR_MAGIC: &[u8; 4] = b"RLV1";
 
@@ -1306,7 +1078,8 @@ fn vector_from_json(values: &[SqlValue]) -> Result<SqlValue> {
     if matches!(value, SqlValue::Null) {
         return Ok(SqlValue::Null);
     }
-    let json = parse_json_value(value)?;
+    let json: serde_json::Value =
+        serde_json::from_str(&value_to_string(value)).map_err(|_| Error::DatatypeMismatch)?;
     let serde_json::Value::Array(items) = json else {
         return Err(Error::DatatypeMismatch);
     };

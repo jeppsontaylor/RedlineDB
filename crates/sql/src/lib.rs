@@ -2,6 +2,7 @@ mod batch;
 mod connection;
 mod error;
 mod exec;
+mod json;
 mod parser;
 mod planner;
 mod session;

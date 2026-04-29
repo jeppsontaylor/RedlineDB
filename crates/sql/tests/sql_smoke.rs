@@ -556,7 +556,7 @@ fn json_text_functions_are_sqlite_compatible_for_core_paths() {
     assert_eq!(stmt.step().expect("row"), Step::Row);
     assert_eq!(stmt.column_i64(0).expect("valid"), 1);
     assert_eq!(stmt.column_i64(1).expect("extract"), 2);
-    assert_eq!(stmt.column_text(2).expect("type"), "boolean");
+    assert_eq!(stmt.column_text(2).expect("type"), "true");
     assert_eq!(stmt.column_text(3).expect("array"), "[1,\"two\",null]");
     assert_eq!(stmt.column_text(4).expect("object"), "{\"k\":7}");
     assert_eq!(stmt.column_text(5).expect("quote"), "\"x\"");
