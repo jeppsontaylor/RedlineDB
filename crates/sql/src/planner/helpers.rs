@@ -289,6 +289,8 @@ pub(crate) fn render_json_node(node: &PhysicalPlan, out: &mut String) {
     out.push(',');
     push_json_kv(out, "index", node.index.as_deref().unwrap_or(""));
     out.push(',');
+    push_json_kv(out, "index_probe_kind", node.index_probe_kind.unwrap_or(""));
+    out.push(',');
     push_json_num(out, "estimated_rows", node.estimated_rows);
     out.push(',');
     push_json_num(out, "startup_cost", node.cost.startup);
@@ -350,9 +352,20 @@ pub(crate) fn render_detail(node: &PhysicalPlan) -> String {
         }
         PhysicalKind::IndexScan => {
             let relation = node.relation.as_deref().unwrap_or("?");
+            // Render the probe kind (PointLookup vs RangeScan) so
+            // EXPLAIN consumers can distinguish equality probes from
+            // range scans even though both reuse `IndexScan` as the
+            // physical kind. Covering-index renders keep their legacy
+            // wording until that optimization is enabled.
             if let Some(index) = &node.index {
+                let probe = node.index_probe_kind.unwrap_or("");
                 if !node.projected_columns.is_empty() {
                     let _ = write!(out, "SEARCH TABLE {relation} USING COVERING INDEX {index}");
+                } else if !probe.is_empty() {
+                    let _ = write!(
+                        out,
+                        "SEARCH TABLE {relation} USING INDEX {index}: {probe}"
+                    );
                 } else {
                     let _ = write!(out, "SEARCH TABLE {relation} USING INDEX {index}");
                 }

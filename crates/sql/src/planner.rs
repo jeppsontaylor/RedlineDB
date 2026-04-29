@@ -147,6 +147,11 @@ pub struct PhysicalPlan {
     pub kind: PhysicalKind,
     pub relation: Option<String>,
     pub index: Option<String>,
+    /// The B-tree probe kind for `PhysicalKind::IndexScan` nodes, used
+    /// only for EXPLAIN rendering. `None` for non-index nodes and for
+    /// `CoveringIndexScan` (which renders distinctly via the
+    /// `projected_columns` marker today).
+    pub index_probe_kind: Option<&'static str>,
     pub estimated_rows: f64,
     pub cost: Cost,
     pub access_predicates: Vec<String>,
@@ -168,6 +173,7 @@ impl PhysicalPlan {
             kind,
             relation: None,
             index: None,
+            index_probe_kind: None,
             estimated_rows: 0.0,
             cost: Cost::zero(),
             access_predicates: Vec::new(),
@@ -438,6 +444,7 @@ fn build_table_scan_plan(
             let mut node =
                 PhysicalPlan::leaf(PhysicalKind::IndexScan, Some(table.name.to_string()));
             node.index = Some(index.name.to_string());
+            node.index_probe_kind = Some("PointLookup");
             node.estimated_rows = estimate_eq_rows(table_stats, &index, &predicates);
             node.cost = estimate_index_cost(node.estimated_rows, width, true);
             node.access_predicates = predicates;
@@ -447,6 +454,7 @@ fn build_table_scan_plan(
             let mut node =
                 PhysicalPlan::leaf(PhysicalKind::IndexScan, Some(table.name.to_string()));
             node.index = Some(index.name.to_string());
+            node.index_probe_kind = Some("RangeScan");
             node.estimated_rows = estimate_range_rows(table_stats, &index, &predicates);
             node.cost = estimate_index_cost(node.estimated_rows, width, false);
             node.access_predicates = predicates;
