@@ -4,8 +4,10 @@ pub mod config;
 mod engine;
 mod gates;
 mod metrics;
+pub mod process_metrics;
 mod recover;
 mod report;
+pub mod strace_capture;
 pub mod workload;
 
 use std::fs;

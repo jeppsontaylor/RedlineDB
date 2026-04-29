@@ -10,6 +10,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossbeam-utils = "0.8"
 hdrhistogram = "7"
+libc = "0.2"
 rand = "0.9"
 rand_chacha = "0.9"
 redlinedb = { path = "../redlinedb" }

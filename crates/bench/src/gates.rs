@@ -183,6 +183,7 @@ mod tests {
             data_bytes: 1,
             wal_bytes: 1,
             engine_stats: serde_json::json!({}),
+            process_metrics: None,
         }
     }
 
