@@ -161,9 +161,17 @@ pub fn next_run_id(engine: EngineKind, workload: WorkloadKind) -> String {
 pub fn collect_environment() -> RunEnvironment {
     RunEnvironment {
         hostname: hostname(),
-        git_sha: command_output(["git", "rev-parse", "HEAD"]),
-        git_dirty: command_status(["git", "status", "--porcelain"])
-            .map(|output| !output.is_empty()),
+        // Lane BH P1 #4: prefer caller-provided env vars so the
+        // remote/Docker path (where `.git` is intentionally excluded
+        // from the rsync) still records the host-side commit. Only
+        // fall back to shelling out when neither is set; that keeps
+        // local interactive runs working unchanged while making the
+        // manifest's `git_sha` / `git_dirty` no longer silently None
+        // on the certify host.
+        git_sha: env_git_sha().or_else(|| command_output(["git", "rev-parse", "HEAD"])),
+        git_dirty: env_git_dirty().or_else(|| {
+            command_status(["git", "status", "--porcelain"]).map(|output| !output.is_empty())
+        }),
         rustc_version: command_output(["rustc", "-V"]),
         sqlite_version: Some(rusqlite::version().to_owned()),
         logical_cpus: std::thread::available_parallelism()
@@ -171,6 +179,31 @@ pub fn collect_environment() -> RunEnvironment {
             .unwrap_or(1),
         memory_mib: total_memory_mib(),
         image_digest: std::env::var("REDLINEDB_BENCH_IMAGE_DIGEST").ok(),
+    }
+}
+
+/// Read `REDLINEDB_BENCH_GIT_SHA` if set and non-empty.
+///
+/// This is the primary path for remote/Docker runs because the
+/// container often has no `.git` directory — the host script captures
+/// the SHA before issuing `docker run`.
+fn env_git_sha() -> Option<String> {
+    std::env::var("REDLINEDB_BENCH_GIT_SHA")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Read `REDLINEDB_BENCH_GIT_DIRTY` and parse it as a boolean. The
+/// host script writes the literal string `true` or `false` so we
+/// accept those exactly; any other value (including unset) yields
+/// `None` and the caller falls back to `git status` if available.
+fn env_git_dirty() -> Option<bool> {
+    let raw = std::env::var("REDLINEDB_BENCH_GIT_DIRTY").ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
     }
 }
 
