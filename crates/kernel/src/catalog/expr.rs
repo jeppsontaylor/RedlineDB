@@ -18,6 +18,14 @@ pub enum ExprAst {
     Le(Box<ExprAst>, Box<ExprAst>),
     Gt(Box<ExprAst>, Box<ExprAst>),
     Ge(Box<ExprAst>, Box<ExprAst>),
+    /// Length of the operand interpreted as a Blob, in bytes.
+    ///
+    /// Returns `Null` if the operand is not a `Blob`. This is the minimum
+    /// surface needed for the SQL layer to express byte-exact vector dimension
+    /// CHECK constraints (`BlobLen(col) == K`) without bringing the full
+    /// `length()` SQL function into the kernel evaluator. Added in phase-10
+    /// Lane V1.
+    BlobLen(Box<ExprAst>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +41,7 @@ pub enum ExprOp {
     Le,
     Gt,
     Ge,
+    BlobLen,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +101,24 @@ pub fn eval_expr(
             ExprOp::Le => compare_into(&mut scratch.stack, |o| o != Ordering::Greater)?,
             ExprOp::Gt => compare_into(&mut scratch.stack, |o| o == Ordering::Greater)?,
             ExprOp::Ge => compare_into(&mut scratch.stack, |o| o != Ordering::Less)?,
+            ExprOp::BlobLen => {
+                let v = scratch.stack.pop().ok_or(ExprError::StackUnderflow)?;
+                let result = match v {
+                    OwnedValue::Blob(b) => OwnedValue::Integer(b.len() as i64),
+                    // Null propagates so that a CHECK like
+                    // `BlobLen(col) = K` is satisfied for nullable columns
+                    // — matching SQLite's "Null in a CHECK is satisfied"
+                    // semantics enforced by `apply_constraints`.
+                    OwnedValue::Null => OwnedValue::Null,
+                    // Non-blob, non-null value: surface a sentinel `-1` so
+                    // that comparisons against any non-negative expected
+                    // length deterministically fail (`-1 = K` → 0). This is
+                    // how vector-dimension enforcement rejects an INTEGER /
+                    // TEXT / REAL written into a `VECTOR(N)` column.
+                    _ => OwnedValue::Integer(-1),
+                };
+                scratch.stack.push(result);
+            }
         }
     }
     Ok(scratch.stack.pop().unwrap_or(OwnedValue::Null))
@@ -148,6 +175,10 @@ fn compile_inner(expr: &ExprAst, bytecode: &mut Vec<ExprOp>, cols: &mut Vec<u16>
             compile_inner(right, bytecode, cols);
             bytecode.push(ExprOp::Ge);
         }
+        ExprAst::BlobLen(operand) => {
+            compile_inner(operand, bytecode, cols);
+            bytecode.push(ExprOp::BlobLen);
+        }
     }
 }
 
@@ -167,6 +198,14 @@ fn compare_into(
 ) -> Result<(), ExprError> {
     let right = stack.pop().ok_or(ExprError::StackUnderflow)?;
     let left = stack.pop().ok_or(ExprError::StackUnderflow)?;
+    // SQL three-valued logic: any comparison with NULL produces NULL. The
+    // SQL `apply_constraints` treats NULL as "constraint satisfied", which is
+    // what callers depend on (e.g. the auto-emitted `BlobLen(col) = K` for
+    // a nullable VECTOR column passes when col is NULL).
+    if matches!(left, OwnedValue::Null) || matches!(right, OwnedValue::Null) {
+        stack.push(OwnedValue::Null);
+        return Ok(());
+    }
     let ord = compare_values(&left, &right);
     stack.push(bool_value(accept(ord)));
     Ok(())

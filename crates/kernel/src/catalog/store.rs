@@ -479,6 +479,11 @@ fn encode_expr_op(out: &mut Writer, op: &ExprOp) -> Result<()> {
         ExprOp::Le => out.u8(8),
         ExprOp::Gt => out.u8(9),
         ExprOp::Ge => out.u8(10),
+        // Phase-10 Lane V1: `BlobLen` was introduced for vector-dimension
+        // CHECK constraints. Older binaries cannot read databases that use
+        // it (the unknown-opcode arm in `decode_expr_op` will surface as
+        // catalog corruption), which is the correct forward-compat posture.
+        ExprOp::BlobLen => out.u8(11),
     }
     Ok(())
 }
@@ -500,6 +505,7 @@ fn decode_expr_op(reader: &mut Reader<'_>) -> Result<ExprOp> {
         8 => ExprOp::Le,
         9 => ExprOp::Gt,
         10 => ExprOp::Ge,
+        11 => ExprOp::BlobLen,
         _ => return Err(Error::CatalogCorrupt("invalid expr opcode")),
     })
 }
