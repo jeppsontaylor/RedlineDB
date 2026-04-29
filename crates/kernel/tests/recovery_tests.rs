@@ -563,6 +563,206 @@ fn old_commit_payload_shape_is_not_accepted_for_commit_records() {
     assert!(matches!(err, Error::BufferTooSmall { .. }));
 }
 
+#[test]
+fn create_index_atomicity_under_simulated_crash_mid_backfill() {
+    use redlinedb_kernel::catalog::{
+        ColumnConstraintSpec, ColumnSpec, ConflictAction, CreateIndexSpec, CreateTableSpec, DbName,
+        IndexColumnSpec, IndexOrigin, QualifiedName, SchemaId, SortDir, ValueRef, encode_record,
+    };
+
+    let temp = TempDir::new().unwrap();
+    let engine = Engine::create(temp.path(), config()).unwrap();
+
+    // CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB) and seed three rows.
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    let table = engine
+        .create_table(
+            &mut tx,
+            CreateTableSpec {
+                schema: None,
+                name: DbName::new("t"),
+                if_not_exists: false,
+                columns: vec![
+                    ColumnSpec {
+                        name: DbName::new("id"),
+                        declared_type: Some("INTEGER".to_owned()),
+                        constraints: vec![ColumnConstraintSpec::PrimaryKey {
+                            sort_dir: SortDir::Asc,
+                            conflict: ConflictAction::Abort,
+                        }],
+                        collation: None,
+                        default_value: None,
+                    },
+                    ColumnSpec {
+                        name: DbName::new("v"),
+                        declared_type: Some("BLOB".to_owned()),
+                        constraints: vec![],
+                        collation: None,
+                        default_value: None,
+                    },
+                ],
+                constraints: vec![],
+                strict: false,
+                without_rowid: false,
+                normalized_sql: Some("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)".to_owned()),
+            },
+        )
+        .unwrap();
+    engine.commit(tx).unwrap();
+
+    for i in 1..=3_i64 {
+        let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+        let mut buf = Vec::new();
+        encode_record(
+            &[ValueRef::Integer(i), ValueRef::Blob(&[0xc0, i as u8])],
+            &mut buf,
+        )
+        .unwrap();
+        let row_id = engine.reserve_row_id();
+        engine
+            .insert_for_relation(&mut tx, table.relation_id, row_id, buf)
+            .unwrap();
+        engine.commit(tx).unwrap();
+    }
+
+    // BEGIN CREATE INDEX -> backfill happens -> simulate crash by dropping
+    // the engine BEFORE commit. The pending tx never commits, so its WAL
+    // payloads (PageImage records logged inside the b-tree backfill) MUST be
+    // discarded by recovery and the catalog must NOT advertise the index.
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    let _ = engine
+        .create_index(
+            &mut tx,
+            CreateIndexSpec {
+                schema: None,
+                name: DbName::new("ix_v"),
+                table: QualifiedName {
+                    schema: DbName::new("main"),
+                    name: DbName::new("t"),
+                },
+                unique: false,
+                columns: vec![IndexColumnSpec {
+                    name: DbName::new("v"),
+                    sort_dir: SortDir::Asc,
+                    collation: None,
+                }],
+                origin: IndexOrigin::User,
+                normalized_sql: Some("CREATE INDEX ix_v ON t(v)".to_owned()),
+            },
+        )
+        .unwrap();
+    drop(tx); // simulated crash mid-backfill: tx never commits.
+    drop(engine);
+
+    let reopened = Engine::open(temp.path(), config()).unwrap();
+    let snapshot = reopened.schema_snapshot();
+    // The CREATE INDEX never committed, so it must NOT appear after recovery.
+    assert!(
+        snapshot.lookup_index(SchemaId(1), "ix_v").is_none(),
+        "uncommitted CREATE INDEX must not survive recovery"
+    );
+    // The base table must still be present.
+    assert!(snapshot.lookup_table(SchemaId(1), "t").is_some());
+}
+
+#[test]
+fn create_index_with_backfill_recovers_meta_page_id_after_commit() {
+    use redlinedb_kernel::catalog::{
+        ColumnConstraintSpec, ColumnSpec, ConflictAction, CreateIndexSpec, CreateTableSpec, DbName,
+        IndexColumnSpec, IndexOrigin, QualifiedName, SchemaId, SortDir, ValueRef, encode_record,
+    };
+
+    let temp = TempDir::new().unwrap();
+    let engine = Engine::create(temp.path(), config()).unwrap();
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    let table = engine
+        .create_table(
+            &mut tx,
+            CreateTableSpec {
+                schema: None,
+                name: DbName::new("t"),
+                if_not_exists: false,
+                columns: vec![
+                    ColumnSpec {
+                        name: DbName::new("id"),
+                        declared_type: Some("INTEGER".to_owned()),
+                        constraints: vec![ColumnConstraintSpec::PrimaryKey {
+                            sort_dir: SortDir::Asc,
+                            conflict: ConflictAction::Abort,
+                        }],
+                        collation: None,
+                        default_value: None,
+                    },
+                    ColumnSpec {
+                        name: DbName::new("v"),
+                        declared_type: Some("TEXT".to_owned()),
+                        constraints: vec![],
+                        collation: None,
+                        default_value: None,
+                    },
+                ],
+                constraints: vec![],
+                strict: false,
+                without_rowid: false,
+                normalized_sql: Some("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)".to_owned()),
+            },
+        )
+        .unwrap();
+    engine.commit(tx).unwrap();
+
+    for i in 1..=4_i64 {
+        let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+        let value = format!("v{i}");
+        let mut buf = Vec::new();
+        encode_record(&[ValueRef::Integer(i), ValueRef::Text(&value)], &mut buf).unwrap();
+        let row_id = engine.reserve_row_id();
+        engine
+            .insert_for_relation(&mut tx, table.relation_id, row_id, buf)
+            .unwrap();
+        engine.commit(tx).unwrap();
+    }
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    engine
+        .create_index(
+            &mut tx,
+            CreateIndexSpec {
+                schema: None,
+                name: DbName::new("ix_v"),
+                table: QualifiedName {
+                    schema: DbName::new("main"),
+                    name: DbName::new("t"),
+                },
+                unique: false,
+                columns: vec![IndexColumnSpec {
+                    name: DbName::new("v"),
+                    sort_dir: SortDir::Asc,
+                    collation: None,
+                }],
+                origin: IndexOrigin::User,
+                normalized_sql: Some("CREATE INDEX ix_v ON t(v)".to_owned()),
+            },
+        )
+        .unwrap();
+    engine.commit(tx).unwrap();
+    drop(engine);
+
+    let reopened = Engine::open(temp.path(), config()).unwrap();
+    let snapshot = reopened.schema_snapshot();
+    let index = snapshot
+        .lookup_index(SchemaId(1), "ix_v")
+        .expect("committed CREATE INDEX must survive recovery");
+    assert!(
+        index.meta_page_id.is_some(),
+        "meta_page_id must survive recovery for committed CREATE INDEX"
+    );
+    assert!(
+        reopened.index_handle(index.index_id).is_some(),
+        "index handle must rehydrate from catalog snapshot"
+    );
+}
+
 fn wal_segment_count(path: &std::path::Path) -> Vec<u64> {
     let mut segments = Vec::new();
     if !path.exists() {

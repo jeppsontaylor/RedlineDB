@@ -16,9 +16,7 @@ use crate::catalog::{
 use crate::engine::lock::{RowKey, RowLockManager};
 use crate::engine::page_heap::{PageBackedHeap, VacuumStats};
 use crate::format::{Csn, DEFAULT_PAGE_SIZE, Lsn, Page, RelId, RowId, TxId};
-use crate::index::{
-    BtreeIndex, IndexDescriptor, IndexId as PhysicalIndexId, IndexUniqueness,
-};
+use crate::index::{BtreeIndex, IndexDescriptor, IndexId as PhysicalIndexId, IndexUniqueness};
 use crate::storage::{
     BufferPool, BufferPoolStats, ControlFile, ControlStore, DEFAULT_CHECKPOINT_BATCH_PAGES,
     PageFile, TxStatusCheckpoint, TxStatusStore,
@@ -879,9 +877,13 @@ impl Engine {
         let dirs: Vec<crate::catalog::SortDir> =
             index.keys.iter().map(|key| key.sort_dir).collect();
         for (row_id, _ptr) in entries {
-            let payload = self
-                .heap
-                .get_for_relation(&self.txs, tx.snapshot(), Some(tx.id()), table.relation_id, row_id)?;
+            let payload = self.heap.get_for_relation(
+                &self.txs,
+                tx.snapshot(),
+                Some(tx.id()),
+                table.relation_id,
+                row_id,
+            )?;
             let Some(payload) = payload else {
                 continue;
             };
@@ -898,8 +900,10 @@ impl Engine {
                     .map_err(|_| Error::CorruptPage("index backfill: column out of range"))?;
                 parts.push(value);
             }
-            let EncodedIndexKey { bytes, contains_null } =
-                encode_index_key(&parts, &dirs, &mut key_buf);
+            let EncodedIndexKey {
+                bytes,
+                contains_null,
+            } = encode_index_key(&parts, &dirs, &mut key_buf);
             // SQLite NULL-uniqueness rule: skip the unique conflict check
             // when any leading key component is NULL — duplicates of NULL
             // are allowed in unique indexes.
