@@ -249,17 +249,21 @@ pub enum WorkloadKind {
 impl WorkloadKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            // Strings here MUST round-trip through clap ValueEnum / serde
+            // kebab-case (the CLI subcommand and the certify child both parse
+            // them), and `clap::ValueEnum` auto-derives kebab-case directly
+            // from the variant name (no inserted dashes around digits).
             Self::SingleRowInsert => "single-row-insert",
-            Self::BatchedInsert100 => "batched-insert-100",
+            Self::BatchedInsert100 => "batched-insert100",
             Self::PointReadPk => "point-read-pk",
             Self::SecondaryIndexRead => "secondary-index-read",
             Self::SecondaryIndexRange => "secondary-index-range",
             Self::WritersDisjoint => "writers-disjoint",
             Self::HotRowUpdate => "hot-row-update",
             Self::MixedOltp => "mixed-oltp",
-            Self::Mixed95Read5Write => "mixed-95-5",
-            Self::Mixed80Read20Write => "mixed-80-20",
-            Self::Mixed50Read50Write => "mixed-50-50",
+            Self::Mixed95Read5Write => "mixed95-read5-write",
+            Self::Mixed80Read20Write => "mixed80-read20-write",
+            Self::Mixed50Read50Write => "mixed50-read50-write",
         }
     }
 }
