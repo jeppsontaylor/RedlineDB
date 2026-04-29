@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{DurabilityKind, EngineKind, WorkloadKind};
+use crate::process_metrics::ProcessMetrics;
 use crate::{ensure_parent, gates};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +53,8 @@ pub struct RunRecord {
     pub data_bytes: u64,
     pub wal_bytes: u64,
     pub engine_stats: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_metrics: Option<ProcessMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

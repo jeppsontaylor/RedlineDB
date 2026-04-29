@@ -714,6 +714,7 @@ dependencies = [
  "clap",
  "crossbeam-utils",
  "hdrhistogram",
+ "libc",
  "rand",
  "rand_chacha",
  "redlinedb",

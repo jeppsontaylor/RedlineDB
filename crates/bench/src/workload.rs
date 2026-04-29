@@ -10,6 +10,7 @@ use rand_chacha::ChaCha8Rng;
 use crate::config::{RunSpec, WorkloadKind};
 use crate::engine::{self, BenchConn, BenchEngine, CellValue};
 use crate::metrics::Metrics;
+use crate::process_metrics;
 use crate::report::{MetricsSummary, RunRecord};
 
 pub fn run_once(spec: &RunSpec) -> Result<RunRecord> {
@@ -36,6 +37,7 @@ pub fn run_once(spec: &RunSpec) -> Result<RunRecord> {
     let snapshot = engine.snapshot()?;
     let checksum = engine.checksum()?;
     let elapsed = started.elapsed();
+    let process = process_metrics::collect_self();
     Ok(RunRecord {
         run_id: crate::report::next_run_id(spec.engine, spec.workload),
         engine: spec.engine,
@@ -57,6 +59,7 @@ pub fn run_once(spec: &RunSpec) -> Result<RunRecord> {
         data_bytes: snapshot.data_bytes,
         wal_bytes: snapshot.wal_bytes,
         engine_stats: snapshot.engine_stats,
+        process_metrics: Some(process),
     })
 }
 
