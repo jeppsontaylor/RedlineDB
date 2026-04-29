@@ -1408,4 +1408,83 @@ mod lane_c {
             "multi-index AND must stay off:\n{plan_and}"
         );
     }
+
+    /// Regression: composite (a, b) index with WHERE a = ? must surface every
+    /// row that shares the leading-key value. The previous upper-bound for the
+    /// half-open range was `prefix || 0x00`, which sorts BEFORE every full
+    /// composite key (because the next part starts with a non-zero type tag),
+    /// so the range returned an empty set.
+    #[test]
+    fn composite_index_leading_prefix_returns_all_rows() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_ab ON t(a, b)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (1, 'x')")
+            .expect("insert 1x");
+        conn.execute("INSERT INTO t VALUES (1, 'y')")
+            .expect("insert 1y");
+        conn.execute("INSERT INTO t VALUES (1, 'z')")
+            .expect("insert 1z");
+        conn.execute("INSERT INTO t VALUES (2, 'x')")
+            .expect("insert 2x");
+
+        // The planner must pick the (a, b) composite index for `WHERE a = 1`.
+        let plan = explain_text(&conn, "SELECT b FROM t WHERE a = 1");
+        assert!(
+            plan.contains("USING INDEX t_ab"),
+            "expected (a,b) index path for leading-only equality, got plan:\n{plan}"
+        );
+
+        let mut stmt = conn
+            .prepare("SELECT b FROM t WHERE a = 1 ORDER BY b")
+            .expect("prepare");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push(stmt.column_text(0).expect("b").to_owned());
+        }
+        assert_eq!(
+            rows,
+            vec!["x".to_owned(), "y".to_owned(), "z".to_owned()],
+            "leading-prefix range must surface every (a=1, *) row"
+        );
+    }
+
+    /// Regression: composite (a, b) index with WHERE a = ? AND b = ? is a
+    /// full-key point lookup; the upper bound must be tight enough to NOT
+    /// surface rows for other `b` values, and lax enough to include the
+    /// requested one.
+    #[test]
+    fn composite_index_leading_prefix_with_explicit_b() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_ab ON t(a, b)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (1, 'x')")
+            .expect("insert 1x");
+        conn.execute("INSERT INTO t VALUES (1, 'y')")
+            .expect("insert 1y");
+        conn.execute("INSERT INTO t VALUES (1, 'z')")
+            .expect("insert 1z");
+        conn.execute("INSERT INTO t VALUES (2, 'x')")
+            .expect("insert 2x");
+
+        // Full-key equality should resolve to a point lookup.
+        let plan = explain_text(&conn, "SELECT b FROM t WHERE a = 1 AND b = 'y'");
+        assert!(
+            plan.contains("USING INDEX t_ab") && plan.contains("PointLookup"),
+            "expected (a,b) IndexPointLookup, got plan:\n{plan}"
+        );
+
+        let mut stmt = conn
+            .prepare("SELECT b FROM t WHERE a = 1 AND b = 'y'")
+            .expect("prepare");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push(stmt.column_text(0).expect("b").to_owned());
+        }
+        assert_eq!(rows, vec!["y".to_owned()]);
+    }
 }
