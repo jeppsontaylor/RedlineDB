@@ -209,12 +209,29 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
 
     // Open the ack log in append mode. Each successful commit
     // contractually fsyncs the WAL; only after the commit returns
-    // do we append the row's key. The flush() ensures the OS sees
-    // the write before we proceed to the next row.
+    // do we append the row's key. We then call `sync_all()` on the
+    // ack-file handle so the line itself is durable on disk before
+    // proceeding — a `flush()` only drains Rust's `BufWriter`, while
+    // `sync_all()` issues an fsync(2) that flushes the OS page cache.
+    // Without the fsync, a child crash could leave the ack log
+    // shorter on disk than what `read_ack_count` saw in memory and
+    // mask real lost-acked-commits as zero.
+    //
+    // We also fsync the parent directory once after creating the
+    // file so the directory entry that names the ack log is itself
+    // durable (matters when the test kills the child before the
+    // first row commits).
     let mut ack = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&args.ack_log)?;
+    ack.sync_all()?;
+    if let Some(parent) = args.ack_log.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
 
     // Every 16 rows the child also calls `Database::checkpoint()` so
     // failpoints that gate the checkpoint path (`engine::checkpoint`,
@@ -251,7 +268,12 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
             return Ok(());
         }
         writeln!(ack, "{key}")?;
-        ack.flush()?;
+        // `flush()` only drains `BufWriter`; `sync_all()` issues a
+        // real fsync(2) so the ack line is durable on disk before
+        // we move on. The parent's `read_ack_count` is the gate
+        // oracle, so any line we count as "acked" must survive a
+        // crash — otherwise the gate is observably false-negative.
+        ack.sync_all()?;
 
         if key > 0 && key.is_multiple_of(CHECKPOINT_EVERY_ROWS) && db.checkpoint().is_err() {
             // The checkpoint failpoint fires here; treat error as
