@@ -240,6 +240,40 @@ mod phase10_sqla_correctness {
         assert_null(&run_scalar("SELECT ifnull(NULL, NULL)"));
     }
 
+    // --- Bug 6: CAST is incomplete / wrong ----------------------------------
+
+    #[test]
+    fn cast_text_to_integer_no_digits_is_zero() {
+        // SQLite: CAST('abc' AS INTEGER) → 0.
+        assert_int(&run_scalar("SELECT CAST('abc' AS INTEGER)"), 0);
+    }
+
+    #[test]
+    fn cast_text_to_integer_prefix_only() {
+        // SQLite: CAST('123abc' AS INTEGER) → 123.
+        assert_int(&run_scalar("SELECT CAST('123abc' AS INTEGER)"), 123);
+    }
+
+    #[test]
+    fn cast_null_to_text_is_null() {
+        // SQLite: CAST(NULL AS TEXT) → NULL (NOT empty string).
+        assert_null(&run_scalar("SELECT CAST(NULL AS TEXT)"));
+        assert_null(&run_scalar("SELECT CAST(NULL AS INTEGER)"));
+        assert_null(&run_scalar("SELECT CAST(NULL AS REAL)"));
+    }
+
+    #[test]
+    fn cast_real_to_integer_truncates_toward_zero() {
+        // SQLite: CAST(3.7 AS INTEGER) → 3 (NOT 4 / round).
+        assert_int(&run_scalar("SELECT CAST(3.7 AS INTEGER)"), 3);
+        assert_int(&run_scalar("SELECT CAST(-3.7 AS INTEGER)"), -3);
+    }
+
+    #[test]
+    fn cast_integer_to_text() {
+        assert_text(&run_scalar("SELECT CAST(42 AS TEXT)"), "42");
+    }
+
     // Round-trip: combination of fixes — divide-by-zero in WHERE filter must
     // not panic, and propagated NULL must filter out the row.
     #[test]
