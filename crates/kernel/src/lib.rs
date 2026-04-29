@@ -14,6 +14,7 @@ pub mod index;
 pub mod io;
 pub mod storage;
 pub mod txn;
+pub mod vector;
 pub mod wal;
 
 pub use error::{Error, Result};
