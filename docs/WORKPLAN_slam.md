@@ -181,6 +181,72 @@ Fusion artifact SHA-256:
 
 The B-tree leaf-split heuristic in `crates/kernel/src/index/mod.rs` overflows when many entries share the same key (e.g., `kv_tenant_idx` with 32 distinct tenants and ≥ 8 duplicates each). Surface error: `kernel error: no free slot space on page`. Smoke seed reduced to 128 rows to avoid; the proper fix is split-on-RowId tiebreaker for duplicate keys, owed to the next kernel lane.
 
+## Phase 9 Wave 6 Fusion (3 reviewer-finding lanes K + F + B)
+
+Wave 6 addresses 7 reviewer findings filed against the Wave 5 fusion. Three parallel agents landed in `lane-k`, `lane-f6`, `lane-b6`; merged into main and tagged `wave6-fused` (aliased `phase9-fusion-green-v2`).
+
+### Lane K (kernel index correctness — findings 1, 2, 3, 6)
+
+7 commits:
+
+- `124e74e phase:9/lane-k/btree-duplicate-split: split heuristic via (key, row_id) tiebreaker`
+- `d167158 phase:9/lane-k/restore-rows: restore smoke 256 + cert 4096`
+- `0e0d4b7 phase:9/lane-k/composite-range-end: fix composite leading-prefix upper bound`
+- `ac5d253 phase:9/lane-k/index-undo-log: per-tx index undo log + unique-lock hold`
+- `5da3edf phase:9/lane-k/tests: 7 new tests covering all four findings`
+- `6b45b67 phase:9/lane-k/fmt: apply rustfmt to lane-k changes`
+- `34a5adc phase:9/lane-k/clippy: collapse if-let nest + allow 8-arg update helper`
+
+Key changes:
+- **Finding #6** — B-tree leaf split now uses physical-key navigation (`(logical_key, row_id)` tiebreaker). Duplicate runs that span leaves are walked right at the leaf level until the first entry's logical key passes the search key. `encoded_entries_len` raised from 18 to 26 to match the new physical-key entries. Internal pages propagate physical separators.
+- **Finding #1** — Per-`SessionState` `IndexUndoOp` log captures every index `Insert` / `DeleteMark` / `UndeleteMark` during a transaction. `replay_index_undo` runs before `engine.rollback`, so a rolled-back DELETE/UPDATE does not hide committed rows; a rolled-back INSERT does not leave stale unique-conflict entries. New `BtreeIndex::undelete_mark_tx` is the inverse of `delete_mark_tx`. Future MVCC-tagged-index-entries lane noted in the commit message.
+- **Finding #2** — `UniqueKeyGuard` refactored to `Arc<UniqueKeyLockTable>` and held in `SessionState::kernel_unique_guards` from the moment the probe sees no duplicate **until commit or rollback finalizes the index entry**. Eliminates the probe-then-drop race that admitted concurrent duplicate UNIQUE keys.
+- **Finding #3** — `next_key` rewritten as a binary successor; corrects three off-by-one cases (leading-prefix equality, `a > N`, `a <= N`). Composite `(a, b)` indexes with `WHERE a = ?` now return all rows.
+
+### Lane F (failpoint correctness — finding 4)
+
+3 commits:
+
+- `4c29e1c phase:9/lane-f6/sync-ack: fsync the ack log after every write`
+- `01a859e phase:9/lane-f6/honor-action: pass failpoint actions verbatim`
+- `722ca81 phase:9/lane-f6/tests: ack-log fsync + return-action passthrough tests`
+
+`open_ack_log` fsyncs file + parent dir on creation. `ack_row` writes line + `sync_all`. `apply_kill_count` no longer rewrites action strings — `panic`, `return`, `abort` flow verbatim to `fail::cfg`. `wal::flush` failpoint now uses the closure form `|_| { Ok(written) }` so the `return` action has meaningful "skipped fsync" semantics.
+
+### Lane B (bench polish — findings 5, 7)
+
+6 commits:
+
+- `64b3e2d phase:9/lane-b6/strace-flag: add --with-strace clap arg`
+- `eef75ba phase:9/lane-b6/strace-child: wrap bench children with strace -c`
+- `ebacaa3 phase:9/lane-b6/strace-lane: proof-lane and justfile recipe for --with-strace`
+- `dfee4a3 phase:9/lane-b6/error-split: separate BUSY/LOCKED/timeout failure classes`
+- `a56b757 phase:9/lane-b6/manifest-fields: surface locked/timeout counters in reports`
+- `4b81826 phase:9/lane-b6/tests: certify --with-strace integration tests + fmt`
+
+`--with-strace` clap arg ORs with `REDLINEDB_BENCH_WITH_STRACE` env var. Each `redlinedb-bench run` child is wrapped with `strace -c -o <path>` (no more parent-side post-mortem attach hang). `FailureKind` enum splits BUSY/LOCKED/Timeout/Other; `MetricsSummary` and `summary.csv` expose all three plus a backward-compat `busy_errors = busy + locked` for one minor cycle. New `phase9-xbabe1-certify-with-strace` proof lane.
+
+### Wave 6 post-fusion proof matrix
+
+- `cargo fmt --check` — green
+- `./scripts/check_file_sizes.sh` — green (3 warnings, no fails: `index/mod.rs` 1610, `exec.rs` 1556, `sql_smoke.rs` 1666; all under 2000 cap)
+- `cargo check --workspace --locked` — green
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
+- `cargo test --workspace --quiet --locked` — `222 passed, 1 ignored (31 suites, 4.82s)` (203 → 222, +19 new tests across the three lanes)
+- `cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7 --out target/bench/wave6-compat.json` — `{"files":3,"cases":40,"failures":[]}`
+- `cargo run -p redlinedb-bench -- recover-matrix --config crates/bench/bench/recovery-matrix.toml --out target/bench/wave6-recovery.json --seed 7` — exit 0, 24/36 passed (12 pre-existing crash gaps unchanged, **not** regressed by Wave 6)
+- `cargo run -p redlinedb-bench -- failpoint-matrix --config crates/bench/bench/failpoint-matrix.toml --out target/bench/wave6-failpoint.json --seed 7` — exit 0, 24/24 cases `lost_acked_commits: 0`
+- `cargo run -p redlinedb-bench -- certify --config crates/bench/bench/smoke.toml --out-dir target/bench/wave6-certify-smoke --seed 7 --repetitions 1 --warmup 0` — exit 0 at **restored** rows=256 (the kernel split fix unblocked the original seed)
+
+Wave 6 artifact SHA-256:
+- `target/bench/wave6-compat.json` — `ee812460f3f08b55b323b6bc63c461f99551177b4db64b7dd106289179f0f91e`
+- `target/bench/wave6-recovery.json` — `ed5dd25b02cbc19788d83b7dad29514f8dbec3c037f38a93280543487813fd14`
+- `target/bench/wave6-failpoint.json` — `87f3e393797720ec729fbed8bf83ee3b79d4363fa0f87828bd6e7aaac6dd334f`
+- `target/bench/wave6-certify-smoke/manifest.json` — `5c9c498758512e99c04e239c92682f770e6b274a26c567660f8bbe03e205a9cc`
+- `target/bench/wave6-certify-smoke/runs.jsonl` — `8842dbb9c829c2e1e41ab2939724432ee4c907b684ef77a96e8fec1141405afc`
+- `target/bench/wave6-certify-smoke/summary.csv` — `0c8bc178fb615a6661d5e1341a699a5336a46af6d3cb39ce0ce7296fb49f9c8f`
+- `target/bench/wave6-certify-smoke/report.md` — `60fe4d2a4347cedc023e453aba41bfb6fd66fc4982197f9fa224064dfa6fc03e`
+
 ## Verified Proof
 
 These commands passed in the current workspace:
