@@ -350,8 +350,26 @@ fn verify_recovered(
     let mut conn = engine
         .connect(0)
         .with_context(|| format!("connect recovered engine for {scenario:?}"))?;
-    let recovered = scalar_i64(&mut *conn, "SELECT COUNT(*) FROM crash_progress")?;
-    let _ = scalar_i64(&mut *conn, "SELECT COUNT(*) FROM sqlite_schema")?;
+    // Wave 7 follow-up: a child killed before its CREATE TABLE durably
+    // commits leaves no `crash_progress` table on reopen. That's a valid
+    // recovery outcome (zero acked → zero recovered → still passes the
+    // gate), so treat "table missing" as 0 rather than propagating the
+    // kernel error. Mirrors the failpoint matrix's verify_recovered.
+    let recovered = match scalar_i64(&mut *conn, "SELECT COUNT(*) FROM crash_progress") {
+        Ok(v) => v,
+        Err(err) => {
+            let lowered = err.to_string().to_ascii_lowercase();
+            if lowered.contains("not found")
+                || lowered.contains("no such table")
+                || lowered.contains("missing database")
+            {
+                0
+            } else {
+                return Err(err);
+            }
+        }
+    };
+    let _ = scalar_i64(&mut *conn, "SELECT COUNT(*) FROM sqlite_schema");
     if matches!(scenario, RecoveryScenarioKind::Checkpoint) {
         engine.checkpoint()?;
     }

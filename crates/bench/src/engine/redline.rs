@@ -15,6 +15,14 @@ impl RedlineEngine {
         std::fs::create_dir_all(db_dir)?;
         let path = db_dir.join("bench.redline");
         let mut options = redlinedb::OpenOptions::default();
+        // Wave 7 follow-up: `OpenOptions::default()` has `create: true`,
+        // which routes the facade through `Database::create` → re-init of
+        // the page file → wiped data. The bench's recover-matrix and
+        // failpoint child both reopen an existing `bench.redline` to verify
+        // recovery; force the open path when that directory already exists.
+        if path.exists() {
+            options.create = false;
+        }
         options.memory.cache_bytes = spec.cache_bytes;
         apply_durability(&mut options, spec.durability);
         let db = redlinedb::Database::open_with_options(&path, options)?;
