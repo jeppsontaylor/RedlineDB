@@ -1384,12 +1384,16 @@ mod lane_c {
     #[test]
     fn select_by_pk_uses_index_point_lookup() {
         let (_dir, conn) = open_database();
-        // Use a non-rowid PK (TEXT PRIMARY KEY) so the planner's
-        // rowid-PK fast path doesn't intercept this query — we want
-        // the row to come through the physical B-tree, not through
-        // RowIdGet.
-        conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER)")
+        // CREATE TABLE PRIMARY KEY indexes are autoindexes that the
+        // catalog records without a `meta_page_id` (no physical pages
+        // are allocated until CREATE INDEX runs). Lane KH P1 #5 made
+        // the planner skip indexes without a live handle, so we issue
+        // CREATE INDEX explicitly here to exercise the point-lookup
+        // path through a real B-tree.
+        conn.execute("CREATE TABLE t(k TEXT, v INTEGER)")
             .expect("create");
+        conn.execute("CREATE INDEX t_k_idx ON t(k)")
+            .expect("create index");
         conn.execute("INSERT INTO t VALUES ('a', 1)")
             .expect("insert a");
         conn.execute("INSERT INTO t VALUES ('b', 2)")

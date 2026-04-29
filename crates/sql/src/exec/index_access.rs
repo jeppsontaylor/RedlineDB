@@ -75,6 +75,7 @@ pub(crate) struct IndexAccessMatch {
 /// against an `(a, b)` index) returns `None`, forcing the caller to
 /// fall back to `TableScan`.
 pub(crate) fn try_match_index_access(
+    engine: &Engine,
     table: &Arc<TableDef>,
     selection: &Option<Expr>,
     bindings: &[Option<SqlValue>],
@@ -96,6 +97,16 @@ pub(crate) fn try_match_index_access(
     // PK rowid alias is the leading column, the planner already prefers
     // `RowIdGet` ahead of this code path, so we don't have to break ties.
     for index in &table.indexes {
+        // Wave 7 P1 #5: do not advertise an index unless both the catalog
+        // entry has a meta_page_id AND the engine has a live handle for
+        // the index. Without those, the executor falls back to TableScan
+        // and EXPLAIN would lie ("IndexPointLookup" while the runtime
+        // scans). Skipping the candidate here keeps planner output
+        // honest; the loop continues so a later index without this
+        // problem can still match.
+        if index.meta_page_id.is_none() || engine.index_handle(index.index_id).is_none() {
+            continue;
+        }
         let Some(first_key) = index.keys.first() else {
             continue;
         };
