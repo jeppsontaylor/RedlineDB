@@ -405,6 +405,7 @@ fn build_table_scan_plan(
         selection,
         order_by,
         rowid,
+        bindings,
         table_stats,
         optimizer,
     );
@@ -955,19 +956,99 @@ fn wrap_limit(input: PhysicalPlan, plan: &SelectPlan) -> PhysicalPlan {
 }
 
 fn choose_access_path(
-    _table: &Arc<TableDef>,
+    table: &Arc<TableDef>,
     _projection: &[SelectItem],
-    _selection: &Option<Expr>,
+    selection: &Option<Expr>,
     _order_by: &[OrderByExpr],
     rowid: Option<RowId>,
+    bindings: &[Option<SqlValue>],
     _table_stats: Option<&TableStats>,
     _optimizer: &OptimizerConfig,
 ) -> AccessPath {
+    // Order matters and mirrors the executor in `exec.rs`:
+    //   1. The integer-PK rowid alias (if the predicate is `id = ?` on
+    //      a rowid table) is the cheapest path; it lands in
+    //      `RowIdGet`.
+    //   2. Lane C: a leading-prefix index probe (point or range).
+    //   3. Fallback: a heap scan. The planner stays conservative — it
+    //      ONLY advertises an index path when the executor will
+    //      actually consume one, so EXPLAIN never lies about the
+    //      physical plan.
     if let Some(rowid) = rowid {
         return AccessPath::RowIdGet { rowid };
     }
-
+    if let Some(matched) =
+        crate::exec::index_access::try_match_index_access(table, selection, bindings)
+    {
+        return match matched.kind {
+            crate::exec::index_access::IndexProbeKind::PointLookup => {
+                AccessPath::IndexPointLookup {
+                    index: matched.index,
+                    predicates: matched.predicates,
+                }
+            }
+            crate::exec::index_access::IndexProbeKind::RangeScan => AccessPath::IndexRangeScan {
+                index: matched.index,
+                predicates: matched.predicates,
+            },
+        };
+    }
     AccessPath::TableScan
+}
+
+/// Conservatism guard for `AccessPath`. The planner is required to
+/// only advertise paths the executor can satisfy; this check is a
+/// compile-time-style enumeration that fires in debug builds if a
+/// new variant is added without a matching executor arm in
+/// `exec.rs::execute_select` and `exec/index_access.rs`.
+///
+/// Variants that ARE consumable today:
+/// - `TableScan`          (executor: `collect_table_rowids`)
+/// - `RowIdGet`           (executor: `selection_rowid_eq` fast path)
+/// - `IndexPointLookup`   (executor: `execute_index_point_lookup`)
+/// - `IndexRangeScan`     (executor: `execute_index_range_scan`)
+///
+/// Variants that are deliberately NOT advertised this round (Wave 4):
+/// - `CoveringIndexScan`  — scheduled for a later wave
+/// - `MultiIndexOr`       — scheduled for a later wave
+/// - `MultiIndexAnd`      — scheduled for a later wave
+///
+/// If you add a new `AccessPath` variant, decide whether the executor
+/// can consume it today. If yes, extend `execute_select` and add a
+/// match arm here (returning `true`). If no, leave the planner unable
+/// to emit it.
+#[cfg(debug_assertions)]
+fn access_path_is_consumable_by_executor(access: &AccessPath) -> bool {
+    match access {
+        AccessPath::TableScan
+        | AccessPath::RowIdGet { .. }
+        | AccessPath::IndexPointLookup { .. }
+        | AccessPath::IndexRangeScan { .. } => true,
+        AccessPath::CoveringIndexScan { .. }
+        | AccessPath::MultiIndexOr { .. }
+        | AccessPath::MultiIndexAnd { .. } => false,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod planner_conservatism_tests {
+    use super::*;
+
+    /// The executor must be able to consume every variant the planner
+    /// could emit today. Extend the match arms in
+    /// `access_path_is_consumable_by_executor` when adding a new
+    /// variant — and add a paired executor arm before flipping the
+    /// answer to `true`.
+    #[test]
+    fn planner_only_emits_executor_consumable_variants() {
+        // TableScan is consumable.
+        assert!(access_path_is_consumable_by_executor(&AccessPath::TableScan));
+        // RowIdGet is consumable.
+        assert!(access_path_is_consumable_by_executor(&AccessPath::RowIdGet {
+            rowid: redlinedb_kernel::format::RowId::new(1),
+        }));
+    }
 }
 
 fn best_index_for_table(
