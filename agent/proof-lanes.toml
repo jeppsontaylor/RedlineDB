@@ -31,6 +31,41 @@ commands = [
   "rtk cargo run -p redlinedb-server -- --help",
 ]
 
+[phase9-smoke]
+commands = [
+  "rtk cargo test -p redlinedb-bench --quiet --locked",
+  "rtk cargo run -p redlinedb-bench -- compare --config crates/bench/bench/smoke.toml --out target/bench/smoke.jsonl --report target/bench/smoke.md --seed 7",
+  "rtk cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7",
+]
+
+[phase9-compat-full]
+commands = [
+  "rtk cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7 --out target/bench/compat-full.json",
+]
+
+[phase9-certification]
+commands = [
+  "rtk cargo run -p redlinedb-bench -- compare --config crates/bench/bench/certification.toml --out target/bench/certification.jsonl --report target/bench/certification.md --seed 7",
+]
+
+[phase9-docker-smoke]
+commands = [
+  "./scripts/bench/xbabe1_sync.sh",
+  "./scripts/bench/xbabe1_run.sh rtk cargo test -p redlinedb-bench --quiet --locked",
+]
+
+[phase9-recovery-matrix]
+commands = [
+  "rtk cargo run -p redlinedb-bench -- recover-matrix --config crates/bench/bench/recovery-matrix.toml --out target/bench/recovery-matrix.json --seed 7",
+]
+
+[phase9-xbabe1-certification]
+commands = [
+  "./scripts/bench/xbabe1_sync.sh",
+  "./scripts/bench/xbabe1_run.sh rtk cargo run -p redlinedb-bench -- compare --config crates/bench/bench/certification.toml --out target/bench/xbabe1/certification.jsonl --report target/bench/xbabe1/certification.md --seed 7",
+  "./scripts/bench/xbabe1_fetch.sh certification",
+]
+
 [security]
 commands = [
   "rtk cargo audit",
