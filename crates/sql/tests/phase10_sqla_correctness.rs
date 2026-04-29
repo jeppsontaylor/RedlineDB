@@ -313,6 +313,97 @@ mod phase10_sqla_correctness {
         assert_int(&run_scalar("SELECT glob('hi', 'h?i')"), 0);
     }
 
+    // --- Bug 8: ORDER BY after GROUP BY honors keys / DESC -----------------
+
+    #[test]
+    fn grouped_order_by_count_desc_via_alias() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(k TEXT, v INTEGER)")
+            .expect("create t");
+        for (k, v) in [("b", 1), ("a", 1), ("a", 2)] {
+            conn.execute(&format!("INSERT INTO t VALUES ('{k}', {v})"))
+                .expect("insert");
+        }
+        let mut stmt = conn
+            .prepare("SELECT k, COUNT(*) AS c FROM t GROUP BY k ORDER BY c DESC")
+            .expect("prepare grouped order");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            let k = stmt.column_text(0).expect("k").to_owned();
+            let c = stmt.column_i64(1).expect("c");
+            rows.push((k, c));
+        }
+        assert_eq!(
+            rows,
+            vec![("a".to_owned(), 2), ("b".to_owned(), 1)],
+            "ORDER BY c DESC after GROUP BY must put the larger count first"
+        );
+    }
+
+    #[test]
+    fn grouped_order_by_count_asc() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(k TEXT)").expect("create t");
+        for k in ["a", "a", "a", "b", "b", "c"] {
+            conn.execute(&format!("INSERT INTO t VALUES ('{k}')"))
+                .expect("insert");
+        }
+        let mut stmt = conn
+            .prepare("SELECT k, COUNT(*) AS c FROM t GROUP BY k ORDER BY c ASC")
+            .expect("prepare grouped order asc");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push((
+                stmt.column_text(0).expect("k").to_owned(),
+                stmt.column_i64(1).expect("c"),
+            ));
+        }
+        assert_eq!(
+            rows,
+            vec![
+                ("c".to_owned(), 1),
+                ("b".to_owned(), 2),
+                ("a".to_owned(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_order_by_desc() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(x INTEGER)").expect("create t");
+        for v in [3, 1, 2, 1, 3] {
+            conn.execute(&format!("INSERT INTO t VALUES ({v})"))
+                .expect("insert");
+        }
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT x FROM t ORDER BY x DESC")
+            .expect("prepare distinct desc");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push(stmt.column_i64(0).expect("x"));
+        }
+        assert_eq!(rows, vec![3, 2, 1], "DISTINCT must honor ORDER BY DESC");
+    }
+
+    #[test]
+    fn grouped_order_by_group_column_desc() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(k TEXT)").expect("create t");
+        for k in ["a", "b", "c", "a", "b"] {
+            conn.execute(&format!("INSERT INTO t VALUES ('{k}')"))
+                .expect("insert");
+        }
+        let mut stmt = conn
+            .prepare("SELECT k FROM t GROUP BY k ORDER BY k DESC")
+            .expect("prepare group by k desc");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push(stmt.column_text(0).expect("k").to_owned());
+        }
+        assert_eq!(rows, vec!["c".to_owned(), "b".to_owned(), "a".to_owned()]);
+    }
+
     // Round-trip: combination of fixes — divide-by-zero in WHERE filter must
     // not panic, and propagated NULL must filter out the row.
     #[test]
