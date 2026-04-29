@@ -88,12 +88,24 @@ pub fn run(args: &FailpointMatrixArgs) -> Result<FailpointMatrixReport> {
     }
 
     let passed = failed == 0;
-    Ok(FailpointMatrixReport {
+    let report = FailpointMatrixReport {
         seed: args.seed,
         passed,
         failed_cases: failed,
         runs,
-    })
+    };
+    // Cross-check the strict gate via the same evaluator the gates
+    // module uses; if the runner ever forgets to flip `passed`, the
+    // gate-side audit will still surface a true/false discrepancy.
+    let gate = crate::gates::gate_zero_lost_acked_commits(&report);
+    if !gate.passed && report.passed {
+        // Internal consistency error - fail loudly.
+        anyhow::bail!(
+            "failpoint matrix runner reported pass but strict gate disagreed: {}",
+            gate.detail
+        );
+    }
+    Ok(report)
 }
 
 pub fn write_report(out: &Path, report: &FailpointMatrixReport) -> Result<()> {
