@@ -7,7 +7,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use redlinedb_kernel::error::Error as KernelError;
 use redlinedb_sql::{DbOptions, Error as SqlError, Step};
@@ -19,6 +20,8 @@ const RLDB_BUSY: c_int = 5;
 const RLDB_LOCKED: c_int = 6;
 const RLDB_INTERRUPT: c_int = 9;
 const RLDB_IOERR: c_int = 10;
+const RLDB_READONLY: c_int = 8;
+const RLDB_CANTOPEN: c_int = 14;
 const RLDB_SCHEMA: c_int = 17;
 const RLDB_CONSTRAINT: c_int = 19;
 const RLDB_MISMATCH: c_int = 20;
@@ -33,6 +36,10 @@ const RLDB_INTEGER: c_int = 1;
 const RLDB_REAL: c_int = 2;
 const RLDB_TEXT: c_int = 3;
 const RLDB_BLOB: c_int = 4;
+
+const SQLITE_OPEN_READONLY: c_int = 0x0000_0001;
+const SQLITE_OPEN_READWRITE: c_int = 0x0000_0002;
+const SQLITE_OPEN_CREATE: c_int = 0x0000_0004;
 
 #[repr(C)]
 pub struct rldb_config {
@@ -51,6 +58,7 @@ pub struct rldb {
     db: Arc<redlinedb_sql::Database>,
     conn: Arc<redlinedb_sql::Connection>,
     path: PathBuf,
+    path_text: CString,
     last_code: AtomicI32,
     last_message: Mutex<CString>,
     interrupted: AtomicBool,
@@ -61,6 +69,7 @@ pub struct rldb {
 pub struct rldb_stmt {
     db: *mut rldb,
     stmt: redlinedb_sql::Statement,
+    sql_text: CString,
     column_names: Vec<CString>,
     text_cache: Vec<CString>,
 }
@@ -73,6 +82,15 @@ pub struct rldb_backup {
     remaining: i64,
     pagecount: i64,
 }
+
+#[allow(non_camel_case_types)]
+pub type sqlite3 = rldb;
+
+#[allow(non_camel_case_types)]
+pub type sqlite3_stmt = rldb_stmt;
+
+#[allow(non_camel_case_types)]
+pub type sqlite3_backup = rldb_backup;
 
 fn api<T>(f: impl FnOnce() -> T) -> Result<T, c_int> {
     catch_unwind(AssertUnwindSafe(f)).map_err(|_| RLDB_INTERNAL)
@@ -124,23 +142,31 @@ fn db_options_from_config(config: Option<&rldb_config>) -> DbOptions {
         options.query_memory.work_mem_bytes = config.work_mem_bytes as usize;
         options.query_memory.max_spill_bytes = config.max_spill_bytes as usize;
         options.query_memory.batch_rows = config.statement_cache_capacity.max(1) as usize;
+        options.busy_timeout = std::time::Duration::from_millis(config.busy_timeout_ms as u64);
     }
     options
 }
 
-fn open_handle(path: &CStr, config: Option<&rldb_config>) -> Result<*mut rldb, c_int> {
+fn open_handle(
+    path: &CStr,
+    config: Option<&rldb_config>,
+    create_if_missing: bool,
+) -> Result<*mut rldb, c_int> {
     let path = path.to_str().map_err(|_| RLDB_MISMATCH)?;
     let options = db_options_from_config(config);
     let db = if Path::new(path).exists() {
         sql_result(redlinedb_sql::Database::open(path, options))?
-    } else {
+    } else if create_if_missing {
         sql_result(redlinedb_sql::Database::create(path, options))?
+    } else {
+        return Err(RLDB_CANTOPEN);
     };
     let conn = db.connect();
     let handle = Box::new(rldb {
         db,
         conn,
         path: PathBuf::from(path),
+        path_text: CString::new(path).map_err(|_| RLDB_MISMATCH)?,
         last_code: AtomicI32::new(RLDB_OK),
         last_message: Mutex::new(CString::new("").unwrap()),
         interrupted: AtomicBool::new(false),
@@ -213,13 +239,83 @@ fn recursive_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn status_message(code: c_int) -> &'static str {
+    match code {
+        RLDB_OK => "ok",
+        RLDB_BUSY => "busy",
+        RLDB_LOCKED => "locked",
+        RLDB_INTERRUPT => "interrupted",
+        RLDB_IOERR => "io error",
+        RLDB_READONLY => "read only",
+        RLDB_CANTOPEN => "cannot open",
+        RLDB_SCHEMA => "schema changed",
+        RLDB_CONSTRAINT => "constraint violation",
+        RLDB_MISMATCH => "datatype mismatch",
+        RLDB_MISUSE => "misuse",
+        RLDB_RANGE => "parameter out of range",
+        RLDB_NOTADB => "not an open database",
+        _ => "error",
+    }
+}
+
+fn sqlite_version_cstr() -> &'static CStr {
+    static VERSION: OnceLock<CString> = OnceLock::new();
+    VERSION
+        .get_or_init(|| CString::new(env!("CARGO_PKG_VERSION")).expect("version cstring"))
+        .as_c_str()
+}
+
+fn sqlite_sourceid_cstr() -> &'static CStr {
+    static SOURCEID: OnceLock<CString> = OnceLock::new();
+    SOURCEID
+        .get_or_init(|| {
+            CString::new(concat!(
+                env!("CARGO_PKG_NAME"),
+                " ",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .expect("sourceid cstring")
+        })
+        .as_c_str()
+}
+
+fn sqlite_errstr(code: c_int) -> &'static CStr {
+    match code {
+        RLDB_OK => c"not an error",
+        RLDB_ERROR => c"SQL error or missing database",
+        RLDB_INTERNAL => c"internal error",
+        RLDB_BUSY => c"database is busy",
+        RLDB_LOCKED => c"database is locked",
+        RLDB_INTERRUPT => c"operation interrupted",
+        RLDB_IOERR => c"disk I/O error",
+        RLDB_READONLY => c"attempt to write a readonly database",
+        RLDB_CANTOPEN => c"unable to open database file",
+        RLDB_SCHEMA => c"database schema has changed",
+        RLDB_CONSTRAINT => c"constraint failed",
+        RLDB_MISMATCH => c"datatype mismatch",
+        RLDB_MISUSE => c"library routine called out of sequence",
+        RLDB_RANGE => c"bind or column index out of range",
+        RLDB_NOTADB => c"file is not a database",
+        _ => c"unknown error",
+    }
+}
+
+fn record_status(db: *mut rldb, code: c_int) {
+    let _ = with_db(db, |db| {
+        db.last_code.store(code, Ordering::Relaxed);
+        if let Ok(mut last_message) = db.last_message.lock() {
+            *last_message = CString::new(status_message(code)).unwrap();
+        }
+    });
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_open(path: *const c_char, out_db: *mut *mut rldb) -> c_int {
     flatten_code(api(|| {
         if path.is_null() || out_db.is_null() {
             return Err(RLDB_MISUSE);
         }
-        let handle = open_handle(unsafe { CStr::from_ptr(path) }, None)?;
+        let handle = open_handle(unsafe { CStr::from_ptr(path) }, None, true)?;
         unsafe {
             *out_db = handle;
         }
@@ -242,7 +338,7 @@ pub extern "C" fn rldb_open_v2(
         } else {
             Some(unsafe { &*config })
         };
-        let handle = open_handle(unsafe { CStr::from_ptr(path) }, config)?;
+        let handle = open_handle(unsafe { CStr::from_ptr(path) }, config, true)?;
         unsafe {
             *out_db = handle;
         }
@@ -293,10 +389,12 @@ pub extern "C" fn rldb_prepare_v2(
                 .map_err(|_| RLDB_MISMATCH)?
                 .to_owned()
         };
+        let sql_len = sql_text.len();
         let stmt = sql_result(db_ref.conn.clone().prepare(&sql_text))?;
         let mut boxed = Box::new(rldb_stmt {
             db,
             stmt,
+            sql_text: CString::new(sql_text).map_err(|_| RLDB_MISMATCH)?,
             column_names: Vec::new(),
             text_cache: Vec::new(),
         });
@@ -312,7 +410,7 @@ pub extern "C" fn rldb_prepare_v2(
         unsafe {
             *out_stmt = Box::into_raw(boxed);
             if !tail.is_null() {
-                *tail = sql_cstr.as_ptr().wrapping_add(sql_text.len());
+                *tail = sql_cstr.as_ptr().wrapping_add(sql_len);
             }
         }
         Ok(RLDB_OK)
@@ -646,8 +744,17 @@ pub extern "C" fn rldb_interrupt(db: *mut rldb) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rldb_busy_timeout(_db: *mut rldb, _milliseconds: c_int) -> c_int {
-    RLDB_OK
+pub extern "C" fn rldb_busy_timeout(db: *mut rldb, milliseconds: c_int) -> c_int {
+    flatten_code(api(|| {
+        if db.is_null() {
+            return Err(RLDB_MISUSE);
+        }
+        let db = unsafe { &*db };
+        let timeout = Duration::from_millis(milliseconds.max(0) as u64);
+        db.db.set_busy_timeout(timeout);
+        db.conn.set_busy_timeout(timeout);
+        Ok(RLDB_OK)
+    }))
 }
 
 #[unsafe(no_mangle)]
@@ -784,4 +891,588 @@ pub extern "C" fn rldb_backup_pagecount(backup: *mut rldb_backup) -> c_int {
         return RLDB_MISUSE;
     }
     unsafe { (*backup).pagecount as c_int }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_open(path: *const c_char, out_db: *mut *mut sqlite3) -> c_int {
+    rldb_open(path, out_db)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_libversion() -> *const c_char {
+    sqlite_version_cstr().as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_libversion_number() -> c_int {
+    let version = env!("CARGO_PKG_VERSION");
+    let mut parts = version.split('.');
+    let major = parts
+        .next()
+        .and_then(|part| part.parse::<i32>().ok())
+        .unwrap_or(0);
+    let minor = parts
+        .next()
+        .and_then(|part| part.parse::<i32>().ok())
+        .unwrap_or(0);
+    let patch = parts
+        .next()
+        .and_then(|part| part.parse::<i32>().ok())
+        .unwrap_or(0);
+    major * 1_000_000 + minor * 1_000 + patch
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_sourceid() -> *const c_char {
+    sqlite_sourceid_cstr().as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_threadsafe() -> c_int {
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_errstr(code: c_int) -> *const c_char {
+    sqlite_errstr(code).as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_open_v2(
+    path: *const c_char,
+    out_db: *mut *mut sqlite3,
+    flags: c_int,
+    _vfs: *const c_char,
+) -> c_int {
+    flatten_code(api(|| {
+        if path.is_null() || out_db.is_null() {
+            return Err(RLDB_MISUSE);
+        }
+        if flags & SQLITE_OPEN_READONLY != 0 {
+            return Err(RLDB_READONLY);
+        }
+        if flags & SQLITE_OPEN_READWRITE == 0 {
+            return Err(RLDB_MISUSE);
+        }
+        let create_if_missing = flags & SQLITE_OPEN_CREATE != 0;
+        let handle = open_handle(unsafe { CStr::from_ptr(path) }, None, create_if_missing)?;
+        unsafe {
+            *out_db = handle;
+        }
+        record_status(handle, RLDB_OK);
+        Ok(RLDB_OK)
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_prepare_v3(
+    db: *mut sqlite3,
+    sql: *const c_char,
+    nbytes: c_int,
+    out_stmt: *mut *mut sqlite3_stmt,
+    tail: *mut *const c_char,
+    _flags: c_int,
+) -> c_int {
+    sqlite3_prepare_v2(db, sql, nbytes, out_stmt, tail)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_stmt_readonly(stmt: *mut sqlite3_stmt) -> c_int {
+    if stmt.is_null() {
+        return 0;
+    }
+    unsafe { (*stmt).stmt.is_readonly() as c_int }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_stmt_busy(stmt: *mut sqlite3_stmt) -> c_int {
+    if stmt.is_null() {
+        return 0;
+    }
+    unsafe { (*stmt).stmt.is_busy() as c_int }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_sql(stmt: *mut sqlite3_stmt) -> *const c_char {
+    if stmt.is_null() {
+        return ptr::null();
+    }
+    unsafe { (*stmt).sql_text.as_ptr() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_close(db: *mut sqlite3) -> c_int {
+    rldb_close(db)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> c_int {
+    rldb_close_v2(db)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_prepare_v2(
+    db: *mut sqlite3,
+    sql: *const c_char,
+    nbytes: c_int,
+    out_stmt: *mut *mut sqlite3_stmt,
+    tail: *mut *const c_char,
+) -> c_int {
+    let rc = rldb_prepare_v2(db, sql, nbytes, out_stmt, tail);
+    record_status(db, rc);
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
+    let rc = rldb_step(stmt);
+    if !stmt.is_null() {
+        let db = unsafe { (*stmt).db };
+        record_status(db, rc);
+    }
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> c_int {
+    let rc = rldb_reset(stmt);
+    if !stmt.is_null() {
+        let db = unsafe { (*stmt).db };
+        record_status(db, rc);
+    }
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> c_int {
+    rldb_finalize(stmt)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> c_int {
+    let rc = rldb_clear_bindings(stmt);
+    if !stmt.is_null() {
+        let db = unsafe { (*stmt).db };
+        record_status(db, rc);
+    }
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, index: c_int) -> c_int {
+    let rc = rldb_bind_null(stmt, index);
+    if !stmt.is_null() {
+        let db = unsafe { (*stmt).db };
+        record_status(db, rc);
+    }
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_bind_int64(stmt: *mut sqlite3_stmt, index: c_int, value: i64) -> c_int {
+    let rc = rldb_bind_int64(stmt, index, value);
+    if !stmt.is_null() {
+        let db = unsafe { (*stmt).db };
+        record_status(db, rc);
+    }
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_bind_double(stmt: *mut sqlite3_stmt, index: c_int, value: f64) -> c_int {
+    let rc = rldb_bind_double(stmt, index, value);
+    if !stmt.is_null() {
+        let db = unsafe { (*stmt).db };
+        record_status(db, rc);
+    }
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_bind_text(
+    stmt: *mut sqlite3_stmt,
+    index: c_int,
+    value: *const c_char,
+    nbytes: c_int,
+    _destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+) -> c_int {
+    let rc = rldb_bind_text(stmt, index, value, nbytes);
+    if !stmt.is_null() {
+        let db = unsafe { (*stmt).db };
+        record_status(db, rc);
+    }
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_bind_blob(
+    stmt: *mut sqlite3_stmt,
+    index: c_int,
+    value: *const c_void,
+    nbytes: c_int,
+    _destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+) -> c_int {
+    let rc = rldb_bind_blob(stmt, index, value, nbytes);
+    if !stmt.is_null() {
+        let db = unsafe { (*stmt).db };
+        record_status(db, rc);
+    }
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_parameter_count(stmt: *mut sqlite3_stmt) -> c_int {
+    rldb_parameter_count(stmt)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_bind_parameter_index(
+    stmt: *mut sqlite3_stmt,
+    name: *const c_char,
+) -> c_int {
+    rldb_bind_parameter_index(stmt, name)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_column_count(stmt: *mut sqlite3_stmt) -> c_int {
+    rldb_column_count(stmt)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_column_name(stmt: *mut sqlite3_stmt, index: c_int) -> *const c_char {
+    rldb_column_name(stmt, index)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_column_type(stmt: *mut sqlite3_stmt, index: c_int) -> c_int {
+    rldb_column_type(stmt, index)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, index: c_int) -> i64 {
+    rldb_column_int64(stmt, index)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_column_double(stmt: *mut sqlite3_stmt, index: c_int) -> f64 {
+    rldb_column_double(stmt, index)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_column_text(stmt: *mut sqlite3_stmt, index: c_int) -> *const c_uchar {
+    rldb_column_text(stmt, index)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_column_blob(stmt: *mut sqlite3_stmt, index: c_int) -> *const c_void {
+    rldb_column_blob(stmt, index)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_column_bytes(stmt: *mut sqlite3_stmt, index: c_int) -> c_int {
+    rldb_column_bytes(stmt, index)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_exec(
+    db: *mut sqlite3,
+    sql: *const c_char,
+    callback: Option<
+        extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int,
+    >,
+    ctx: *mut c_void,
+    errmsg: *mut *mut c_char,
+) -> c_int {
+    let rc = rldb_exec(db, sql, callback, ctx, errmsg);
+    record_status(db, rc);
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_errcode(db: *mut sqlite3) -> c_int {
+    rldb_errcode(db)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_errmsg(db: *mut sqlite3) -> *const c_char {
+    rldb_errmsg(db)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_free(ptr: *mut c_void) {
+    rldb_free(ptr)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_interrupt(db: *mut sqlite3) {
+    rldb_interrupt(db)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_busy_timeout(db: *mut sqlite3, milliseconds: c_int) -> c_int {
+    let rc = rldb_busy_timeout(db, milliseconds);
+    record_status(db, rc);
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_extended_result_codes(_db: *mut sqlite3, _onoff: c_int) -> c_int {
+    RLDB_OK
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_changes(db: *mut sqlite3) -> c_int {
+    rldb_changes(db)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_changes64(db: *mut sqlite3) -> i64 {
+    rldb_changes(db) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_total_changes(db: *mut sqlite3) -> c_int {
+    with_db(db, |db| db.conn.total_changes() as c_int).unwrap_or(RLDB_MISUSE)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_total_changes64(db: *mut sqlite3) -> i64 {
+    with_db(db, |db| db.conn.total_changes() as i64).unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_get_autocommit(db: *mut sqlite3) -> c_int {
+    with_db(db, |db| (!db.conn.in_transaction()) as c_int).unwrap_or(1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> i64 {
+    rldb_last_insert_rowid(db)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqlite3 {
+    if stmt.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { (*stmt).db }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_db_filename(db: *mut sqlite3, name: *const c_char) -> *const c_char {
+    if db.is_null() || name.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        if CStr::from_ptr(name).to_bytes() == b"main" {
+            (*db).path_text.as_ptr()
+        } else {
+            ptr::null()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_db_readonly(_db: *mut sqlite3, _name: *const c_char) -> c_int {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_checkpoint(db: *mut sqlite3) -> c_int {
+    let rc = rldb_checkpoint(db);
+    record_status(db, rc);
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_vacuum(db: *mut sqlite3) -> c_int {
+    let rc = rldb_vacuum(db);
+    record_status(db, rc);
+    rc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_stats_json(db: *mut sqlite3, out_json: *mut *mut c_char) -> c_int {
+    let rc = rldb_stats_json(db, out_json);
+    record_status(db, rc);
+    rc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::ffi::CStr;
+    use std::fs;
+    use std::ptr;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = env::temp_dir();
+        let unique = format!(
+            "redlinedb-ffi-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        path.push(unique);
+        path
+    }
+
+    #[test]
+    fn sqlite3_open_v2_requires_create_for_missing_path() {
+        let path = temp_path("open-v2");
+        fs::create_dir_all(&path).expect("dir");
+        let db_path = path.join("missing.redline");
+        let c_path = CString::new(db_path.to_str().expect("utf8")).expect("cstring");
+        let mut db: *mut sqlite3 = ptr::null_mut();
+
+        let rc = sqlite3_open_v2(c_path.as_ptr(), &mut db, SQLITE_OPEN_READWRITE, ptr::null());
+
+        assert_eq!(rc, RLDB_CANTOPEN);
+        assert!(db.is_null());
+    }
+
+    #[test]
+    fn sqlite3_surface_executes_bind_and_query() {
+        let path = temp_path("surface");
+        fs::create_dir_all(&path).expect("dir");
+        let db_path = path.join("surface.redline");
+        let c_path = CString::new(db_path.to_str().expect("utf8")).expect("cstring");
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), RLDB_OK);
+        assert!(!db.is_null());
+        let main = CString::new("main").unwrap();
+        let filename = unsafe { CStr::from_ptr(sqlite3_db_filename(db, main.as_ptr())) };
+        assert_eq!(
+            filename.to_str().expect("utf8"),
+            db_path.to_str().expect("utf8")
+        );
+        assert_eq!(sqlite3_db_readonly(db, main.as_ptr()), 0);
+
+        let create = CString::new("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        assert_eq!(
+            sqlite3_exec(db, create.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+            RLDB_OK
+        );
+
+        let insert = CString::new("INSERT INTO t VALUES(?, ?)").unwrap();
+        let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, insert.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            RLDB_OK
+        );
+        assert_eq!(sqlite3_bind_int64(stmt, 1, 7), RLDB_OK);
+        let value = CString::new("seven").unwrap();
+        assert_eq!(
+            sqlite3_bind_text(stmt, 2, value.as_ptr(), -1, None),
+            RLDB_OK
+        );
+        assert_eq!(sqlite3_step(stmt), RLDB_DONE);
+        assert_eq!(sqlite3_finalize(stmt), RLDB_OK);
+        assert!(sqlite3_changes(db) >= 1);
+        assert!(sqlite3_total_changes(db) >= 1);
+        assert!(sqlite3_total_changes64(db) >= 1);
+
+        let select = CString::new("SELECT v FROM t WHERE id = 7").unwrap();
+        assert_eq!(
+            sqlite3_prepare_v2(db, select.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            RLDB_OK
+        );
+        let sql_text = unsafe { CStr::from_ptr(sqlite3_sql(stmt)) };
+        assert_eq!(
+            sql_text.to_str().expect("utf8"),
+            "SELECT v FROM t WHERE id = 7"
+        );
+        assert_eq!(sqlite3_stmt_readonly(stmt), 1);
+        assert_eq!(sqlite3_stmt_busy(stmt), 0);
+        assert_eq!(sqlite3_step(stmt), RLDB_ROW);
+        assert_eq!(sqlite3_stmt_busy(stmt), 1);
+        let text_ptr = sqlite3_column_text(stmt, 0);
+        assert!(!text_ptr.is_null());
+        let text = unsafe { CStr::from_ptr(text_ptr as *const c_char) };
+        assert_eq!(text.to_str().expect("utf8"), "seven");
+        assert_eq!(sqlite3_column_type(stmt, 0), RLDB_TEXT);
+        assert_eq!(sqlite3_finalize(stmt), RLDB_OK);
+
+        assert_eq!(sqlite3_busy_timeout(db, 50), RLDB_OK);
+        assert_eq!(sqlite3_errcode(db), RLDB_OK);
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_metadata_helpers_return_values() {
+        let version = unsafe { CStr::from_ptr(sqlite3_libversion()) };
+        let sourceid = unsafe { CStr::from_ptr(sqlite3_sourceid()) };
+
+        assert!(!version.to_bytes().is_empty());
+        assert!(!sourceid.to_bytes().is_empty());
+        assert!(sqlite3_libversion_number() > 0);
+        assert_eq!(sqlite3_threadsafe(), 1);
+        assert!(
+            !unsafe { CStr::from_ptr(sqlite3_errstr(RLDB_BUSY)) }
+                .to_bytes()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sqlite3_prepare_v3_is_compatible_with_prepare_v2() {
+        let path = temp_path("prepare-v3");
+        fs::create_dir_all(&path).expect("dir");
+        let db_path = path.join("prepare-v3.redline");
+        let c_path = CString::new(db_path.to_str().expect("utf8")).expect("cstring");
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), RLDB_OK);
+
+        let sql = CString::new("SELECT 1").unwrap();
+        let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v3(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut(), 0),
+            RLDB_OK
+        );
+        assert_eq!(sqlite3_db_handle(stmt), db);
+        let sql_text = unsafe { CStr::from_ptr(sqlite3_sql(stmt)) };
+        assert_eq!(sql_text.to_str().expect("utf8"), "SELECT 1");
+        assert_eq!(sqlite3_stmt_readonly(stmt), 1);
+        assert_eq!(sqlite3_stmt_busy(stmt), 0);
+        assert_eq!(sqlite3_step(stmt), RLDB_ROW);
+        assert_eq!(sqlite3_stmt_busy(stmt), 1);
+        assert_eq!(sqlite3_finalize(stmt), RLDB_OK);
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_autocommit_tracks_transaction_state() {
+        let path = temp_path("autocommit");
+        fs::create_dir_all(&path).expect("dir");
+        let db_path = path.join("autocommit.redline");
+        let c_path = CString::new(db_path.to_str().expect("utf8")).expect("cstring");
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), RLDB_OK);
+        assert_eq!(sqlite3_get_autocommit(db), 1);
+
+        let begin = CString::new("BEGIN").unwrap();
+        assert_eq!(
+            sqlite3_exec(db, begin.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+            RLDB_OK
+        );
+        assert_eq!(sqlite3_get_autocommit(db), 0);
+
+        let rollback = CString::new("ROLLBACK").unwrap();
+        assert_eq!(
+            sqlite3_exec(
+                db,
+                rollback.as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut()
+            ),
+            RLDB_OK
+        );
+        assert_eq!(sqlite3_get_autocommit(db), 1);
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
 }
