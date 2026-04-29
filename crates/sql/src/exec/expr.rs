@@ -393,16 +393,50 @@ fn eval_binary(
             (Some(false), Some(false)) => SqlValue::Integer(0),
             _ => SqlValue::Null,
         },
-        BinaryOperator::Plus => arithmetic(left_value, right_value, |a, b| a + b, |a, b| a + b)?,
-        BinaryOperator::Minus => arithmetic(left_value, right_value, |a, b| a - b, |a, b| a - b)?,
-        BinaryOperator::Multiply => {
-            arithmetic(left_value, right_value, |a, b| a * b, |a, b| a * b)?
-        }
-        BinaryOperator::Divide => arithmetic(left_value, right_value, |a, b| a / b, |a, b| a / b)?,
-        BinaryOperator::Modulo => match (&left_value, &right_value) {
-            (SqlValue::Integer(a), SqlValue::Integer(b)) => SqlValue::Integer(a % b),
-            _ => return Err(Error::DatatypeMismatch),
-        },
+        BinaryOperator::Plus => arithmetic(
+            left_value,
+            right_value,
+            |a, b| Some(a.wrapping_add(b)),
+            |a, b| Some(a + b),
+        )?,
+        BinaryOperator::Minus => arithmetic(
+            left_value,
+            right_value,
+            |a, b| Some(a.wrapping_sub(b)),
+            |a, b| Some(a - b),
+        )?,
+        BinaryOperator::Multiply => arithmetic(
+            left_value,
+            right_value,
+            |a, b| Some(a.wrapping_mul(b)),
+            |a, b| Some(a * b),
+        )?,
+        BinaryOperator::Divide => arithmetic(
+            left_value,
+            right_value,
+            // SQLite: division by zero returns NULL, not an error.
+            |a, b| if b == 0 { None } else { a.checked_div(b) },
+            |a, b| {
+                if b == 0.0 {
+                    None
+                } else {
+                    Some(a / b)
+                }
+            },
+        )?,
+        BinaryOperator::Modulo => arithmetic(
+            left_value,
+            right_value,
+            // SQLite: modulo by zero returns NULL, not an error.
+            |a, b| if b == 0 { None } else { a.checked_rem(b) },
+            |a, b| {
+                if b == 0.0 {
+                    None
+                } else {
+                    Some(a % b)
+                }
+            },
+        )?,
         BinaryOperator::Eq => compare_binary(left_value, right_value, |o| o == Ordering::Equal)?,
         BinaryOperator::NotEq | BinaryOperator::Spaceship => {
             compare_binary(left_value, right_value, |o| o != Ordering::Equal)?
@@ -942,17 +976,31 @@ fn negate(value: SqlValue) -> Result<SqlValue> {
 pub(crate) fn arithmetic(
     left: SqlValue,
     right: SqlValue,
-    int_op: impl FnOnce(i64, i64) -> i64,
-    real_op: impl FnOnce(f64, f64) -> f64,
+    int_op: impl FnOnce(i64, i64) -> Option<i64>,
+    real_op: impl FnOnce(f64, f64) -> Option<f64>,
 ) -> Result<SqlValue> {
     if matches!(left, SqlValue::Null) || matches!(right, SqlValue::Null) {
         return Ok(SqlValue::Null);
     }
+    // Closures may return None (e.g. divide / modulo by zero) — in that case
+    // SQLite returns NULL rather than raising an error or panicking.
+    fn lift_int(opt: Option<i64>) -> SqlValue {
+        match opt {
+            Some(v) => SqlValue::Integer(v),
+            None => SqlValue::Null,
+        }
+    }
+    fn lift_real(opt: Option<f64>) -> SqlValue {
+        match opt {
+            Some(v) => SqlValue::Real(v),
+            None => SqlValue::Null,
+        }
+    }
     match (left, right) {
-        (SqlValue::Integer(a), SqlValue::Integer(b)) => Ok(SqlValue::Integer(int_op(a, b))),
-        (SqlValue::Integer(a), SqlValue::Real(b)) => Ok(SqlValue::Real(real_op(a as f64, b))),
-        (SqlValue::Real(a), SqlValue::Integer(b)) => Ok(SqlValue::Real(real_op(a, b as f64))),
-        (SqlValue::Real(a), SqlValue::Real(b)) => Ok(SqlValue::Real(real_op(a, b))),
+        (SqlValue::Integer(a), SqlValue::Integer(b)) => Ok(lift_int(int_op(a, b))),
+        (SqlValue::Integer(a), SqlValue::Real(b)) => Ok(lift_real(real_op(a as f64, b))),
+        (SqlValue::Real(a), SqlValue::Integer(b)) => Ok(lift_real(real_op(a, b as f64))),
+        (SqlValue::Real(a), SqlValue::Real(b)) => Ok(lift_real(real_op(a, b))),
         (SqlValue::Text(a), SqlValue::Text(b)) => {
             let a = a
                 .trim()
@@ -962,7 +1010,7 @@ pub(crate) fn arithmetic(
                 .trim()
                 .parse::<f64>()
                 .map_err(|_| Error::DatatypeMismatch)?;
-            Ok(SqlValue::Real(real_op(a, b)))
+            Ok(lift_real(real_op(a, b)))
         }
         _ => Err(Error::DatatypeMismatch),
     }

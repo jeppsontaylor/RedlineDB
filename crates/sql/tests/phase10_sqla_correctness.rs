@@ -163,4 +163,57 @@ mod phase10_sqla_correctness {
         // Regression: non-NULL concat still works.
         assert_text(&run_scalar("SELECT 'a' || 'b'"), "ab");
     }
+
+    // --- Bug 4: divide / modulo by zero return NULL --------------------------
+
+    #[test]
+    fn integer_divide_by_zero_returns_null() {
+        assert_null(&run_scalar("SELECT 1 / 0"));
+    }
+
+    #[test]
+    fn integer_modulo_by_zero_returns_null() {
+        assert_null(&run_scalar("SELECT 5 % 0"));
+    }
+
+    #[test]
+    fn real_divide_by_zero_returns_null() {
+        assert_null(&run_scalar("SELECT 1.0 / 0"));
+        assert_null(&run_scalar("SELECT 1.0 / 0.0"));
+    }
+
+    #[test]
+    fn real_divide_normal_returns_real() {
+        // Regression: 7.5 / 2.5 = 3.0.
+        assert_real(&run_scalar("SELECT 7.5 / 2.5"), 3.0);
+    }
+
+    #[test]
+    fn divide_normal_still_works() {
+        // Regression: 6 / 2 still returns 3 as integer.
+        assert_int(&run_scalar("SELECT 6 / 2"), 3);
+    }
+
+    // Round-trip: combination of fixes — divide-by-zero in WHERE filter must
+    // not panic, and propagated NULL must filter out the row.
+    #[test]
+    fn divide_by_zero_in_where_does_not_panic() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(x INTEGER, y INTEGER)")
+            .expect("create t");
+        conn.execute("INSERT INTO t VALUES (1, 0)")
+            .expect("insert zero divisor");
+        conn.execute("INSERT INTO t VALUES (10, 2)")
+            .expect("insert ok");
+        // The divisor-zero row must not match (x/y produces NULL, NULL > 0
+        // is NULL ≠ TRUE, so row filtered out).
+        let mut stmt = conn
+            .prepare("SELECT x FROM t WHERE x / y > 0")
+            .expect("prepare where with division");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push(stmt.column_i64(0).expect("x"));
+        }
+        assert_eq!(rows, vec![10], "only the non-zero-divisor row must match");
+    }
 }

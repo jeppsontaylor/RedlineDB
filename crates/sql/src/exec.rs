@@ -1191,22 +1191,36 @@ fn eval_group_scalar_with_ctx(
                     (Some(false), Some(false)) => SqlValue::Integer(0),
                     _ => SqlValue::Null,
                 },
-                BinaryOperator::Plus => {
-                    arithmetic(left_value, right_value, |a, b| a + b, |a, b| a + b)?
-                }
-                BinaryOperator::Minus => {
-                    arithmetic(left_value, right_value, |a, b| a - b, |a, b| a - b)?
-                }
-                BinaryOperator::Multiply => {
-                    arithmetic(left_value, right_value, |a, b| a * b, |a, b| a * b)?
-                }
-                BinaryOperator::Divide => {
-                    arithmetic(left_value, right_value, |a, b| a / b, |a, b| a / b)?
-                }
-                BinaryOperator::Modulo => match (&left_value, &right_value) {
-                    (SqlValue::Integer(a), SqlValue::Integer(b)) => SqlValue::Integer(a % b),
-                    _ => return Err(Error::DatatypeMismatch),
-                },
+                BinaryOperator::Plus => arithmetic(
+                    left_value,
+                    right_value,
+                    |a, b| Some(a.wrapping_add(b)),
+                    |a, b| Some(a + b),
+                )?,
+                BinaryOperator::Minus => arithmetic(
+                    left_value,
+                    right_value,
+                    |a, b| Some(a.wrapping_sub(b)),
+                    |a, b| Some(a - b),
+                )?,
+                BinaryOperator::Multiply => arithmetic(
+                    left_value,
+                    right_value,
+                    |a, b| Some(a.wrapping_mul(b)),
+                    |a, b| Some(a * b),
+                )?,
+                BinaryOperator::Divide => arithmetic(
+                    left_value,
+                    right_value,
+                    |a, b| if b == 0 { None } else { a.checked_div(b) },
+                    |a, b| if b == 0.0 { None } else { Some(a / b) },
+                )?,
+                BinaryOperator::Modulo => arithmetic(
+                    left_value,
+                    right_value,
+                    |a, b| if b == 0 { None } else { a.checked_rem(b) },
+                    |a, b| if b == 0.0 { None } else { Some(a % b) },
+                )?,
                 BinaryOperator::Eq => {
                     compare_binary(left_value, right_value, |o| o == Ordering::Equal)?
                 }
