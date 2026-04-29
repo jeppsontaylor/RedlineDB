@@ -14,3 +14,11 @@ redlinedb-kernel = { path = "../kernel" }
 
 [dev-dependencies]
 tempfile = "3.23"
+fail = { version = "0.5", features = ["failpoints"] }
+
+[features]
+default = []
+# Lane KH P0 #3: enables `failpoints` in the kernel transitively so the
+# commit-failure rollback test can arm `engine::commit::before_publish`
+# with a `return(...)` action and observe SQL-side index repair.
+failpoints = ["redlinedb-kernel/failpoints"]

@@ -825,6 +825,7 @@ name = "redlinedb-sql"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "fail",
  "parking_lot",
  "redlinedb-kernel",
  "sqlparser",

@@ -673,3 +673,84 @@ fn snapshot_index_pages(
     }
     Ok(pages)
 }
+
+/// Lane KH (Wave 7) P1 #6: a range scan over a small contiguous slice
+/// of a large index must terminate as soon as the leaf chain crosses
+/// the upper bound — not walk every right sibling to the end of the
+/// index. Without the fix, a `WHERE k BETWEEN 5 AND 10` over 5000
+/// entries pinned every leaf along the way (O(N)).
+#[test]
+fn range_scan_terminates_early() {
+    let temp = TempDir::new().unwrap();
+    let page_file = Arc::new(PageFile::create(temp.path().join("data.redline"), 4096).unwrap());
+    let buffer = Arc::new(BufferPool::new(Arc::clone(&page_file), 4096).unwrap());
+    let index = BtreeIndex::create(
+        Arc::clone(&buffer),
+        IndexDescriptor::new(IndexId(99), RelId(1), IndexUniqueness::NonUnique),
+    )
+    .unwrap();
+
+    // Insert 5000 entries with zero-padded ASCII keys so byte order
+    // tracks numeric order. (`format!("k{:05}", n)` keeps key length
+    // constant; without padding, "k10" sorts before "k2" and the
+    // range bounds would be wrong.)
+    const ENTRIES: u64 = 5_000;
+    for i in 0..ENTRIES {
+        let key = format!("k{i:05}");
+        index
+            .insert(
+                key.as_bytes(),
+                IndexRowRef::new(TuplePtr::new_with_generation(
+                    PageId(1_000 + i),
+                    (i % u16::MAX as u64) as u16,
+                    redlinedb_kernel::format::PageGeneration::ONE,
+                )),
+            )
+            .unwrap();
+    }
+
+    // Sanity: tree must have multiple leaves so the early-exit path
+    // is reachable. With ~5000 keys + 4 KiB pages there should be
+    // dozens of leaves.
+    let report = index.validate().expect("validate");
+    assert!(
+        report.errors.is_empty(),
+        "validate errors: {:?}",
+        report.errors
+    );
+    assert!(
+        report.leaf_pages > 4,
+        "expected many leaves, got {}",
+        report.leaf_pages
+    );
+    let total_leaves = report.leaf_pages as u64;
+
+    // Reset the visit counter to a known baseline; the validate()
+    // pass above does not touch range_scan, but assertions here
+    // expect a clean number.
+    let baseline = index.stats().range_scan_leaves_visited;
+
+    // Probe `5..=10` (inclusive on both ends, encoded half-open).
+    // The result must be exactly the six matching entries.
+    let start = b"k00005".to_vec();
+    // Half-open upper bound: anything strictly less than "k00011"
+    // matches keys "k00005".."k00010" inclusive.
+    let end = b"k00011".to_vec();
+    let hits = index.range_scan(&start, &end).expect("range_scan");
+    assert_eq!(
+        hits.len(),
+        6,
+        "range scan must match 6 entries, got {}",
+        hits.len()
+    );
+
+    let visits = index.stats().range_scan_leaves_visited - baseline;
+    assert!(
+        visits <= 4,
+        "range_scan must terminate within a few leaves; visited {visits} of {total_leaves}",
+    );
+    assert!(
+        visits < total_leaves,
+        "range_scan must not walk every leaf; visited {visits} of {total_leaves}",
+    );
+}

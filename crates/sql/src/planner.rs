@@ -968,7 +968,6 @@ fn wrap_limit(input: PhysicalPlan, plan: &SelectPlan) -> PhysicalPlan {
 // need; flattening into a struct would scatter call sites without
 // shrinking the contract.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn choose_access_path(
     conn: &Connection,
     table: &Arc<TableDef>,

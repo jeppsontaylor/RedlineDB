@@ -383,10 +383,7 @@ impl Connection {
                 Ok(())
             }
             Err(err) => {
-                crate::exec::replay_index_undo_after_commit_failure(
-                    &self.db.engine,
-                    &mut session,
-                );
+                crate::exec::replay_index_undo_after_commit_failure(&self.db.engine, &mut session);
                 session.kernel_unique_guards.clear();
                 session.unique_guards.clear();
                 Err(err.into())
