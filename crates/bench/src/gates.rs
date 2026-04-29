@@ -32,12 +32,14 @@ pub fn evaluate_records(records: &[RunRecord]) -> GateSummary {
 pub fn markdown_summary(records: &[RunRecord]) -> String {
     let summary = evaluate_records(records);
     let mut out = String::from(
-        "| workload | engine | durability | threads | ops/s | p99 us | p999 us | data bytes | wal bytes |\n",
+        "| workload | engine | durability | threads | ops/s | p99 us | p999 us | busy | locked | timeout | data bytes | wal bytes |\n",
     );
-    out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    out.push_str(
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
     for record in records {
         out.push_str(&format!(
-            "| {} | {:?} | {} | {} | {:.1} | {} | {} | {} | {} |\n",
+            "| {} | {:?} | {} | {} | {:.1} | {} | {} | {} | {} | {} | {} | {} |\n",
             record.workload.as_str(),
             record.engine,
             record.durability.as_str(),
@@ -45,6 +47,9 @@ pub fn markdown_summary(records: &[RunRecord]) -> String {
             record.metrics.throughput_ops_per_sec,
             record.metrics.latency.p99_us,
             record.metrics.latency.p999_us,
+            record.metrics.busy_errors,
+            record.metrics.locked_errors,
+            record.metrics.timeout_errors,
             record.data_bytes,
             record.wal_bytes
         ));
@@ -216,6 +221,8 @@ mod tests {
                 operations: 10,
                 failures: 0,
                 busy_errors: 0,
+                locked_errors: 0,
+                timeout_errors: 0,
                 elapsed_ms: 10,
                 throughput_ops_per_sec: throughput,
                 latency: LatencySummary {

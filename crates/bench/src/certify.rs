@@ -408,12 +408,12 @@ fn write_summary_csv(path: &Path, runs: &[RunRecord]) -> Result<()> {
     let mut out = fs::File::create(path)?;
     writeln!(
         out,
-        "engine,workload,durability,threads,ops,failures,busy_errors,throughput_ops_per_sec,p99_us,p999_us,data_bytes,wal_bytes"
+        "engine,workload,durability,threads,ops,failures,busy_errors,locked_errors,timeout_errors,throughput_ops_per_sec,p99_us,p999_us,data_bytes,wal_bytes"
     )?;
     for run in runs {
         writeln!(
             out,
-            "{:?},{},{},{},{},{},{},{:.2},{},{},{},{}",
+            "{:?},{},{},{},{},{},{},{},{},{:.2},{},{},{},{}",
             run.engine,
             run.workload.as_str(),
             run.durability.as_str(),
@@ -421,6 +421,8 @@ fn write_summary_csv(path: &Path, runs: &[RunRecord]) -> Result<()> {
             run.metrics.operations,
             run.metrics.failures,
             run.metrics.busy_errors,
+            run.metrics.locked_errors,
+            run.metrics.timeout_errors,
             run.metrics.throughput_ops_per_sec,
             run.metrics.latency.p99_us,
             run.metrics.latency.p999_us,

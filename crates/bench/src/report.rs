@@ -32,7 +32,20 @@ pub struct LatencySummary {
 pub struct MetricsSummary {
     pub operations: u64,
     pub failures: u64,
+    /// Combined BUSY + LOCKED count, kept for one minor cycle so older
+    /// dashboards continue to render. New consumers should prefer the
+    /// split `locked_errors` and dedicated `timeout_errors` fields.
     pub busy_errors: u64,
+    /// Errors whose message indicates the engine reported the
+    /// destination as locked (e.g. `database is locked`,
+    /// `lock_wait` expired). Reviewer Finding #7.
+    #[serde(default)]
+    pub locked_errors: u64,
+    /// Errors that timed out waiting for a resource — distinct from
+    /// busy/locked because the engine never refused outright but the
+    /// caller tripped its deadline.
+    #[serde(default)]
+    pub timeout_errors: u64,
     pub elapsed_ms: u64,
     pub throughput_ops_per_sec: f64,
     pub latency: LatencySummary,
