@@ -771,3 +771,32 @@ The workspace is green, the new benchmark lanes exist, and the timeout behavior 
 4. Catalog/DDL crash-atomicity tightening.
 
 Those items are not represented here as finished facts; they are the next layer after the verified smoke lane and recovery matrix.
+
+## Phase 10 Carry-Forward Update
+
+Implemented in the carry-forward pass:
+
+1. Added the cert-v3 feature workloads: `json-path-extract`, `json-path-update`, `vector-flat-search`, `vector-ann-search`, `vector-ann-search-disk`, `commit-storm-batched`, and the existing `large-sort-spill`.
+2. Added cert-v3 smoke/full/stress configs under `crates/bench/bench/`.
+3. Replaced the WAL semantic-combiner panic path with a pure `CombineOutcome::Folded(CombinableDelta)` / `Enqueue` result.
+4. Surfaced group-commit batch telemetry through `Database::benchmark_stats`.
+5. Unignored and fixed `ORDER BY ... COLLATE NOCASE` for the vectorized sort path.
+6. Regenerated `paper/data/*.csv`, added generated figs 6-8, and rebuilt `paper/main.pdf`.
+
+Verified locally:
+
+1. `rtk cargo check -p redlinedb --locked`
+2. `rtk cargo check -p redlinedb-bench --locked`
+3. `rtk cargo test -p redlinedb-bench --locked --quiet` — `46 passed`
+4. `rtk cargo test -p redlinedb-kernel --test group_commit_tests --locked --quiet` — `16 passed`
+5. `rtk cargo test -p redlinedb-sql --test phase10_sqld_collation --locked --quiet` — `4 passed`
+6. `rtk cargo run -p redlinedb-bench --release -- certify --config crates/bench/bench/certification-phase10-v3-smoke.toml --out-dir target/bench/phase10-v3-smoke --seed 7 --repetitions 1 --warmup 0`
+7. `rtk python3 paper/scripts/build_figs.py`
+8. `rtk pdflatex ...`, `rtk bibtex ...`, `rtk pdflatex ...`, `rtk pdflatex ...`
+
+Artifacts:
+
+1. `target/bench/phase10-v3-smoke/manifest.json`
+2. `target/bench/phase10-v3-smoke/runs.jsonl`
+3. `target/bench/phase10-v3-smoke/report.md`
+4. `paper/main.pdf` SHA-256: `d19666553419439b04903c2013cda0af1ef18466587dc8ce8f0a8bb9801aa717`

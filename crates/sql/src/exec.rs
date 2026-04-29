@@ -840,7 +840,7 @@ fn order_and_project_rows(
         for row in &filtered {
             let keys = order_by
                 .iter()
-                .map(|expr| eval_scalar(&expr.expr, &row.context(), bindings))
+                .map(|order| eval_order_key(order, &row.context(), bindings))
                 .collect::<Result<Vec<_>>>()?;
             let projected = project_row(projection, row, bindings)?;
             heap.push(keys, projected)?;
@@ -870,7 +870,7 @@ fn order_and_project_rows(
     for row in &filtered {
         let keys = order_by
             .iter()
-            .map(|expr| eval_scalar(&expr.expr, &row.context(), bindings))
+            .map(|order| eval_order_key(order, &row.context(), bindings))
             .collect::<Result<Vec<_>>>()?;
         let projected = project_row(projection, row, bindings)?;
         projected_with_keys.push((keys, projected));
@@ -917,6 +917,29 @@ fn directions_from_order_by(order_by: &[OrderByExpr]) -> Vec<vec::SortDirection>
             _ => vec::SortDirection::Asc,
         })
         .collect()
+}
+
+fn eval_order_key(
+    order: &OrderByExpr,
+    row: &RowContext<'_>,
+    bindings: &[Option<SqlValue>],
+) -> Result<SqlValue> {
+    normalize_order_key(order, eval_scalar(&order.expr, row, bindings)?)
+}
+
+fn normalize_order_key(order: &OrderByExpr, value: SqlValue) -> Result<SqlValue> {
+    let Some(collation) = collation_from_expr(&order.expr) else {
+        return Ok(value);
+    };
+    Ok(match (collation, value) {
+        (crate::collation::Collation::NoCase, SqlValue::Text(text)) => {
+            SqlValue::Text(Arc::from(text.to_ascii_lowercase()))
+        }
+        (crate::collation::Collation::RTrim, SqlValue::Text(text)) => {
+            SqlValue::Text(Arc::from(text.trim_end_matches(' ')))
+        }
+        (_, value) => value,
+    })
 }
 
 fn select_requires_aggregation(plan: &crate::statement::SelectPlan) -> bool {

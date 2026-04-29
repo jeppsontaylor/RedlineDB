@@ -274,6 +274,18 @@ pub enum WorkloadKind {
     /// `SELECT * FROM t ORDER BY payload` with a tight `work_mem_bytes`,
     /// surfacing `engine_stats.spill_bytes_ratio`.
     LargeSortSpill,
+    /// Phase 10 cert-v3: read-heavy SQLite JSON1 path extraction workload.
+    JsonPathExtract,
+    /// Phase 10 cert-v3: JSON path mutation workload using `json_set`.
+    JsonPathUpdate,
+    /// Phase 10 cert-v3: exact flat vector distance search.
+    VectorFlatSearch,
+    /// Phase 10 cert-v3: HNSW approximate vector search.
+    VectorAnnSearch,
+    /// Phase 10 cert-v3: DiskANN sector-backed approximate vector search.
+    VectorAnnSearchDisk,
+    /// Phase 10 cert-v3: many tiny commits to expose group-commit batching.
+    CommitStormBatched,
 }
 
 impl WorkloadKind {
@@ -296,6 +308,12 @@ impl WorkloadKind {
             Self::Mixed50Read50Write => "mixed50-read50-write",
             Self::ConnectionLimit => "connection-limit",
             Self::LargeSortSpill => "large-sort-spill",
+            Self::JsonPathExtract => "json-path-extract",
+            Self::JsonPathUpdate => "json-path-update",
+            Self::VectorFlatSearch => "vector-flat-search",
+            Self::VectorAnnSearch => "vector-ann-search",
+            Self::VectorAnnSearchDisk => "vector-ann-search-disk",
+            Self::CommitStormBatched => "commit-storm-batched",
         }
     }
 }
@@ -556,6 +574,12 @@ impl FromStr for WorkloadKind {
             "mixed50-read50-write" => Ok(Self::Mixed50Read50Write),
             "connection-limit" => Ok(Self::ConnectionLimit),
             "large-sort-spill" => Ok(Self::LargeSortSpill),
+            "json-path-extract" => Ok(Self::JsonPathExtract),
+            "json-path-update" => Ok(Self::JsonPathUpdate),
+            "vector-flat-search" => Ok(Self::VectorFlatSearch),
+            "vector-ann-search" => Ok(Self::VectorAnnSearch),
+            "vector-ann-search-disk" => Ok(Self::VectorAnnSearchDisk),
+            "commit-storm-batched" => Ok(Self::CommitStormBatched),
             _ => bail!("unknown workload {value}"),
         }
     }

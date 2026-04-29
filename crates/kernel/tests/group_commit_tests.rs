@@ -406,14 +406,39 @@ fn combiner_overflow_is_refused_not_saturated() {
 }
 
 #[test]
-#[should_panic(expected = "safe-by-construction fold not yet implemented")]
-fn combiner_fold_path_is_explicit_unimplemented_stub() {
-    // Lane GC: the prompt is explicit — "if it's not safe-by-
-    // construction, leave it as a feature stub with unimplemented!()
-    // rather than ship something broken." This test pins that
-    // contract: invoking the still-unproved fold path panics with
-    // the documented message rather than silently misbehaving.
-    use redlinedb_kernel::wal::combiner::{CombinableDelta, WalCombiner, maybe_combine_pending};
+fn combiner_fold_path_returns_merged_delta() {
+    use redlinedb_kernel::wal::combiner::{
+        CombinableDelta, CombineOutcome, WalCombiner, maybe_combine_pending,
+    };
+    let combiner = WalCombiner::new();
+    let pending = CombinableDelta {
+        rel_id: 1,
+        row_id: 1,
+        column: 1,
+        delta: 1,
+    };
+    let cand = CombinableDelta {
+        rel_id: 1,
+        row_id: 1,
+        column: 1,
+        delta: 2,
+    };
+    assert_eq!(
+        maybe_combine_pending(&combiner, &cand, Some(&pending)),
+        CombineOutcome::Folded(CombinableDelta {
+            rel_id: 1,
+            row_id: 1,
+            column: 1,
+            delta: 3,
+        })
+    );
+}
+
+#[test]
+fn combiner_fold_path_enqueues_without_pending_or_match() {
+    use redlinedb_kernel::wal::combiner::{
+        CombinableDelta, CombineOutcome, WalCombiner, maybe_combine_pending,
+    };
     let combiner = WalCombiner::new();
     let cand = CombinableDelta {
         rel_id: 1,
@@ -421,7 +446,20 @@ fn combiner_fold_path_is_explicit_unimplemented_stub() {
         column: 1,
         delta: 1,
     };
-    let _ = maybe_combine_pending(&combiner, &cand, None);
+    let other = CombinableDelta {
+        rel_id: 1,
+        row_id: 2,
+        column: 1,
+        delta: 1,
+    };
+    assert_eq!(
+        maybe_combine_pending(&combiner, &cand, None),
+        CombineOutcome::Enqueue
+    );
+    assert_eq!(
+        maybe_combine_pending(&combiner, &cand, Some(&other)),
+        CombineOutcome::Enqueue
+    );
 }
 
 #[test]

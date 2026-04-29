@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use redlinedb_bench::Cli;
+use redlinedb_bench::config::{CompareConfig, WorkloadKind};
 
 fn run_spec(engine: redlinedb_bench::config::EngineKind) -> redlinedb_bench::config::RunSpec {
     redlinedb_bench::config::RunSpec {
@@ -39,4 +40,25 @@ fn smoke_compare_config_exists() {
     assert!(redlinedb_bench::default_certification_config_path().exists());
     assert!(redlinedb_bench::default_recovery_matrix_path().exists());
     let _ = std::mem::size_of::<Cli>();
+}
+
+#[test]
+fn phase10_v3_configs_register_feature_workloads() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("bench/certification-phase10-v3-smoke.toml");
+    let config = CompareConfig::load(&path).expect("load phase10 v3 smoke config");
+    for workload in [
+        WorkloadKind::JsonPathExtract,
+        WorkloadKind::JsonPathUpdate,
+        WorkloadKind::VectorFlatSearch,
+        WorkloadKind::VectorAnnSearch,
+        WorkloadKind::VectorAnnSearchDisk,
+        WorkloadKind::CommitStormBatched,
+        WorkloadKind::LargeSortSpill,
+    ] {
+        assert!(
+            config.workloads.contains(&workload),
+            "{workload:?} missing from phase10 v3 smoke config"
+        );
+    }
 }

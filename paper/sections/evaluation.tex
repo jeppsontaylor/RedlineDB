@@ -143,6 +143,40 @@ counts.}
 \label{fig:recovery}
 \end{figure}
 
+\subsection{Phase 10 Feature Lanes}
+Figures~\ref{fig:json}, \ref{fig:vector}, and
+\ref{fig:groupcommit} are generated from the phase-10 cert-v3 lane.
+The JSON lane separates path extraction from path mutation, the vector
+lane reports flat exact search alongside HNSW and DiskANN-style
+approximate search, and the group-commit lane plots the WAL
+coordinator's records-per-fdatasync batch histogram under a tiny
+commit storm. These plots are feature proof lanes rather than the
+SQLite parity headline: vector ANN and Redline JSONB are intentionally
+beyond SQLite's default type surface.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figs/fig6_json_throughput.eps}
+\caption{JSON path extract and update throughput in the phase-10
+cert-v3 lane.}
+\label{fig:json}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figs/fig7_vector_recall_qps.eps}
+\caption{Vector search throughput with recall@10 surfaced for ANN
+indexes.}
+\label{fig:vector}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figs/fig8_group_commit_batching.eps}
+\caption{Group-commit batch-size telemetry under commit-storm load.}
+\label{fig:groupcommit}
+\end{figure}
+
 \subsection{Telemetry Totals}
 Table~\ref{tab:cert} reports the certification totals from
 \texttt{paper/data/cert\_totals.csv}.

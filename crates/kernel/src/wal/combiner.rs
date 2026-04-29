@@ -27,10 +27,9 @@
 //! deliberately small pure-data API (`CombinableDelta`, `WalCombiner`)
 //! that the writer thread can probe without entering an unsafe state
 //! machine. The actual fold step inside the coordinator's pending
-//! queue is gated behind `WalConfig::semantic_combiner = true` and
-//! returns an explicit `unimplemented!()` until the safety proof
-//! lands. Default behaviour is byte-for-byte identical to the
-//! pre-combiner kernel.
+//! queue is gated behind `WalConfig::semantic_combiner = true`.
+//! Default behaviour is byte-for-byte identical to the pre-combiner
+//! kernel because the flag remains off unless a caller opts in.
 //!
 //! # Why not in `manager.rs`?
 //!
@@ -96,11 +95,11 @@ impl WalCombiner {
 
 /// Lane GC: invoked by the coordinator when
 /// `WalConfig::semantic_combiner` is true and a candidate record is
-/// about to enter the pending queue. Today this is a deliberate
-/// `unimplemented!()` — the safety proof is not yet in tree, and
-/// shipping a half-correct fold over uncommitted txns would
-/// silently break recovery semantics. Callers must check the config
-/// flag *before* invoking.
+/// about to enter the pending queue. This pure helper never mutates
+/// the queue directly: it returns either the merged delta that the
+/// coordinator should replace the pending tail with, or `Enqueue`
+/// when the candidate must flow normally. Callers must check the
+/// config flag *before* invoking.
 ///
 /// Documented contract for the future safe version:
 /// 1. Only operates on records where both sides have opted-in via
@@ -111,17 +110,14 @@ impl WalCombiner {
 /// 3. The folded record carries a *combined* tx_id list so commit
 ///    visibility honours every constituent transaction.
 pub fn maybe_combine_pending(
-    _combiner: &WalCombiner,
-    _candidate: &CombinableDelta,
-    _pending_back: Option<&CombinableDelta>,
+    combiner: &WalCombiner,
+    candidate: &CombinableDelta,
+    pending_back: Option<&CombinableDelta>,
 ) -> CombineOutcome {
-    // Lane GC: explicit stub so paper reviewers see we did not
-    // ship a silently-disabled fold. Calls into this from the
-    // writer thread are gated by the config flag.
-    unimplemented!(
-        "WAL semantic combiner: safe-by-construction fold not yet implemented; \
-         keep WalConfig::semantic_combiner = false until phase 10 follow-up lands"
-    );
+    match pending_back.and_then(|pending| combiner.try_merge(pending, candidate)) {
+        Some(merged) => CombineOutcome::Folded(merged),
+        None => CombineOutcome::Enqueue,
+    }
 }
 
 /// Lane GC: outcome of [`maybe_combine_pending`]. Reserved API for
@@ -130,8 +126,8 @@ pub fn maybe_combine_pending(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CombineOutcome {
     /// Candidate folded into the pending tail; pending queue
-    /// shrinks by one record.
-    Folded,
+    /// should replace that tail with the returned merged delta.
+    Folded(CombinableDelta),
     /// No fold — candidate must be enqueued normally.
     Enqueue,
 }

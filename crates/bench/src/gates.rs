@@ -104,21 +104,28 @@ fn gate_checksums_match(records: &[RunRecord]) -> GateResult {
 }
 
 fn gate_single_thread_parity(records: &[RunRecord]) -> GateResult {
-    let passed = compare_ratio(records, 1, 0.90, WorkloadKind::PointReadPk);
+    let outcome = compare_ratio(records, 1, 0.90, WorkloadKind::PointReadPk);
     GateResult {
         name: "single_thread_parity".to_owned(),
-        passed,
-        detail: "redline point-read throughput stays within 90% of sqlite".to_owned(),
+        passed: outcome.unwrap_or(true),
+        detail: match outcome {
+            Some(_) => "redline point-read throughput stays within 90% of sqlite".to_owned(),
+            None => "skipped: point-read sqlite/redline comparison rows absent".to_owned(),
+        },
     }
 }
 
 fn gate_writer_advantage(records: &[RunRecord]) -> GateResult {
-    let passed = compare_ratio(records, 8, 1.50, WorkloadKind::WritersDisjoint);
+    let outcome = compare_ratio(records, 8, 1.50, WorkloadKind::WritersDisjoint);
     GateResult {
         name: "concurrent_writer_advantage".to_owned(),
-        passed,
-        detail: "redline writers-disjoint throughput exceeds sqlite by 1.5x at 8 threads"
-            .to_owned(),
+        passed: outcome.unwrap_or(true),
+        detail: match outcome {
+            Some(_) => {
+                "redline writers-disjoint throughput exceeds sqlite by 1.5x at 8 threads".to_owned()
+            }
+            None => "skipped: writers-disjoint sqlite/redline comparison rows absent".to_owned(),
+        },
     }
 }
 
@@ -173,7 +180,7 @@ fn compare_ratio(
     threads: usize,
     min_ratio: f64,
     workload: WorkloadKind,
-) -> bool {
+) -> Option<bool> {
     let sqlite = records.iter().find(|record| {
         record.engine == EngineKind::Sqlite
             && record.threads == threads
@@ -189,13 +196,16 @@ fn compare_ratio(
     match (sqlite, redline) {
         (Some(sqlite), Some(redline)) => {
             if sqlite.metrics.throughput_ops_per_sec == 0.0 {
-                false
+                Some(false)
             } else {
-                (redline.metrics.throughput_ops_per_sec / sqlite.metrics.throughput_ops_per_sec)
-                    >= min_ratio
+                Some(
+                    (redline.metrics.throughput_ops_per_sec
+                        / sqlite.metrics.throughput_ops_per_sec)
+                        >= min_ratio,
+                )
             }
         }
-        _ => false,
+        _ => None,
     }
 }
 

@@ -5,7 +5,7 @@ Reads the read-only inputs under target/bench/ and emits:
   - paper/data/perf_aggregates.csv
   - paper/data/headline_table.csv
   - paper/data/cert_totals.csv
-  - paper/figs/fig1..fig5 *.eps
+  - paper/figs/fig1..fig8 *.eps
 
 Run from repo root:
     python3 paper/scripts/build_figs.py
@@ -36,6 +36,10 @@ BENCH = REPO / "target" / "bench"
 CERT = BENCH / "xbabe1" / "certification"
 RUNS_JSONL = CERT / "runs.jsonl"
 SUMMARY_CSV = CERT / "summary.csv"
+FEATURE_CERT_CANDIDATES = [
+    BENCH / "xbabe1" / "phase10-v3-cert" / "runs.jsonl",
+    BENCH / "phase10-v3-smoke" / "runs.jsonl",
+]
 WAVE7_COMPAT = BENCH / "wave7-compat.json"
 WAVE7_RECOVERY = BENCH / "wave7-recovery.json"
 WAVE7_FAILPOINT = BENCH / "wave7-failpoint.json"
@@ -86,7 +90,7 @@ PRIMARY_WORKLOADS = list(WORKLOAD_COLORS.keys())
 # --------------------------------------------------------------------------
 # Step 2 — load runs.jsonl, aggregate per (engine, workload, durability, threads)
 # --------------------------------------------------------------------------
-def load_runs() -> pd.DataFrame:
+def load_runs_jsonl(path: Path) -> pd.DataFrame:
     """Load measured run records.
 
     runs.jsonl carries one record per repetition. The certification harness
@@ -94,11 +98,13 @@ def load_runs() -> pd.DataFrame:
     Each record is grouped by (engine, workload, durability, threads).
     """
     records = []
-    with RUNS_JSONL.open() as f:
+    with path.open() as f:
         for line in f:
             r = json.loads(line)
             metrics = r.get("metrics", {})
             lat = metrics.get("latency", {})
+            engine_stats = r.get("engine_stats", {})
+            wal = engine_stats.get("wal", {})
             records.append(
                 {
                     "run_id": r["run_id"],
@@ -114,10 +120,57 @@ def load_runs() -> pd.DataFrame:
                     "max_us": float(lat.get("max_us", float("nan"))),
                     "ops": int(metrics.get("operations", 0)),
                     "failures": int(metrics.get("failures", 0)),
+                    "vector_recall_at_10": float(
+                        engine_stats.get("vector_recall_at_10", float("nan"))
+                    ),
+                    "group_commit_batch_p50": float(
+                        wal.get("group_commit_batch_p50", float("nan"))
+                    ),
+                    "group_commit_batch_p95": float(
+                        wal.get("group_commit_batch_p95", float("nan"))
+                    ),
+                    "group_commit_batch_p99": float(
+                        wal.get("group_commit_batch_p99", float("nan"))
+                    ),
+                    "group_commit_batch_max": float(
+                        wal.get("group_commit_batch_max", float("nan"))
+                    ),
+                    "group_commits_issued": float(
+                        wal.get("group_commits_issued", float("nan"))
+                    ),
                 }
             )
     df = pd.DataFrame.from_records(records)
     return df
+
+
+def load_runs() -> pd.DataFrame:
+    return load_runs_jsonl(RUNS_JSONL)
+
+
+def load_feature_runs() -> pd.DataFrame:
+    for path in FEATURE_CERT_CANDIDATES:
+        if path.exists():
+            df = load_runs_jsonl(path)
+            df["source"] = str(path.relative_to(REPO))
+            return df
+    return pd.DataFrame(
+        columns=[
+            "engine",
+            "workload",
+            "durability",
+            "threads",
+            "qps",
+            "p99_us",
+            "vector_recall_at_10",
+            "group_commit_batch_p50",
+            "group_commit_batch_p95",
+            "group_commit_batch_p99",
+            "group_commit_batch_max",
+            "group_commits_issued",
+            "source",
+        ]
+    )
 
 
 def aggregate(df: pd.DataFrame) -> pd.DataFrame:
@@ -492,6 +545,106 @@ def fig5_recovery_failpoint(totals: pd.DataFrame, out: Path) -> None:
     plt.close(fig)
 
 
+def feature_slice(df: pd.DataFrame, workloads: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return df[
+        (df.engine == "redline")
+        & (df.durability == "strict")
+        & (df.workload.isin(workloads))
+    ]
+
+
+def fig6_json(feature_df: pd.DataFrame, out: Path) -> None:
+    fig, ax = plt.subplots()
+    data = feature_slice(feature_df, ["json-path-extract", "json-path-update"])
+    if data.empty:
+        ax.text(0.5, 0.5, "phase10-v3 JSON cert missing", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        grouped = (
+            data.groupby(["workload", "threads"], as_index=False)
+            .agg(qps=("qps", "mean"))
+            .sort_values(["workload", "threads"])
+        )
+        for workload, marker in [("json-path-extract", "o"), ("json-path-update", "s")]:
+            rows = grouped[grouped.workload == workload]
+            if rows.empty:
+                continue
+            ax.plot(rows.threads, rows.qps, marker=marker, label=workload)
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+        ax.set_xlabel("threads")
+        ax.set_ylabel("JSON ops/s")
+        ax.grid(True, which="both", linestyle=":", linewidth=0.4, alpha=0.6)
+        ax.legend(frameon=False)
+    fig.savefig(out, format="eps")
+    plt.close(fig)
+
+
+def fig7_vector(feature_df: pd.DataFrame, out: Path) -> None:
+    fig, ax1 = plt.subplots()
+    workloads = ["vector-flat-search", "vector-ann-search", "vector-ann-search-disk"]
+    data = feature_slice(feature_df, workloads)
+    if data.empty:
+        ax1.text(0.5, 0.5, "phase10-v3 vector cert missing", ha="center", va="center")
+        ax1.set_axis_off()
+    else:
+        grouped = (
+            data.groupby(["workload", "threads"], as_index=False)
+            .agg(qps=("qps", "mean"), recall=("vector_recall_at_10", "mean"))
+            .sort_values(["workload", "threads"])
+        )
+        for workload, marker in zip(workloads, ["o", "s", "^"]):
+            rows = grouped[grouped.workload == workload]
+            if rows.empty:
+                continue
+            label = workload
+            recall = rows.recall.dropna()
+            if not recall.empty:
+                label = f"{workload} r@10={recall.mean():.2f}"
+            ax1.plot(rows.threads, rows.qps, marker=marker, label=label)
+        ax1.set_xscale("log", base=2)
+        ax1.set_yscale("log")
+        ax1.set_xlabel("threads")
+        ax1.set_ylabel("vector queries/s")
+        ax1.grid(True, which="both", linestyle=":", linewidth=0.4, alpha=0.6)
+        ax1.legend(frameon=False, fontsize=7)
+    fig.savefig(out, format="eps")
+    plt.close(fig)
+
+
+def fig8_group_commit(feature_df: pd.DataFrame, out: Path) -> None:
+    fig, ax = plt.subplots()
+    data = feature_slice(feature_df, ["commit-storm-batched"])
+    if data.empty:
+        ax.text(0.5, 0.5, "phase10-v3 group-commit cert missing", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        grouped = (
+            data.groupby(["threads"], as_index=False)
+            .agg(
+                p50=("group_commit_batch_p50", "mean"),
+                p95=("group_commit_batch_p95", "mean"),
+                p99=("group_commit_batch_p99", "mean"),
+                max_batch=("group_commit_batch_max", "mean"),
+            )
+            .sort_values("threads")
+        )
+        for col, marker in [("p50", "o"), ("p95", "s"), ("p99", "^"), ("max_batch", "x")]:
+            if grouped[col].isna().all():
+                continue
+            ax.plot(grouped.threads, grouped[col], marker=marker, label=col)
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+        ax.set_xlabel("threads")
+        ax.set_ylabel("records per fdatasync group")
+        ax.grid(True, which="both", linestyle=":", linewidth=0.4, alpha=0.6)
+        ax.legend(frameon=False)
+    fig.savefig(out, format="eps")
+    plt.close(fig)
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -518,12 +671,26 @@ def main() -> int:
     fig3_ratio_bars(agg, FIGS_DIR / "fig3_ratio_bars.eps")
     fig4_efficiency(agg, FIGS_DIR / "fig4_scaling_efficiency.eps")
     fig5_recovery_failpoint(totals, FIGS_DIR / "fig5_recovery_failpoint.eps")
+    feature_df = load_feature_runs()
+    if not feature_df.empty:
+        feature_df["engine"] = feature_df["engine"].str.lower()
+        print(
+            f"Loaded {len(feature_df)} phase10-v3 feature runs from {feature_df.source.iloc[0]}."
+        )
+    else:
+        print("[warn] no phase10-v3 feature runs found; fig6-fig8 will be placeholders.")
+    fig6_json(feature_df, FIGS_DIR / "fig6_json_throughput.eps")
+    fig7_vector(feature_df, FIGS_DIR / "fig7_vector_recall_qps.eps")
+    fig8_group_commit(feature_df, FIGS_DIR / "fig8_group_commit_batching.eps")
     for fname in (
         "fig1_throughput_scaling.eps",
         "fig2_latency_p99.eps",
         "fig3_ratio_bars.eps",
         "fig4_scaling_efficiency.eps",
         "fig5_recovery_failpoint.eps",
+        "fig6_json_throughput.eps",
+        "fig7_vector_recall_qps.eps",
+        "fig8_group_commit_batching.eps",
     ):
         p = FIGS_DIR / fname
         print(f"Wrote {p} ({p.stat().st_size} bytes)")

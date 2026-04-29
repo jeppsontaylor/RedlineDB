@@ -208,6 +208,20 @@ pub struct WalBenchStats {
     pub fdatasyncs_issued: u64,
     #[serde(default)]
     pub pwrites_issued: u64,
+    #[serde(default)]
+    pub group_commits_issued: u64,
+    #[serde(default)]
+    pub group_commit_batch_bytes_sum: u64,
+    #[serde(default)]
+    pub group_commit_batch_record_count_sum: u64,
+    #[serde(default)]
+    pub group_commit_batch_p50: u64,
+    #[serde(default)]
+    pub group_commit_batch_p95: u64,
+    #[serde(default)]
+    pub group_commit_batch_p99: u64,
+    #[serde(default)]
+    pub group_commit_batch_max: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]

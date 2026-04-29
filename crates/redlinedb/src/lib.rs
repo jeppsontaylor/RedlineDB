@@ -219,6 +219,15 @@ impl Database {
                 fsyncs_issued: stats.wal_sync_counters.fsyncs_issued,
                 fdatasyncs_issued: stats.wal_sync_counters.fdatasyncs_issued,
                 pwrites_issued: stats.wal_sync_counters.pwrites_issued,
+                group_commits_issued: stats.wal_sync_counters.group_commits_issued,
+                group_commit_batch_bytes_sum: stats.wal_sync_counters.group_commit_batch_bytes_sum,
+                group_commit_batch_record_count_sum: stats
+                    .wal_sync_counters
+                    .group_commit_batch_record_count_sum,
+                group_commit_batch_p50: stats.wal_sync_counters.batch_record_count_percentile(0.50),
+                group_commit_batch_p95: stats.wal_sync_counters.batch_record_count_percentile(0.95),
+                group_commit_batch_p99: stats.wal_sync_counters.batch_record_count_percentile(0.99),
+                group_commit_batch_max: stats.wal_sync_counters.batch_record_count_max(),
             },
             checkpoint: CheckpointBenchStats {
                 generation: stats.checkpoint.map(|control| control.generation),
