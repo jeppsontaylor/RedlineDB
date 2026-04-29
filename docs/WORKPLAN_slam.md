@@ -394,6 +394,107 @@ Components:
 - `paper/refs/refs.bib` — 49 BibTeX entries (49 distinct `\cite` keys, every entry used)
 - `paper/scripts/{build_figs.py,check_refs.py,_bibcheck.tex}` — reproducibility scripts
 
+## Phase 10 Long-Range Closure (in progress)
+
+Phase 10 picks up the long-range items the paper-v1 called out as future work:
+JSON / JSONB, vector search, full SQLite surface, vectorized executor + spillable
+sort, group-commit deepening, integrity checker. Multi-wave parallel-agent fusion.
+
+### Phase 10A — Baseline fusion (`phase10-baseline`)
+
+Single integrator commit `b91a3ef` fused ~1900 LOC of in-flight phase-10 work:
+- `CommitOutcome::MaybeCommitted` propagated through engine + SQL
+- index MVCC `(create_tx, delete_tx)` per-entry replacing boolean dead flag
+- index format v2 + v1→v2 migration on open
+- transactional index-handle queueing in `Txn`
+- engine `integrity_check()` skeleton + PRAGMA wiring
+- SQL-side index undo log fully removed (rides kernel MVCC)
+- 12 JSON function shells + 4 vector shells in `exec/expr.rs`
+- FFI null-pointer hardening + multi-stmt scaffolding
+- `user_version` persisted to sidecar file
+
+Proof: 261 passed (vs 241 wave-7-fused).
+
+### Phase 10B Wave 1 — partial fusion (`phase10-wave1-partial`)
+
+5 of 6 lanes fused via parallel-agent worktrees + integrator merge. VE pending
+(launched concurrently with Wave 2 to run while other agents work).
+
+Lane SQL-A — 8 SQLite wrong-result fixes + 37 tests
+- SELECT ALL preserves duplicates
+- NOT IN with NULL propagates 3-valued logic
+- NULL || x propagates NULL (not coerced)
+- divide / modulo by zero return NULL (no panic)
+- scalar functions propagate NULL (length, lower, upper, abs, round, hex, ...)
+- CAST follows SQLite truncation/prefix-parse rules
+- GLOB supports bracket / range / negation classes
+- ORDER BY honors keys after GROUP BY / DISTINCT
+
+Lane SQL-B — multi-stmt parser + savepoints + FFI pzTail + 35 tests
+- multi-stmt splitter + `Connection::prepare_v2` returning unconsumed remainder
+- SAVEPOINT / RELEASE / ROLLBACK TO via journal-and-replay
+- FFI `sqlite3_prepare_v2` + `pzTail`; multi-stmt `sqlite3_exec`
+- errmsg ownership via `CString::into_raw` + `sqlite3_free` round-trip
+
+Lane SQL-C — SQLite ON CONFLICT matrix + 25 tests
+- `INSERT OR ABORT/FAIL/IGNORE/REPLACE/ROLLBACK` routed through unified
+  conflict-action dispatcher
+- audit P0-11 fixed: `INSERT OR IGNORE` against NOT NULL silently skips
+- `INTEGER PRIMARY KEY` high-water-mark survives delete + recovery
+- UPSERT `DO UPDATE` / `DO NOTHING` matrix
+
+Lane GC — group-commit telemetry + per-core lanes + combiner stub + 21 tests
+- `WalSyncCounters` extended with `group_commits_issued`,
+  `group_commit_batch_record_count_sum`, 16-bucket histogram (p50/p95/p99/max)
+- per-core `WalLaneCoordinator`: opt-in N-lane mode keeps default 1-lane behavior
+- semantic counter combiner stub (explicit `unimplemented!()`, opt-in)
+- 100-thread test: 2 fsyncs cover 100 commits; mean fan-in 50×
+
+Lane INT — integrity checker + bench DatasetChecksum + 12 tests
+- `crates/kernel/src/integrity/{mod,heap,index,equivalence,page_csum}.rs`
+- per-relation `IntegrityReport`: heap row count, index entry count,
+  heap_minus_index, index_minus_heap, page_csum_failures,
+  lsn_monotonicity_violations
+- PRAGMA `redline_index_check`, PRAGMA `redline_full_check`
+- bench `DatasetChecksum`: real row hashes (audit P1-12 fix); replaces
+  `MAX(k)` / `COUNT(*)` placeholder
+
+Wave-1-partial proof matrix:
+- `cargo fmt --check` — green
+- `./scripts/check_file_sizes.sh` — green (3 active warnings, all under 2000 cap)
+- `cargo check --workspace --locked` — green
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
+- `cargo test --workspace --quiet --locked` — `390 passed, 1 ignored` (37 suites)
+  (vs 241 wave-7-fused → +149 phase-10 tests)
+- `cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7` — `40/40 cases, 0 failures`
+- `cargo run -p redlinedb-bench -- certify --config crates/bench/bench/smoke.toml --out-dir target/bench/phase10-w1p-smoke --seed 7 --repetitions 1 --warmup 0` — exit 0; manifest carries `DatasetChecksum`
+
+Wave-1-partial artifact SHA-256:
+- `target/bench/phase10-w1p-smoke/manifest.json` — `668d6c2aa8d0d8f43e1e2ff3e90c12ad7b4bd8a1da1f511239a288fa490bb38b`
+- `target/bench/phase10-w1p-smoke/runs.jsonl` — `4e22fa4989f9dcb42ca3f0a3b6ef14cd28e6addead2a1ad2cc8bab12846870ef`
+- `target/bench/phase10-w1p-smoke/summary.csv` — `d3f317f29f7dcc74b65d98d8effe45c096ee232854a26c094c09bc90b1b23c1a`
+- `target/bench/phase10-w1p-smoke/report.md` — `cc50a0d8e4f00fd621e0a2bb6fc11b531f19d745edf53a7afc24993e6f648afa`
+
+Lanes in flight at this writing (parallel worktrees):
+- VE — vectorized executor + spillable sort
+- J1 — JSON1 text functions full surface
+- J2 — JSONB binary format + path bytecode
+- V1 — VECTOR type + flat SIMD
+- V2 — HNSW index
+- V3 — DiskANN-style SSD graph
+- SQL-D — SQLite surface (FK, triggers, views, CTEs, window funcs, generated cols, partial/expression indexes, collations, REGEXP, date/time, ALTER TABLE)
+
+### Phase 10C onward — pending
+
+After wave-2 lanes fuse:
+- Phase 10D — bench expansion (7 new workloads: json-path-extract,
+  json-path-update, vector-flat-search, vector-ann-search,
+  vector-ann-search-disk, large-sort-spill, commit-storm-batched) +
+  `certification-v2.toml` + live xbabe1 cert.
+- Phase 10E — paper rebuild with new figs 6/7/8 and refreshed evaluation
+  section (paper-v2).
+- Phase 10F — final cleanup pass + `phase10-fusion-green` tag.
+
 ## Verified Proof
 
 These commands passed in the current workspace:
