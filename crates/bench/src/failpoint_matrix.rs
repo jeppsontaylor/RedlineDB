@@ -65,6 +65,25 @@ pub fn run(args: &FailpointMatrixArgs) -> Result<FailpointMatrixReport> {
     // targets the redline engine under strict durability.
     let engine = EngineKind::Redline;
 
+    let total_planned: usize = config
+        .cases
+        .iter()
+        .map(|case| {
+            let durabilities = if case.durabilities.is_empty() {
+                config.durabilities.len()
+            } else {
+                case.durabilities.len()
+            };
+            let kills = case.kill_after_n_hits.len().max(1);
+            durabilities * kills
+        })
+        .sum();
+    eprintln!(
+        "failpoint-matrix: planning {total_planned} runs across {} cases",
+        config.cases.len()
+    );
+
+    let mut completed = 0_usize;
     for case in &config.cases {
         let durabilities = if case.durabilities.is_empty() {
             config.durabilities.clone()
@@ -78,11 +97,27 @@ pub fn run(args: &FailpointMatrixArgs) -> Result<FailpointMatrixReport> {
         };
         for &durability in &durabilities {
             for &kill_after_n_hits in &kill_hits {
+                eprintln!(
+                    "failpoint-matrix: [{}/{}] case={} durability={} kill_after_n_hits={}",
+                    completed + 1,
+                    total_planned,
+                    case.name,
+                    durability.as_str(),
+                    kill_after_n_hits
+                );
                 let run = run_case(engine, durability, case, kill_after_n_hits)?;
                 if !run.passed {
                     failed += 1;
                 }
+                eprintln!(
+                    "failpoint-matrix:   -> {} acked={} recovered={} lost={}",
+                    if run.passed { "PASS" } else { "FAIL" },
+                    run.acknowledged,
+                    run.recovered,
+                    run.lost_acked_commits
+                );
                 runs.push(run);
+                completed += 1;
             }
         }
     }
@@ -131,6 +166,19 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
+    // Failpoints commonly fire on background threads (the WAL writer
+    // thread, for instance). A Rust panic on a background thread
+    // unwinds that thread but does not kill the process; subsequent
+    // foreground operations would block forever waiting on the dead
+    // worker. Install an abort-on-panic hook so any failpoint panic
+    // anywhere in the child terminates the whole process and lets the
+    // parent observe a clean death.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        original_hook(info);
+        std::process::abort();
+    }));
+
     // Arm the failpoint registry. `init` is idempotent and `cfg` only
     // succeeds when the `failpoints` feature was enabled at compile
     // time, which we guarantee via the bench's direct dep on
@@ -168,6 +216,14 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
         .append(true)
         .open(&args.ack_log)?;
 
+    // Every 16 rows the child also calls `Database::checkpoint()` so
+    // failpoints that gate the checkpoint path (`engine::checkpoint`,
+    // `wal::flush_all`, `storage::control::write`) actually fire.
+    // Without this hook the simple INSERT loop would never exercise
+    // those sites and the corresponding matrix cases would silently
+    // pass.
+    const CHECKPOINT_EVERY_ROWS: usize = 16;
+
     for key in 0..args.rows {
         // Use INSERT OR REPLACE so the same key can be retried after
         // a successful commit if our process is restarted; under the
@@ -196,6 +252,13 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
         }
         writeln!(ack, "{key}")?;
         ack.flush()?;
+
+        if key > 0 && key.is_multiple_of(CHECKPOINT_EVERY_ROWS) && db.checkpoint().is_err() {
+            // The checkpoint failpoint fires here; treat error as
+            // workload termination so the parent observes a clean
+            // ack-up-to-N before our process aborts.
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -239,7 +302,16 @@ fn run_case(
         .with_context(|| format!("spawn failpoint child for case {}", case.name))?;
 
     let acknowledged = read_ack_count(&ack_log)?;
-    let recovered = verify_recovered(durability, &db_dir).unwrap_or(0);
+    let recovered = match verify_recovered(durability, &db_dir) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "failpoint-matrix:   verify_recovered failed for {}: {err:#}",
+                case.name
+            );
+            0
+        }
+    };
     let lost = acknowledged as i64 - recovered as i64;
     let passed = lost <= 0;
 
@@ -261,22 +333,42 @@ fn run_case(
 fn verify_recovered(durability: DurabilityKind, db_dir: &Path) -> Result<usize> {
     let mut options = redlinedb::OpenOptions::default();
     options.memory.cache_bytes = 8 * 1024 * 1024;
+    // CRITICAL: `create: true` (the default) routes the redlinedb facade
+    // through `Database::create`, which re-initialises the page file
+    // and wipes any existing data. For recovery verification we need
+    // `Database::open`, which replays the WAL on top of the existing
+    // page file.
+    options.create = false;
     options.durability = match durability {
         DurabilityKind::Strict => redlinedb::Durability::Strict,
         DurabilityKind::Normal => redlinedb::Durability::Normal,
         DurabilityKind::Unsafe => redlinedb::Durability::UnsafeDev,
     };
     let path = db_dir.join("bench.redline");
-    let db = redlinedb::Database::open_with_options(&path, options)?;
-    let mut conn = db.connect()?;
-    let mut rows = conn.query("SELECT COUNT(*) FROM kv", ())?;
-    let count = match rows.step()? {
-        redlinedb::Step::Row(row) => match row.get_ref(0)? {
-            redlinedb::ValueRef::Integer(value) => value,
-            redlinedb::ValueRef::Null => 0,
-            _ => 0,
+    let db = redlinedb::Database::open_with_options(&path, options)
+        .with_context(|| format!("open recovered db at {}", path.display()))?;
+    let mut conn = db.connect().with_context(|| "connect to recovered db")?;
+    // The kv table may not exist if the child died before the
+    // CREATE TABLE durably committed. Treat that as zero recovered
+    // rows rather than propagating the error: the gate is about
+    // whether *acknowledged* rows are recovered, and ack count is
+    // zero in that scenario, so the case naturally passes.
+    let count = match conn.query("SELECT COUNT(*) FROM kv", ()) {
+        Ok(mut rows) => match rows.step()? {
+            redlinedb::Step::Row(row) => match row.get_ref(0)? {
+                redlinedb::ValueRef::Integer(value) => value,
+                redlinedb::ValueRef::Null => 0,
+                _ => 0,
+            },
+            redlinedb::Step::Done => 0,
         },
-        redlinedb::Step::Done => 0,
+        Err(err) => {
+            eprintln!(
+                "failpoint-matrix:   recovered db at {} has no kv table ({err})",
+                path.display()
+            );
+            0
+        }
     };
     Ok(count.max(0) as usize)
 }
