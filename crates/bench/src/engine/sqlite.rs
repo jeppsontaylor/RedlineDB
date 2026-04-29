@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -35,6 +36,47 @@ impl SqliteEngine {
         apply_pragmas(&conn, self.cache_kib, self.durability)?;
         Ok(conn)
     }
+
+    /// Capture validated PRAGMA settings as `BTreeMap<String, String>`.
+    /// Failures are best-effort — we record `<error>` for any pragma that
+    /// the driver refuses to read so the manifest still surfaces what we
+    /// attempted.
+    pub fn pragmas(&self) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let conn = match self.open_conn() {
+            Ok(conn) => conn,
+            Err(_) => return out,
+        };
+        for name in [
+            "journal_mode",
+            "synchronous",
+            "cache_size",
+            "busy_timeout",
+            "foreign_keys",
+            "page_size",
+        ] {
+            let value =
+                read_pragma_value(&conn, name).unwrap_or_else(|err| format!("<error: {err}>"));
+            out.insert(name.to_owned(), value);
+        }
+        out
+    }
+}
+
+fn read_pragma_value(conn: &Connection, name: &str) -> Result<String> {
+    let sql = format!("PRAGMA {name}");
+    let value: String = conn.query_row(&sql, [], |row| {
+        // PRAGMA results are heterogeneous — read into ValueRef so we can
+        // print integers and text uniformly.
+        Ok(match row.get_ref(0)? {
+            ValueRef::Null => String::new(),
+            ValueRef::Integer(v) => v.to_string(),
+            ValueRef::Real(v) => v.to_string(),
+            ValueRef::Text(v) => String::from_utf8_lossy(v).into_owned(),
+            ValueRef::Blob(v) => format!("blob:{}", v.len()),
+        })
+    })?;
+    Ok(value)
 }
 
 impl BenchEngine for SqliteEngine {
@@ -79,6 +121,8 @@ impl BenchEngine for SqliteEngine {
     }
 
     fn snapshot(&self) -> Result<EngineSnapshot> {
+        // NEEDS_REVIEW: SQLite VFS metrics not yet captured — the snapshot
+        // surfaces only journal/synchronous PRAGMAs and on-disk byte counts.
         let conn = self.open_conn()?;
         let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
