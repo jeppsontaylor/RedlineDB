@@ -102,6 +102,40 @@ Post-fusion proof:
 Wave 3 artifact SHA-256:
 - `target/bench/wave3-compat.json` — `ee812460f3f08b55b323b6bc63c461f99551177b4db64b7dd106289179f0f91e`
 
+## Phase 9 Wave 4 Fusion (Lane C)
+
+Lane C landed on top of `wave3-fused` (d3994d9) and tagged `wave4-fused`. Six commits fast-forwarded into main:
+
+- `f94c037 phase:9/lane-c/operator: SQL index_access probe operator`
+- `506e8e7 phase:9/lane-c/exec-wire: route SELECT through index probes`
+- `c911614 phase:9/lane-c/planner: re-enable index access path advertising`
+- `90c7fa9 phase:9/lane-c/explain: distinguish PointLookup vs RangeScan in EXPLAIN`
+- `509edf7 phase:9/lane-c/lint: fmt + clippy fixes for Lane C`
+- `9705399 phase:9/lane-c/tests: 7 new sql_smoke lane_c tests`
+
+New `crates/sql/src/exec/index_access.rs` (530 LOC) probes `BtreeIndex::point_lookup` / range and reloads heap rows via `Engine::get_for_relation` with snapshot visibility checks. Planner re-enables `IndexPointLookup` / `IndexRangeScan` advertising for leading-column equality / range only. EXPLAIN now emits `USING INDEX <name>: PointLookup` / `RangeScan` with a JSON `index_probe_kind` field. `access_path_is_consumable_by_executor` debug assertion plus paired test prevents the planner from ever emitting a path the executor can't honor. CoveringIndex/MultiIndexAnd/MultiIndexOr remain disabled.
+
+Seven new `lane_c::` tests in `crates/sql/tests/sql_smoke.rs`:
+- `select_by_pk_uses_index_point_lookup`
+- `select_indexed_range_uses_index_range_scan`
+- `unsupported_predicate_falls_back_to_table_scan`
+- `index_point_lookup_returns_correct_rows`
+- `index_range_scan_returns_correct_rows`
+- `planner_does_not_advertise_covering_index`
+- `planner_does_not_advertise_multi_index_and_or`
+
+Post-fusion proof:
+- `cargo fmt --check` — green
+- `./scripts/check_file_sizes.sh` — green (`crates/sql/src/exec.rs` warns at 1526 LOC, hard fail is 2000)
+- `cargo check --workspace --locked` — green
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
+- `cargo test --workspace --quiet --locked` — `195 passed (29 suites, 4.24s)` (187 → 195, +8 tests)
+- `cargo test -p redlinedb-sql --quiet --locked` — 40 passed (was 32)
+- `cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7 --out target/bench/wave4-compat.json` — `{"files":3,"cases":40,"failures":[]}`
+
+Wave 4 artifact SHA-256:
+- `target/bench/wave4-compat.json` — `ee812460f3f08b55b323b6bc63c461f99551177b4db64b7dd106289179f0f91e`
+
 ## Verified Proof
 
 These commands passed in the current workspace:
