@@ -29,6 +29,9 @@ pub struct CertificationManifest {
     pub report_md_hash: String,
     pub git_sha: Option<String>,
     pub git_dirty: Option<bool>,
+    /// Echo the resolved `--with-strace` decision so manifest consumers
+    /// can tell at a glance whether the child wrap was attempted.
+    pub with_strace: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pragmas: Option<BTreeMap<String, BTreeMap<String, String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,11 +56,10 @@ pub fn run(config: &CompareConfig, args: &CertifyArgs) -> Result<CertificationRe
     // exposes its settings via engine_stats embedded in run records.
     let pragmas = collect_pragmas(config, args)?;
 
-    let with_strace = std::env::var_os("REDLINEDB_BENCH_WITH_STRACE")
-        .filter(|value| !value.is_empty())
-        .is_some();
+    let with_strace = args.strace_enabled();
 
     let mut runs = Vec::new();
+    let mut strace_child_paths: Vec<PathBuf> = Vec::new();
     for rep in 0..args.repetitions.max(1) {
         for &engine in &config.engines {
             for &workload in &config.workloads {
@@ -66,8 +68,11 @@ pub fn run(config: &CompareConfig, args: &CertifyArgs) -> Result<CertificationRe
                         let seed = args.seed.wrapping_add(rep as u64);
                         let spec =
                             config.run_spec(&engine, &workload, &durability, threads, seed)?;
-                        let record = run_child(&spec, &raw_dir, rep, with_strace)?;
-                        runs.push(record);
+                        let outcome = run_child(&spec, &raw_dir, rep, with_strace)?;
+                        runs.push(outcome.record);
+                        if let Some(path) = outcome.strace_path {
+                            strace_child_paths.push(path);
+                        }
                     }
                 }
             }
@@ -96,7 +101,7 @@ pub fn run(config: &CompareConfig, args: &CertifyArgs) -> Result<CertificationRe
     };
 
     let checksums = checksum_map(&runs);
-    let strace = strace_summary(with_strace, &args.out_dir)?;
+    let strace = strace_summary(with_strace, &args.out_dir, &strace_child_paths)?;
 
     let manifest = CertificationManifest {
         out_dir: args.out_dir.clone(),
@@ -106,6 +111,7 @@ pub fn run(config: &CompareConfig, args: &CertifyArgs) -> Result<CertificationRe
         report_md_hash: hash_file(&report_md)?,
         git_sha: report::collect_environment().git_sha,
         git_dirty: report::collect_environment().git_dirty,
+        with_strace,
         pragma_validation: pragma_validation(&pragmas),
         pragmas: if pragmas.is_empty() {
             None
@@ -190,32 +196,114 @@ fn checksum_map(runs: &[RunRecord]) -> BTreeMap<String, String> {
     out
 }
 
+/// Aggregate the per-child strace summaries collected during the run.
+///
+/// Earlier versions of this harness attached `strace` to the parent
+/// process *after* every child had exited. On Linux that path can hang
+/// because `strace -p $$` is asking strace to attach to the same
+/// process that is then waiting for strace to detach. The new contract
+/// is: each spawned `redlinedb-bench run` child is wrapped with
+/// `strace -c -o <path>` directly — see `run_child` — and we sum the
+/// per-child summaries here.
 fn strace_summary(
     with_strace: bool,
     out_dir: &Path,
+    child_paths: &[PathBuf],
 ) -> Result<crate::strace_capture::StraceCapture> {
     if !with_strace {
         return Ok(crate::strace_capture::StraceCapture {
             syscall_counts: None,
             reason: Some(if cfg!(target_os = "linux") {
-                "disabled (set REDLINEDB_BENCH_WITH_STRACE=1 to enable)".to_owned()
+                "disabled (pass --with-strace or set REDLINEDB_BENCH_WITH_STRACE=1 to enable)"
+                    .to_owned()
             } else {
                 "linux required".to_owned()
             }),
             output_path: None,
         });
     }
-    let pid = std::process::id() as i32;
-    let path = out_dir.join("strace.txt");
-    Ok(strace_capture::capture_or_skip(pid, &path))
+    if !cfg!(target_os = "linux") {
+        return Ok(crate::strace_capture::StraceCapture {
+            syscall_counts: None,
+            reason: Some("linux required".to_owned()),
+            output_path: None,
+        });
+    }
+    if child_paths.is_empty() {
+        return Ok(crate::strace_capture::StraceCapture {
+            syscall_counts: None,
+            reason: Some("no strace output files were produced by children".to_owned()),
+            output_path: None,
+        });
+    }
+
+    // Sum the per-child summaries into a single map.
+    let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+    let mut empties = 0usize;
+    for path in child_paths {
+        match fs::read_to_string(path) {
+            Ok(raw) => {
+                let parsed = strace_capture::parse_strace_summary(&raw);
+                if parsed.is_empty() {
+                    empties += 1;
+                    continue;
+                }
+                for (name, calls) in parsed {
+                    *totals.entry(name).or_insert(0) += calls;
+                }
+            }
+            Err(_) => empties += 1,
+        }
+    }
+
+    let aggregate_path = out_dir.join("strace.txt");
+    if !totals.is_empty() {
+        let mut text = String::from(
+            "% time     seconds  usecs/call     calls    errors syscall\n\
+             ------ ----------- ----------- --------- --------- ----------------\n",
+        );
+        for (name, calls) in &totals {
+            text.push_str(&format!("   0.00    0.000000           0 {calls:>9}         0 {name}\n"));
+        }
+        let _ = fs::write(&aggregate_path, text);
+    }
+
+    Ok(crate::strace_capture::StraceCapture {
+        syscall_counts: if totals.is_empty() {
+            None
+        } else {
+            Some(totals)
+        },
+        reason: if empties > 0 {
+            Some(format!(
+                "{empties} of {} child strace files were empty or unreadable",
+                child_paths.len()
+            ))
+        } else {
+            None
+        },
+        output_path: if aggregate_path.exists() {
+            Some(aggregate_path)
+        } else {
+            None
+        },
+    })
+}
+
+/// What `run_child` returns: the parsed per-run record plus an optional
+/// path to the strace summary captured for that run (only populated on
+/// Linux when `--with-strace` is in effect and `strace` is on `PATH`).
+pub(crate) struct ChildOutcome {
+    pub record: RunRecord,
+    pub strace_path: Option<PathBuf>,
 }
 
 fn run_child(
     spec: &crate::config::RunSpec,
     raw_dir: &Path,
     rep: usize,
-    _with_strace: bool,
-) -> Result<RunRecord> {
+    with_strace: bool,
+) -> Result<ChildOutcome> {
     let exe = std::env::current_exe().context("resolve bench executable")?;
     let run_dir = raw_dir.join(format!(
         "{:?}-{}-{}-t{}-r{}",
@@ -227,7 +315,27 @@ fn run_child(
     ));
     fs::create_dir_all(&run_dir)?;
     let out_path = run_dir.join("record.json");
-    let output = Command::new(exe)
+
+    // Decide whether to wrap the child in `strace -c`. We only do this on
+    // Linux when the caller asked for it AND the `strace` binary is
+    // actually installed; otherwise we fall through to a normal invocation
+    // and the parent surfaces a `strace_reason` in the manifest.
+    let strace_path = run_dir.join("strace.txt");
+    let wrap_with_strace = with_strace && cfg!(target_os = "linux") && which_strace();
+
+    let mut command = if wrap_with_strace {
+        let mut c = Command::new("strace");
+        c.arg("-c")
+            .arg("-o")
+            .arg(&strace_path)
+            .arg("--")
+            .arg(&exe);
+        c
+    } else {
+        Command::new(&exe)
+    };
+
+    let output = command
         .arg("run")
         .arg("--engine")
         .arg(engine_arg(spec.engine))
@@ -262,7 +370,30 @@ fn run_child(
     }
     let raw = fs::read_to_string(&out_path)
         .with_context(|| format!("read run record {}", out_path.display()))?;
-    Ok(serde_json::from_str(&raw)?)
+    let record: RunRecord = serde_json::from_str(&raw)?;
+    let strace_path = if wrap_with_strace && strace_path.exists() {
+        Some(strace_path)
+    } else {
+        None
+    };
+    Ok(ChildOutcome {
+        record,
+        strace_path,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn which_strace() -> bool {
+    Command::new("which")
+        .arg("strace")
+        .output()
+        .map(|out| out.status.success() && !out.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn which_strace() -> bool {
+    false
 }
 
 fn write_runs_jsonl(path: &Path, runs: &[RunRecord]) -> Result<()> {
