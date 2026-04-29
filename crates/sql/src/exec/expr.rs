@@ -209,6 +209,12 @@ pub(crate) fn eval_scalar(
             if matches!(value, SqlValue::Null) {
                 SqlValue::Null
             } else {
+                // SQLite semantics: compute the base IN as TRUE / FALSE / NULL,
+                // then apply NOT only on TRUE / FALSE — NULL must propagate
+                // through unchanged.
+                //   `5 NOT IN (1, NULL)`  → NULL  (cannot prove 5 != NULL)
+                //   `1 NOT IN (1, NULL)`  → FALSE (we found a match)
+                //   `5 NOT IN (1, 2, 3)`  → TRUE  (no NULL, no match)
                 let mut found = false;
                 let mut saw_null = false;
                 for item in list {
@@ -222,14 +228,17 @@ pub(crate) fn eval_scalar(
                         _ => {}
                     }
                 }
-                let mut ok = found;
-                if *negated {
-                    ok = !ok;
-                }
-                if !ok && saw_null {
-                    SqlValue::Null
+                let base_in: Option<bool> = if found {
+                    Some(true)
+                } else if saw_null {
+                    None
                 } else {
-                    SqlValue::Integer(if ok { 1 } else { 0 })
+                    Some(false)
+                };
+                match (base_in, *negated) {
+                    (Some(b), false) => SqlValue::Integer(if b { 1 } else { 0 }),
+                    (Some(b), true) => SqlValue::Integer(if !b { 1 } else { 0 }),
+                    (None, _) => SqlValue::Null,
                 }
             }
         }
@@ -266,14 +275,19 @@ pub(crate) fn eval_scalar(
                         _ => {}
                     }
                 }
-                let mut ok = found;
-                if *negated {
-                    ok = !ok;
-                }
-                if !ok && saw_null {
-                    SqlValue::Null
+                // Same NOT-IN-with-NULL semantics as InList: compute base IN as
+                // TRUE / FALSE / NULL, then apply NOT only on TRUE / FALSE.
+                let base_in: Option<bool> = if found {
+                    Some(true)
+                } else if saw_null {
+                    None
                 } else {
-                    SqlValue::Integer(if ok { 1 } else { 0 })
+                    Some(false)
+                };
+                match (base_in, *negated) {
+                    (Some(b), false) => SqlValue::Integer(if b { 1 } else { 0 }),
+                    (Some(b), true) => SqlValue::Integer(if !b { 1 } else { 0 }),
+                    (None, _) => SqlValue::Null,
                 }
             }
         }
@@ -379,18 +393,48 @@ fn eval_binary(
             (Some(false), Some(false)) => SqlValue::Integer(0),
             _ => SqlValue::Null,
         },
-        BinaryOperator::Plus => arithmetic(left_value, right_value, |a, b| a + b, |a, b| a + b)?,
-        BinaryOperator::Minus => arithmetic(left_value, right_value, |a, b| a - b, |a, b| a - b)?,
-        BinaryOperator::Multiply => {
-            arithmetic(left_value, right_value, |a, b| a * b, |a, b| a * b)?
-        }
-        BinaryOperator::Divide if numeric_zero(&right_value)? => SqlValue::Null,
-        BinaryOperator::Divide => arithmetic(left_value, right_value, |a, b| a / b, |a, b| a / b)?,
-        BinaryOperator::Modulo => match (&left_value, &right_value) {
-            (_, SqlValue::Integer(0)) => SqlValue::Null,
-            (SqlValue::Integer(a), SqlValue::Integer(b)) => SqlValue::Integer(a % b),
-            _ => return Err(Error::DatatypeMismatch),
-        },
+        BinaryOperator::Plus => arithmetic(
+            left_value,
+            right_value,
+            |a, b| Some(a.wrapping_add(b)),
+            |a, b| Some(a + b),
+        )?,
+        BinaryOperator::Minus => arithmetic(
+            left_value,
+            right_value,
+            |a, b| Some(a.wrapping_sub(b)),
+            |a, b| Some(a - b),
+        )?,
+        BinaryOperator::Multiply => arithmetic(
+            left_value,
+            right_value,
+            |a, b| Some(a.wrapping_mul(b)),
+            |a, b| Some(a * b),
+        )?,
+        BinaryOperator::Divide => arithmetic(
+            left_value,
+            right_value,
+            |a, b| if b == 0 { None } else { a.checked_div(b) },
+            |a, b| {
+                if b == 0.0 {
+                    None
+                } else {
+                    Some(a / b)
+                }
+            },
+        )?,
+        BinaryOperator::Modulo => arithmetic(
+            left_value,
+            right_value,
+            |a, b| if b == 0 { None } else { a.checked_rem(b) },
+            |a, b| {
+                if b == 0.0 {
+                    None
+                } else {
+                    Some(a % b)
+                }
+            },
+        )?,
         BinaryOperator::Eq => compare_binary(left_value, right_value, |o| o == Ordering::Equal)?,
         BinaryOperator::NotEq | BinaryOperator::Spaceship => {
             compare_binary(left_value, right_value, |o| o != Ordering::Equal)?
@@ -401,16 +445,17 @@ fn eval_binary(
         BinaryOperator::LtEq => {
             compare_binary(left_value, right_value, |o| o != Ordering::Greater)?
         }
-        BinaryOperator::StringConcat
-            if matches!(left_value, SqlValue::Null) || matches!(right_value, SqlValue::Null) =>
-        {
-            SqlValue::Null
+        BinaryOperator::StringConcat => {
+            if matches!(left_value, SqlValue::Null) || matches!(right_value, SqlValue::Null) {
+                SqlValue::Null
+            } else {
+                SqlValue::Text(Arc::from(format!(
+                    "{}{}",
+                    value_to_string(&left_value),
+                    value_to_string(&right_value)
+                )))
+            }
         }
-        BinaryOperator::StringConcat => SqlValue::Text(Arc::from(format!(
-            "{}{}",
-            value_to_string(&left_value),
-            value_to_string(&right_value)
-        ))),
         other => {
             return Err(Error::UnsupportedSql(format!(
                 "unsupported binary op {other:?}"
@@ -648,6 +693,15 @@ fn glob_result(value: SqlValue, pattern: SqlValue, negated: bool) -> Result<SqlV
 }
 
 fn glob_match(text: &[u8], pattern: &[u8]) -> bool {
+    // SQLite GLOB grammar:
+    //   *           — matches zero or more characters
+    //   ?           — matches exactly one character
+    //   [abc]       — character class (any of)
+    //   [a-z]       — character range
+    //   [!abc]      — negated class (matches one char NOT in abc)
+    //   [^abc]      — also a negated class (compatibility)
+    //   anything else — literal (case-sensitive, unlike LIKE)
+    // An unterminated `[` is treated as a literal `[`.
     fn inner(text: &[u8], pattern: &[u8]) -> bool {
         let mut ti = 0usize;
         let mut pi = 0usize;
@@ -676,6 +730,23 @@ fn glob_match(text: &[u8], pattern: &[u8]) -> bool {
                     ti += 1;
                     pi += 1;
                 }
+                b'[' => {
+                    if let Some((matched, advance)) = match_glob_class(&pattern[pi..], text.get(ti))
+                    {
+                        if !matched {
+                            return false;
+                        }
+                        ti += 1;
+                        pi += advance;
+                    } else {
+                        // Unterminated class: treat `[` as a literal.
+                        if ti >= text.len() || text[ti] != b'[' {
+                            return false;
+                        }
+                        ti += 1;
+                        pi += 1;
+                    }
+                }
                 ch => {
                     if ti >= text.len() || text[ti] != ch {
                         return false;
@@ -690,8 +761,74 @@ fn glob_match(text: &[u8], pattern: &[u8]) -> bool {
     inner(text, pattern)
 }
 
+/// Try to match a `[...]` character class at the start of `pattern` against
+/// the optional next byte of the input. Returns `(matched, pattern_advance)`
+/// on success; `None` when the class is unterminated (caller should treat
+/// the leading `[` as a literal).
+fn match_glob_class(pattern: &[u8], target: Option<&u8>) -> Option<(bool, usize)> {
+    debug_assert!(pattern.first() == Some(&b'['));
+    let mut idx = 1usize;
+    let negate = matches!(pattern.get(idx), Some(&b'!') | Some(&b'^'));
+    if negate {
+        idx += 1;
+    }
+    let class_start = idx;
+    let mut matched = false;
+    let target_byte = match target {
+        Some(&b) => b,
+        None => 0,
+    };
+
+    // SQLite allows a literal `]` only as the first character of the class.
+    // So `[]abc]` matches `]`, `a`, `b`, or `c`.
+    if pattern.get(idx) == Some(&b']') {
+        if target.is_some() && target_byte == b']' {
+            matched = true;
+        }
+        idx += 1;
+    }
+
+    while idx < pattern.len() && pattern[idx] != b']' {
+        let lo = pattern[idx];
+        if idx + 2 < pattern.len() && pattern[idx + 1] == b'-' && pattern[idx + 2] != b']' {
+            let hi = pattern[idx + 2];
+            if target.is_some() && target_byte >= lo.min(hi) && target_byte <= lo.max(hi) {
+                matched = true;
+            }
+            idx += 3;
+        } else {
+            if target.is_some() && target_byte == lo {
+                matched = true;
+            }
+            idx += 1;
+        }
+    }
+
+    if idx >= pattern.len() {
+        // No closing `]` — pattern is malformed. Caller falls back to literal.
+        if class_start == idx {
+            return None;
+        }
+        return None;
+    }
+
+    let final_match = if target.is_none() {
+        false
+    } else if negate {
+        !matched
+    } else {
+        matched
+    };
+
+    Some((final_match, idx + 1))
+}
+
 fn round_function(values: &[SqlValue]) -> Result<SqlValue> {
-    if values.is_empty() {
+    // SQLite: round(NULL, ...) and round(x, NULL) return NULL.
+    if values.is_empty() || matches!(values[0], SqlValue::Null) {
+        return Ok(SqlValue::Null);
+    }
+    if values.len() > 1 && matches!(values[1], SqlValue::Null) {
         return Ok(SqlValue::Null);
     }
     let value = numeric_value(&values[0])?;
@@ -717,13 +854,6 @@ pub(crate) fn numeric_value(value: &SqlValue) -> Result<f64> {
             .parse::<f64>()
             .map_err(|_| Error::DatatypeMismatch),
     }
-}
-
-fn numeric_zero(value: &SqlValue) -> Result<bool> {
-    if matches!(value, SqlValue::Null) {
-        return Ok(false);
-    }
-    Ok(numeric_value(value)? == 0.0)
 }
 
 fn hex_value(value: &SqlValue) -> String {
@@ -831,19 +961,35 @@ fn eval_function(
 
     let name = func.name.to_string().to_ascii_lowercase();
     match name.as_str() {
-        "length" => Ok(SqlValue::Integer(
-            value_to_string(values.first().unwrap_or(&SqlValue::Null)).len() as i64,
-        )),
-        "lower" => Ok(SqlValue::Text(Arc::from(
-            value_to_string(values.first().unwrap_or(&SqlValue::Null)).to_ascii_lowercase(),
-        ))),
-        "upper" => Ok(SqlValue::Text(Arc::from(
-            value_to_string(values.first().unwrap_or(&SqlValue::Null)).to_ascii_uppercase(),
-        ))),
+        "length" => match values.first() {
+            // SQLite: length(NULL) is NULL, not 0.
+            Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+            Some(other) => Ok(SqlValue::Integer(value_to_string(other).len() as i64)),
+        },
+        "lower" => match values.first() {
+            Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+            Some(other) => Ok(SqlValue::Text(Arc::from(
+                value_to_string(other).to_ascii_lowercase(),
+            ))),
+        },
+        "upper" => match values.first() {
+            Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+            Some(other) => Ok(SqlValue::Text(Arc::from(
+                value_to_string(other).to_ascii_uppercase(),
+            ))),
+        },
         "abs" => match values.first() {
-            Some(SqlValue::Integer(v)) => Ok(SqlValue::Integer(v.abs())),
+            // SQLite: abs(NULL) is NULL, not an error.
+            Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+            Some(SqlValue::Integer(v)) => Ok(SqlValue::Integer(v.wrapping_abs())),
             Some(SqlValue::Real(v)) => Ok(SqlValue::Real(v.abs())),
-            _ => Err(Error::DatatypeMismatch),
+            // Coerce text / blob to numeric then abs (SQLite implicit-numeric).
+            Some(SqlValue::Text(_)) | Some(SqlValue::Blob(_)) => {
+                match numeric_value(values.first().unwrap()) {
+                    Ok(v) => Ok(SqlValue::Real(v.abs())),
+                    Err(_) => Ok(SqlValue::Real(0.0)),
+                }
+            }
         },
         "coalesce" | "ifnull" => {
             for value in values {
@@ -876,9 +1022,10 @@ fn eval_function(
         "vector_dims" => vector_dims(&values),
         "vector_distance_l2" => vector_distance_l2(&values),
         "vector_distance_cosine" => vector_distance_cosine(&values),
-        "hex" => Ok(SqlValue::Text(Arc::from(hex_value(
-            values.first().unwrap_or(&SqlValue::Null),
-        )))),
+        "hex" => match values.first() {
+            Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+            Some(other) => Ok(SqlValue::Text(Arc::from(hex_value(other)))),
+        },
         "quote" => Ok(SqlValue::Text(Arc::from(quote_value(
             values.first().unwrap_or(&SqlValue::Null),
         )))),
@@ -1269,29 +1416,176 @@ pub(crate) fn cast_value(
     value: SqlValue,
     data_type: &sqlparser::ast::DataType,
 ) -> Result<SqlValue> {
+    // SQLite: CAST(NULL AS anything) is NULL.
     if matches!(value, SqlValue::Null) {
         return Ok(SqlValue::Null);
     }
-    let text = value_to_string(&value);
     let type_name = data_type.to_string().to_ascii_lowercase();
-    if type_name.contains("int") {
-        return Ok(SqlValue::Integer(
-            text.trim()
-                .parse::<i64>()
-                .map_err(|_| Error::DatatypeMismatch)?,
-        ));
+
+    // CAST AS BLOB: text becomes its UTF-8 bytes; numerics become their
+    // textual representation as bytes.
+    if type_name.contains("blob") {
+        return Ok(match value {
+            SqlValue::Blob(_) => value,
+            SqlValue::Text(s) => SqlValue::Blob(Arc::from(s.as_bytes())),
+            other => SqlValue::Blob(Arc::from(value_to_string(&other).into_bytes())),
+        });
     }
-    if type_name.contains("real") || type_name.contains("floa") || type_name.contains("doub") {
-        return Ok(SqlValue::Real(
-            text.trim()
-                .parse::<f64>()
-                .map_err(|_| Error::DatatypeMismatch)?,
-        ));
-    }
+
     if type_name.contains("text") || type_name.contains("char") || type_name.contains("clob") {
-        return Ok(SqlValue::Text(Arc::from(text)));
+        // CAST AS TEXT: numbers become their text form; blobs become UTF-8
+        // (lossy if invalid bytes); text is unchanged.
+        return Ok(match value {
+            SqlValue::Text(_) => value,
+            SqlValue::Integer(v) => SqlValue::Text(Arc::from(v.to_string())),
+            SqlValue::Real(v) => SqlValue::Text(Arc::from(v.to_string())),
+            SqlValue::Blob(v) => SqlValue::Text(Arc::from(String::from_utf8_lossy(&v).into_owned())),
+            SqlValue::Null => SqlValue::Null,
+        });
     }
+
+    if type_name.contains("real") || type_name.contains("floa") || type_name.contains("doub") {
+        return Ok(SqlValue::Real(cast_to_real(&value)));
+    }
+
+    if type_name.contains("int") {
+        // SQLite truncates real toward zero (not floor / round):
+        //   CAST(3.7 AS INTEGER)  → 3
+        //   CAST(-3.7 AS INTEGER) → -3
+        return Ok(SqlValue::Integer(cast_to_integer(&value)));
+    }
+
+    // CAST AS NUMERIC (or any unrecognized type): return integer if it parses
+    // cleanly, otherwise real, otherwise the integer prefix.
+    if type_name.contains("numeric") {
+        return Ok(cast_to_numeric(&value));
+    }
+
     Ok(value)
+}
+
+/// SQLite-style implicit text → integer conversion: parse the longest valid
+/// integer prefix; if no valid digits, return 0. Real values truncate toward
+/// zero; blobs are interpreted as their UTF-8 text.
+fn cast_to_integer(value: &SqlValue) -> i64 {
+    match value {
+        SqlValue::Null => 0,
+        SqlValue::Integer(v) => *v,
+        // Truncate toward zero — matches SQLite (not floor / round).
+        SqlValue::Real(v) => {
+            if v.is_nan() {
+                0
+            } else if *v > i64::MAX as f64 {
+                i64::MAX
+            } else if *v < i64::MIN as f64 {
+                i64::MIN
+            } else {
+                *v as i64
+            }
+        }
+        SqlValue::Text(s) => parse_integer_prefix(s),
+        SqlValue::Blob(b) => parse_integer_prefix(&String::from_utf8_lossy(b)),
+    }
+}
+
+fn cast_to_real(value: &SqlValue) -> f64 {
+    match value {
+        SqlValue::Null => 0.0,
+        SqlValue::Integer(v) => *v as f64,
+        SqlValue::Real(v) => *v,
+        SqlValue::Text(s) => parse_real_prefix(s),
+        SqlValue::Blob(b) => parse_real_prefix(&String::from_utf8_lossy(b)),
+    }
+}
+
+fn cast_to_numeric(value: &SqlValue) -> SqlValue {
+    match value {
+        SqlValue::Null => SqlValue::Null,
+        SqlValue::Integer(_) | SqlValue::Real(_) => value.clone(),
+        SqlValue::Text(t) => parse_numeric_text(t.as_ref()),
+        SqlValue::Blob(b) => parse_numeric_text(&String::from_utf8_lossy(b)),
+    }
+}
+
+fn parse_numeric_text(text: &str) -> SqlValue {
+    let trimmed = text.trim();
+    if let Ok(v) = trimmed.parse::<i64>() {
+        SqlValue::Integer(v)
+    } else if let Ok(v) = trimmed.parse::<f64>() {
+        SqlValue::Real(v)
+    } else {
+        SqlValue::Integer(parse_integer_prefix(trimmed))
+    }
+}
+
+/// Parse the longest valid integer prefix of `s`, mirroring SQLite's
+/// `CAST(<text> AS INTEGER)`. Stops at the first non-digit character.
+/// Leading whitespace and a single optional sign are accepted.
+fn parse_integer_prefix(s: &str) -> i64 {
+    let s = s.trim_start();
+    let bytes = s.as_bytes();
+    let mut idx = 0usize;
+    let mut neg = false;
+    if let Some(&first) = bytes.first() {
+        if first == b'+' {
+            idx = 1;
+        } else if first == b'-' {
+            idx = 1;
+            neg = true;
+        }
+    }
+    let start = idx;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx == start {
+        return 0;
+    }
+    let digits = &s[start..idx];
+    let mag: i64 = digits.parse().unwrap_or(i64::MAX);
+    if neg { mag.wrapping_neg() } else { mag }
+}
+
+/// Parse the longest valid real-number prefix of `s` (sign, digits,
+/// fractional part, optional exponent). Returns 0.0 on no match.
+fn parse_real_prefix(s: &str) -> f64 {
+    let s = s.trim_start();
+    let bytes = s.as_bytes();
+    let mut idx = 0usize;
+    if let Some(&first) = bytes.first()
+        && (first == b'+' || first == b'-')
+    {
+        idx = 1;
+    }
+    let mut saw_digit = false;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+        saw_digit = true;
+    }
+    if idx < bytes.len() && bytes[idx] == b'.' {
+        idx += 1;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+            saw_digit = true;
+        }
+    }
+    if saw_digit && idx < bytes.len() && (bytes[idx] == b'e' || bytes[idx] == b'E') {
+        let mut after_e = idx + 1;
+        if after_e < bytes.len() && (bytes[after_e] == b'+' || bytes[after_e] == b'-') {
+            after_e += 1;
+        }
+        let exp_start = after_e;
+        while after_e < bytes.len() && bytes[after_e].is_ascii_digit() {
+            after_e += 1;
+        }
+        if after_e > exp_start {
+            idx = after_e;
+        }
+    }
+    if !saw_digit {
+        return 0.0;
+    }
+    s[..idx].parse::<f64>().unwrap_or(0.0)
 }
 
 fn negate(value: SqlValue) -> Result<SqlValue> {
@@ -1306,17 +1600,31 @@ fn negate(value: SqlValue) -> Result<SqlValue> {
 pub(crate) fn arithmetic(
     left: SqlValue,
     right: SqlValue,
-    int_op: impl FnOnce(i64, i64) -> i64,
-    real_op: impl FnOnce(f64, f64) -> f64,
+    int_op: impl FnOnce(i64, i64) -> Option<i64>,
+    real_op: impl FnOnce(f64, f64) -> Option<f64>,
 ) -> Result<SqlValue> {
     if matches!(left, SqlValue::Null) || matches!(right, SqlValue::Null) {
         return Ok(SqlValue::Null);
     }
+    // Closures may return None (e.g. divide / modulo by zero) — in that case
+    // SQLite returns NULL rather than raising an error or panicking.
+    fn lift_int(opt: Option<i64>) -> SqlValue {
+        match opt {
+            Some(v) => SqlValue::Integer(v),
+            None => SqlValue::Null,
+        }
+    }
+    fn lift_real(opt: Option<f64>) -> SqlValue {
+        match opt {
+            Some(v) => SqlValue::Real(v),
+            None => SqlValue::Null,
+        }
+    }
     match (left, right) {
-        (SqlValue::Integer(a), SqlValue::Integer(b)) => Ok(SqlValue::Integer(int_op(a, b))),
-        (SqlValue::Integer(a), SqlValue::Real(b)) => Ok(SqlValue::Real(real_op(a as f64, b))),
-        (SqlValue::Real(a), SqlValue::Integer(b)) => Ok(SqlValue::Real(real_op(a, b as f64))),
-        (SqlValue::Real(a), SqlValue::Real(b)) => Ok(SqlValue::Real(real_op(a, b))),
+        (SqlValue::Integer(a), SqlValue::Integer(b)) => Ok(lift_int(int_op(a, b))),
+        (SqlValue::Integer(a), SqlValue::Real(b)) => Ok(lift_real(real_op(a as f64, b))),
+        (SqlValue::Real(a), SqlValue::Integer(b)) => Ok(lift_real(real_op(a, b as f64))),
+        (SqlValue::Real(a), SqlValue::Real(b)) => Ok(lift_real(real_op(a, b))),
         (SqlValue::Text(a), SqlValue::Text(b)) => {
             let a = a
                 .trim()
@@ -1326,7 +1634,7 @@ pub(crate) fn arithmetic(
                 .trim()
                 .parse::<f64>()
                 .map_err(|_| Error::DatatypeMismatch)?;
-            Ok(SqlValue::Real(real_op(a, b)))
+            Ok(lift_real(real_op(a, b)))
         }
         _ => Err(Error::DatatypeMismatch),
     }
