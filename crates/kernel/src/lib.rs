@@ -13,6 +13,7 @@ pub mod heap;
 pub mod index;
 pub mod integrity;
 pub mod io;
+pub mod json;
 pub mod storage;
 pub mod txn;
 pub mod wal;

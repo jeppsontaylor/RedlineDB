@@ -823,6 +823,7 @@ dependencies = [
  "fail",
  "parking_lot",
  "proptest",
+ "serde_json",
  "smallvec",
  "tempfile",
  "thiserror",
