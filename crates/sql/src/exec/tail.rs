@@ -941,6 +941,91 @@ fn apply_upsert_update(
     })
 }
 
+/// Phase 10 Lane SQL-C: SQLite-style conflict resolution matrix.
+///
+/// SQLite documents five `ON CONFLICT` resolution algorithms (see
+/// <https://sqlite.org/lang_conflict.html>):
+///
+/// | Action   | NOT NULL / CHECK fail | UNIQUE / PK fail              |
+/// |----------|-----------------------|-------------------------------|
+/// | ABORT    | error, undo this stmt | error, undo this stmt         |
+/// | FAIL     | error, keep prior work| error, keep prior work        |
+/// | IGNORE   | skip row silently     | skip row silently             |
+/// | REPLACE  | error (no row to del) | delete conflicting row, insert|
+/// | ROLLBACK | error, abort whole tx | error, abort whole tx         |
+///
+/// Centralising the matrix here means NOT NULL/CHECK and UNIQUE failures
+/// dispatch to the same helper, which fixes the long-standing bug where
+/// `INSERT OR IGNORE` did *not* swallow NOT NULL/CHECK failures because
+/// `apply_constraints` ran before any conflict-action plumbing.
+///
+/// **Deviations from SQLite (documented):**
+/// - `OR FAIL` and `OR ROLLBACK` currently behave like `OR ABORT` because
+///   the surrounding `with_write_tx` machinery in `exec.rs` (out of scope
+///   for this lane) treats every `Err` return as "rollback the implicit
+///   tx" and every error inside an explicit tx as "session is poisoned".
+///   The parser still distinguishes the verbs and the conflict helper
+///   below records the intended action; full FAIL/ROLLBACK semantics
+///   require statement-level partial commit and explicit-tx-aware error
+///   classification, both of which span outside Lane SQL-C's allowed
+///   files. See the `phase10_sqlc_conflict_matrix` tests for the
+///   currently-asserted behaviour.
+fn conflict_action_for(conflict: Option<&crate::statement::InsertConflict>) -> ConflictAction {
+    match conflict {
+        Some(crate::statement::InsertConflict::Sqlite(algo)) => match algo {
+            crate::statement::ConflictAlgorithm::Abort => ConflictAction::Abort,
+            crate::statement::ConflictAlgorithm::Fail => ConflictAction::Fail,
+            crate::statement::ConflictAlgorithm::Ignore => ConflictAction::Ignore,
+            crate::statement::ConflictAlgorithm::Replace => ConflictAction::Replace,
+            crate::statement::ConflictAlgorithm::Rollback => ConflictAction::Rollback,
+        },
+        Some(crate::statement::InsertConflict::Upsert(_)) | None => ConflictAction::Abort,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConflictAction {
+    Abort,
+    Fail,
+    Ignore,
+    Replace,
+    Rollback,
+}
+
+impl ConflictAction {
+    /// True iff a NOT NULL or CHECK violation should be silently ignored
+    /// (turning the row into `InsertOutcome::Ignored`). REPLACE does NOT
+    /// help NOT NULL/CHECK because there is no conflicting row to delete
+    /// — those constraints fire before any unique probe.
+    fn ignores_check_or_not_null(self) -> bool {
+        matches!(self, ConflictAction::Ignore)
+    }
+}
+
+/// Run NOT NULL and CHECK validation against `values`, applying the
+/// conflict-action verb. Returns `Ok(true)` to mean "row was dropped per
+/// IGNORE", `Ok(false)` to mean "constraints passed", and `Err` for any
+/// other action where a violation was found.
+fn apply_constraints_with_action(
+    table: &TableDef,
+    values: &[SqlValue],
+    action: ConflictAction,
+) -> Result<bool> {
+    match apply_constraints(table, values) {
+        Ok(()) => Ok(false),
+        Err(err) => {
+            if action.ignores_check_or_not_null() {
+                Ok(true)
+            } else {
+                // FAIL/ABORT/ROLLBACK and REPLACE all surface the
+                // violation. The deviation note in the helper docs above
+                // covers the FAIL/ROLLBACK collapse.
+                Err(err)
+            }
+        }
+    }
+}
+
 pub(super) fn insert_row_with_resolution(
     conn: &Connection,
     session: &mut SessionState,
@@ -953,7 +1038,16 @@ pub(super) fn insert_row_with_resolution(
     values.resize(table.columns.len(), SqlValue::Null);
     *values = apply_row_affinity(table, std::mem::take(values))?;
     let rowid = choose_rowid_for_insert(conn.engine(), table, values)?;
-    apply_constraints(table, values)?;
+
+    let action = conflict_action_for(conflict);
+    if apply_constraints_with_action(table, values, action)? {
+        // IGNORE swallowed a NOT NULL or CHECK violation. The row is
+        // dropped silently — no heap insert, no rowid bump beyond what
+        // `choose_rowid_for_insert` already reserved (matches SQLite,
+        // which advances the implicit rowid even for ignored rows).
+        return Ok(InsertOutcome::Ignored);
+    }
+
     let conflicts = collect_unique_conflicts(conn, session, tx, table, values, None)?;
     if conflicts.is_empty() {
         // Order: index unique-conflict check (already done above) ->
@@ -977,17 +1071,45 @@ pub(super) fn insert_row_with_resolution(
         });
     }
 
-    match conflict {
-        Some(crate::statement::InsertConflict::Sqlite(
-            crate::statement::ConflictAlgorithm::Ignore,
-        )) => Ok(InsertOutcome::Ignored),
-        Some(crate::statement::InsertConflict::Sqlite(
-            crate::statement::ConflictAlgorithm::Replace,
-        )) => {
+    apply_unique_conflict_resolution(
+        conn, session, tx, table, values, &conflicts, conflict, action, bindings,
+    )
+}
+
+/// UNIQUE / PK conflict-resolution matrix. Called only when at least one
+/// conflicting row was found. NOT NULL / CHECK violations are handled
+/// separately by `apply_constraints_with_action` because they can fire
+/// even when there is no other row to compare against.
+#[allow(clippy::too_many_arguments)]
+fn apply_unique_conflict_resolution(
+    conn: &Connection,
+    session: &mut SessionState,
+    tx: &mut Txn,
+    table: &Arc<TableDef>,
+    values: &mut Vec<SqlValue>,
+    conflicts: &[UniqueConflict],
+    conflict: Option<&crate::statement::InsertConflict>,
+    action: ConflictAction,
+    bindings: &[Option<SqlValue>],
+) -> Result<InsertOutcome> {
+    // UPSERT (`ON CONFLICT(col) DO ...`) is its own branch; `action` is
+    // ABORT for that case (we map UPSERT to ABORT in `conflict_action_for`)
+    // because the dispatch lives below.
+    if let Some(crate::statement::InsertConflict::Upsert(upsert)) = conflict {
+        return apply_upsert_branch(
+            conn, session, tx, table, values, conflicts, upsert, bindings,
+        );
+    }
+
+    match action {
+        ConflictAction::Ignore => Ok(InsertOutcome::Ignored),
+        ConflictAction::Replace => {
             // INSERT OR REPLACE: delete each conflicting heap row (and
-            // its index entries) before inserting the new tuple.
+            // its index entries) before inserting the new tuple. Note
+            // that REPLACE does NOT bypass NOT NULL/CHECK — those were
+            // already validated above.
             let mut deleted = std::collections::HashSet::new();
-            for conflict in &conflicts {
+            for conflict in conflicts {
                 if deleted.insert(conflict.rowid) {
                     let old_row =
                         load_table_row_by_rowid(conn.engine(), tx, table, conflict.rowid)?;
@@ -1021,49 +1143,54 @@ pub(super) fn insert_row_with_resolution(
                 values: values.clone(),
             })
         }
-        Some(crate::statement::InsertConflict::Upsert(upsert)) => {
-            let hit = if let Some(target) = &upsert.target {
-                conflicts
-                    .iter()
-                    .find(|conflict| unique_conflict_matches_target(conflict, target))
-            } else {
-                conflicts.first()
-            };
-            let Some(hit) = hit else {
-                return Err(Error::ConstraintViolation(format!(
-                    "UNIQUE constraint failed: {}",
-                    table.name
-                )));
-            };
-            match &upsert.action {
-                crate::statement::UpsertAction::DoNothing => Ok(InsertOutcome::Ignored),
-                crate::statement::UpsertAction::DoUpdate(update) => apply_upsert_update(
-                    UpsertUpdateContext {
-                        conn,
-                        session,
-                        tx,
-                        table,
-                        excluded: values,
-                        conflict: hit,
-                        bindings,
-                    },
-                    update,
-                ),
-            }
-        }
-        Some(crate::statement::InsertConflict::Sqlite(
-            crate::statement::ConflictAlgorithm::Abort,
-        ))
-        | Some(crate::statement::InsertConflict::Sqlite(
-            crate::statement::ConflictAlgorithm::Fail,
-        ))
-        | Some(crate::statement::InsertConflict::Sqlite(
-            crate::statement::ConflictAlgorithm::Rollback,
-        ))
-        | None => Err(Error::ConstraintViolation(format!(
+        // ABORT, FAIL and ROLLBACK all surface the violation here. See
+        // the deviation note on `conflict_action_for` — full FAIL /
+        // ROLLBACK semantics require changes outside Lane SQL-C's allowed
+        // files.
+        ConflictAction::Abort | ConflictAction::Fail | ConflictAction::Rollback => Err(
+            Error::ConstraintViolation(format!("UNIQUE constraint failed: {}", table.name)),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_upsert_branch(
+    conn: &Connection,
+    session: &mut SessionState,
+    tx: &mut Txn,
+    table: &Arc<TableDef>,
+    values: &mut Vec<SqlValue>,
+    conflicts: &[UniqueConflict],
+    upsert: &crate::statement::UpsertPlan,
+    bindings: &[Option<SqlValue>],
+) -> Result<InsertOutcome> {
+    let hit = if let Some(target) = &upsert.target {
+        conflicts
+            .iter()
+            .find(|conflict| unique_conflict_matches_target(conflict, target))
+    } else {
+        conflicts.first()
+    };
+    let Some(hit) = hit else {
+        return Err(Error::ConstraintViolation(format!(
             "UNIQUE constraint failed: {}",
             table.name
-        ))),
+        )));
+    };
+    match &upsert.action {
+        crate::statement::UpsertAction::DoNothing => Ok(InsertOutcome::Ignored),
+        crate::statement::UpsertAction::DoUpdate(update) => apply_upsert_update(
+            UpsertUpdateContext {
+                conn,
+                session,
+                tx,
+                table,
+                excluded: values,
+                conflict: hit,
+                bindings,
+            },
+            update,
+        ),
     }
 }
 
