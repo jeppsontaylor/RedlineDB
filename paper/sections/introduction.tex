@@ -48,7 +48,9 @@ intact.
 \item A SQLite-compatible C ABI shim path
 (\texttt{sqlite3.h}~$\cup$~\texttt{rldb\_*}) that allows existing
 SQLite clients to link against RedlineDB without source changes for the
-covered surface.
+covered surface, including phase-10 SAVEPOINT and multi-statement
+\texttt{prepare\_v2} / \texttt{exec} with proper \texttt{pzTail}
+handling.
 \item A deterministic crash certification protocol: 16 failpoint sites
 exercised under a fsynced-ack child-oracle harness, observing 0 lost
 acked commits across 24 scenarios.
@@ -61,6 +63,20 @@ mixed and writers-disjoint OLTP at 64 threads against SQLite 3.x
 bundled by \texttt{rusqlite}~\cite{rusqlite}, parity at 64-thread point
 reads, and a transparent accounting of the two workloads where SQLite
 still wins.
+\item A long-range capabilities layer (the phase-10 closure):
+per-entry MVCC index tags with a v1$\rightarrow$v2 migration; a
+\texttt{CommitOutcome::MaybeCommitted} signal that lets the SQL
+layer distinguish post-fsync ambiguity from rollback; a heap /
+index / page-checksum / LSN-monotonicity integrity checker exposed
+via \texttt{PRAGMA redline\_index\_check} and
+\texttt{PRAGMA redline\_full\_check}; a binary JSONB format with a
+compiled JSON-path bytecode plus SIMD key compare; the SQLite
+JSON1 surface; a native VECTOR type backing flat SIMD scan, HNSW
+(recall@10 = 0.95) and a DiskANN-style graph (recall@10 = 0.99);
+a vectorized executor with selection vectors, hash aggregation,
+top-K heap, and an external merge-sort with spill; and a
+\texttt{DatasetChecksum} for benchmark integrity that replaces the
+phase-9 \texttt{MAX(k)} / \texttt{COUNT(*)} placeholder.
 \end{enumerate}
 
 The rest of this paper is organized as follows. Section~\ref{sec:background}
