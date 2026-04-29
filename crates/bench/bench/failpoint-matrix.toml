@@ -18,6 +18,16 @@
 # maps the early return to "successful no-op flush" (i.e. fsync was
 # skipped) — that is exactly the wal-fsync-skipped scenario.
 #
+# Lane FP NOTE: revisions before phase:9/lane-fp used `action = "abort"`
+# for the kill-style cases. The `fail` crate does not recognise `abort`
+# — it returns Err — and the bench runner false-passed every case
+# because acked and recovered both ended at zero. The kill-style
+# entries are now `action = "panic"`, the original intent (panic on a
+# background or foreground thread, the child's panic hook then aborts
+# the process so the parent sees a non-zero exit). The kernel `cfg`
+# wrapper now validates against the fail grammar so `abort` would be
+# rejected loudly at the configuration boundary.
+#
 # The child's ack log is `sync_all()`'d after every entry (and after
 # initial creation, including a parent-directory fsync) so the
 # `read_ack_count` oracle is durable across a crash. Without that, the
@@ -51,7 +61,7 @@ kill_after_n_hits = [1, 5, 25]
 [[cases]]
 name = "commit-publish-kill"
 failpoint = "engine::commit::before_publish"
-action = "abort"
+action = "panic"
 durabilities = ["strict", "normal"]
 rows = 1024
 kill_after_n_hits = [1, 5, 25]
@@ -59,7 +69,7 @@ kill_after_n_hits = [1, 5, 25]
 [[cases]]
 name = "heap-mutation-kill"
 failpoint = "heap::mutation"
-action = "abort"
+action = "panic"
 durabilities = ["strict"]
 rows = 1024
 kill_after_n_hits = [1, 5, 25]
@@ -67,7 +77,7 @@ kill_after_n_hits = [1, 5, 25]
 [[cases]]
 name = "index-insert-kill"
 failpoint = "index::insert"
-action = "abort"
+action = "panic"
 durabilities = ["strict"]
 rows = 1024
 kill_after_n_hits = [1, 5, 25]
@@ -75,7 +85,7 @@ kill_after_n_hits = [1, 5, 25]
 [[cases]]
 name = "catalog-rename-kill"
 failpoint = "catalog::save::rename"
-action = "abort"
+action = "panic"
 durabilities = ["strict"]
 rows = 64
 kill_after_n_hits = [1]
@@ -83,7 +93,7 @@ kill_after_n_hits = [1]
 [[cases]]
 name = "checkpoint-kill"
 failpoint = "engine::checkpoint"
-action = "abort"
+action = "panic"
 durabilities = ["strict"]
 rows = 1024
 kill_after_n_hits = [1, 3]
