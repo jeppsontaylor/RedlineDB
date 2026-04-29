@@ -247,6 +247,76 @@ Wave 6 artifact SHA-256:
 - `target/bench/wave6-certify-smoke/summary.csv` — `0c8bc178fb615a6661d5e1341a699a5336a46af6d3cb39ce0ce7296fb49f9c8f`
 - `target/bench/wave6-certify-smoke/report.md` — `60fe4d2a4347cedc023e453aba41bfb6fd66fc4982197f9fa224064dfa6fc03e`
 
+## Phase 9 Wave 7 Fusion (3 reviewer pass-2 lanes KH + FP + BH)
+
+Wave 7 addresses the reviewer's 7 pass-2 findings (3 P0 + 4 P1). Three parallel agents landed in lane-kh, lane-fp, lane-bh; all merged into main and tagged `wave7-fused` (alias `phase9-fusion-green-v3`).
+
+### Lane KH (kernel + SQL correctness — P0 #3, P1 #5, P1 #6)
+
+4 commits:
+
+- `fe81db3 phase:9/lane-kh/commit-failure-rollback: replay index undo on commit error`
+- `9570d57 phase:9/lane-kh/planner-requires-live-handle: gate try_match_index_access`
+- `7f4e989 phase:9/lane-kh/range-scan-early-term: bail when leaf's last key >= end`
+- `d3fcc95 phase:9/lane-kh/tests: regression coverage for the three Wave 7 fixes`
+
+P0 #3: `Connection::commit` and the implicit-write-tx path no longer clear `index_undo` before checking `engine.commit(tx)` success; on `Err` we replay the inverse against a fresh tx so heap and indexes stay consistent. Three new tests cover commit-failure rollback, planner not advertising index without live handle, and range-scan early termination.
+
+### Lane FP (failpoint matrix correctness — P0 #2)
+
+5 commits:
+
+- `533ba73 phase:9/lane-fp/validate-action: reject unknown tokens at cfg boundary`
+- `78c1e04 phase:9/lane-fp/toml-action-panic: replace abort with panic in matrix TOML`
+- `94f7c9d phase:9/lane-fp/expect-exit-gate: gate matrix on real expectations`
+- `f04ccc0 chore(fmt): apply rustfmt to lane-fp validate_action test`
+- `f4aae55 phase:9/lane-fp/tests: synthetic verdict tests + counted-skip kernel hook`
+
+`failpoints::cfg` validates the action against the `fail` 0.5.x grammar (`off|return|sleep|panic|print|pause|yield|delay`, optional `freq%` / `count*` prefix); rejects `abort` etc. with a clear error. Matrix gate is now three independent clauses: `expect_child_exit` (default `non-zero`), `expect_zero_acks` (default `false`, anti-vacuous-oracle), and `lost_acked_commits == 0`. Each run carries a `pass_reason` so the verdict is auditable. `cfg_skip_then_panic(skip = K-1)` gives `kill_after_n_hits > 1` real semantics. 4 new tests.
+
+### Lane BH (bench harness parallelism + telemetry — P0 #1, P1 #4, P1 #7)
+
+5 commits:
+
+- `9f5f466 phase:9/lane-bh/git-env-passthrough: surface host git state on remote runs`
+- `e4cd4c8 phase:9/lane-bh/fetch-path-fix: rsync from xbabe1 prefix`
+- `30bfbbd phase:9/lane-bh/telemetry: recursive data_bytes, fsync counters, connection-limit`
+- `0424ce5 phase:9/lane-bh/parallel-scheduler: bin-pack certify children + warmup + full latency CSV`
+- `7ed01a8 phase:9/lane-bh/tests: 6 regression tests for the Wave 7 fixes`
+
+**The big one — bin-packing parallel certify scheduler.** Reserves 4 cores for OS, dispatches children whose `--threads` ≤ remaining core budget. 64 jobs of 1s each finish in 7.40s on a 14-core box (vs 64s serial); on xbabe1's 128 cores the cert matrix collapses from days to ~30-60min. Plus real warmup accounting (was parsed but ignored), git SHA/dirty via env passthrough into Docker, fetch-path fix, recursive `data_bytes` walk of `.redline` dir, populated WAL fsync/fdatasync/pwrite counters via `WalSyncCounters`, p50/p95/max in summary.csv, new `connection-limit` workload (binary search for max stable concurrent connections). 6 new tests + 1 inline `redline_data_bytes_recursive`.
+
+### Wave 7 follow-up: recover-matrix verify wipes data
+
+Two latent bugs surfaced during Wave 7 fusion:
+
+1. `RedlineEngine::open` used `OpenOptions::default()` which has `create: true`. When `verify_recovered` re-opened an existing `bench.redline`, the facade routed through `Database::create` and re-initialised the page file. Fixed: detect existing dir and force `options.create = false`.
+2. A child killed before its CREATE TABLE durably committed left no `crash_progress` table. `verify_recovered` now treats "table not found" / "no such table" / "missing database" as 0 recovered (matches the failpoint matrix verify path).
+
+After both fixes, recover-matrix reports **36/36 PASS** (was 24/36 in Wave 6).
+
+### Wave 7 post-fusion proof matrix
+
+- `cargo fmt --check` — green
+- `./scripts/check_file_sizes.sh` — green (3 warnings; index/mod 1661, exec.rs 1604, sql_smoke 1794; all under 2000 cap)
+- `cargo check --workspace --locked` — green
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
+- `cargo test --workspace --quiet --locked` — `241 passed, 1 ignored (32 suites, 18.63s)` (222 → 241, +19 new tests across the three lanes)
+- `cargo test --workspace --features failpoints --quiet --locked` — 242 passed, 1 ignored
+- `cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7 --out target/bench/wave7-compat.json` — `{"files":3,"cases":40,"failures":[]}`
+- `cargo run -p redlinedb-bench -- recover-matrix --config crates/bench/bench/recovery-matrix.toml --out target/bench/wave7-recovery.json --seed 7` — exit 0, **36/36 PASS** (vs 24/36 in Wave 6)
+- `cargo run -p redlinedb-bench -- failpoint-matrix --config crates/bench/bench/failpoint-matrix.toml --out target/bench/wave7-failpoint.json --seed 7` — exit 0, **24/24 cases passed for the right reasons** (verbatim actions, expect-exit gate, no false-passing)
+- `cargo run -p redlinedb-bench -- certify --config crates/bench/bench/smoke.toml --out-dir target/bench/wave7-certify-smoke --seed 7 --repetitions 1 --warmup 1` — exit 0; manifest now contains `git_sha`, `git_dirty`, `warmup_runs_per_combo`, `measured_runs_per_combo`, recursive `data_bytes`, populated `fdatasync_count`/`pwrite_count`, p50/p95/max in summary.csv
+
+Wave 7 artifact SHA-256:
+- `target/bench/wave7-compat.json` — `ee812460f3f08b55b323b6bc63c461f99551177b4db64b7dd106289179f0f91e`
+- `target/bench/wave7-recovery.json` — `7d5792dd1a3db7cbc6d1cb9036cdc1713b65b95b1d1f022bc9ff8a5062341959`
+- `target/bench/wave7-failpoint.json` — `c7f99fe1636dae52d398a4aad34b241295a6555cd9c7994746e4b18b14a9534b`
+- `target/bench/wave7-certify-smoke/manifest.json` — `33ffcaf31fc04b10fe61d13940a5cf97f602318360bd985bd10bcda22b0a4592`
+- `target/bench/wave7-certify-smoke/runs.jsonl` — `41d58c683555f05bbca1898bdb5b1df15e89849ca6a72832a730ff1285d48939`
+- `target/bench/wave7-certify-smoke/summary.csv` — `a45c5f6827ffe6be09ff6d7744f477100f268fd62313d4a216aca118e74f34d8`
+- `target/bench/wave7-certify-smoke/report.md` — `d5c2f66e0f089f97ce8650cc173d5e12129b1e9ea8001a0b0530294ec4c167e6`
+
 ## Verified Proof
 
 These commands passed in the current workspace:
