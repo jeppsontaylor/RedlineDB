@@ -165,7 +165,8 @@ impl PageBackedHeap {
         payload: Vec<u8>,
         lsn: Lsn,
     ) -> Result<()> {
-        let current = self.visible_tuple_for_write(tx_id, snapshot, tx_status, target.row_id)?;
+        let current =
+            self.visible_tuple_for_write_in_relation(tx_id, snapshot, tx_status, target)?;
         self.append_update_version(tx_id, target.rel_id, target.row_id, payload, current, lsn)
     }
 
@@ -182,7 +183,7 @@ impl PageBackedHeap {
         row_id: RowId,
         payload: Vec<u8>,
     ) -> Result<()> {
-        let current = self.current_tuple(row_id)?;
+        let current = self.current_tuple_for_relation(rel_id, row_id)?;
         // LSN sentinel: legit init. Recovery replay; no fresh WAL record.
         self.append_update_version(tx_id, rel_id, row_id, payload, current, Lsn::ZERO)
     }
@@ -208,7 +209,12 @@ impl PageBackedHeap {
         row_id: RowId,
         lsn: Lsn,
     ) -> Result<()> {
-        let current = self.visible_tuple_for_write(tx_id, snapshot, tx_status, row_id)?;
+        let current = self.visible_tuple_for_write_in_relation(
+            tx_id,
+            snapshot,
+            tx_status,
+            RelationWriteTarget { rel_id, row_id },
+        )?;
         self.append_delete_version(tx_id, rel_id, row_id, current, lsn)
     }
 
@@ -224,7 +230,7 @@ impl PageBackedHeap {
         rel_id: RelId,
         row_id: RowId,
     ) -> Result<()> {
-        let current = self.current_tuple(row_id)?;
+        let current = self.current_tuple_for_relation(rel_id, row_id)?;
         // LSN sentinel: legit init. Recovery replay; no fresh WAL record.
         self.append_delete_version(tx_id, rel_id, row_id, current, Lsn::ZERO)
     }
@@ -299,11 +305,11 @@ impl PageBackedHeap {
             oldest_active_snapshot_csn: horizon,
             ..VacuumStats::default()
         };
-        let rows = self.row_directory_entries()?;
+        let rows = self.all_relation_entries()?;
         stats.rows_scanned = rows.len();
 
-        for (row_id, ptr) in rows {
-            self.vacuum_row(row_id, ptr, horizon, tx_status, &mut stats)?;
+        for (rel_id, row_id, ptr) in rows {
+            self.vacuum_row(rel_id, row_id, ptr, horizon, tx_status, &mut stats)?;
         }
 
         Ok(stats)
@@ -600,7 +606,28 @@ impl PageBackedHeap {
         tx_status: &ConcurrentTxStatus,
         row_id: RowId,
     ) -> Result<TupleVersion> {
-        let current = self.current_tuple(row_id)?;
+        let current = self.current_tuple_for_relation(self.rel_id, row_id)?;
+        self.visible_current_tuple_for_write(tx_id, snapshot, tx_status, current)
+    }
+
+    fn visible_tuple_for_write_in_relation(
+        &self,
+        tx_id: TxId,
+        snapshot: &Snapshot,
+        tx_status: &ConcurrentTxStatus,
+        target: RelationWriteTarget,
+    ) -> Result<TupleVersion> {
+        let current = self.current_tuple_for_relation(target.rel_id, target.row_id)?;
+        self.visible_current_tuple_for_write(tx_id, snapshot, tx_status, current)
+    }
+
+    fn visible_current_tuple_for_write(
+        &self,
+        tx_id: TxId,
+        snapshot: &Snapshot,
+        tx_status: &ConcurrentTxStatus,
+        current: TupleVersion,
+    ) -> Result<TupleVersion> {
         match current.visibility_concurrent(tx_status, snapshot, Some(tx_id)) {
             TupleVisibility::Visible => return Ok(current),
             TupleVisibility::Deleted => return Err(Error::NotVisible),
@@ -626,9 +653,20 @@ impl PageBackedHeap {
     }
 
     fn current_tuple(&self, row_id: RowId) -> Result<TupleVersion> {
+        self.current_tuple_for_relation(self.rel_id, row_id)
+    }
+
+    fn current_tuple_for_relation(&self, rel_id: RelId, row_id: RowId) -> Result<TupleVersion> {
+        let rel_id = if rel_id == RelId::ZERO {
+            self.rel_id
+        } else {
+            rel_id
+        };
         let ptr = self
-            .head(row_id)?
-            .ok_or(Error::CorruptPage("row id missing from row directory"))?;
+            .head_for_relation(rel_id, row_id)?
+            .ok_or(Error::CorruptPage(
+                "row id missing from relation row directory",
+            ))?;
         self.read_tuple(ptr)
     }
 
@@ -724,6 +762,19 @@ impl PageBackedHeap {
         Ok(rows)
     }
 
+    fn all_relation_entries(&self) -> Result<Vec<(RelId, RowId, TuplePtr)>> {
+        let mut rows = Vec::new();
+        for shard in &self.relation_row_dir {
+            let shard = shard
+                .read()
+                .map_err(|_| Error::CorruptPage("relation row dir shard poisoned"))?;
+            for (rel_id, entries) in shard.iter() {
+                rows.extend(entries.iter().map(|(row_id, ptr)| (*rel_id, *row_id, *ptr)));
+            }
+        }
+        Ok(rows)
+    }
+
     fn set_head(&self, row_id: RowId, ptr: TuplePtr) -> Result<()> {
         let shard = self.row_dir_shard(row_id);
         let mut shard = shard
@@ -779,13 +830,14 @@ impl PageBackedHeap {
 
     fn vacuum_row(
         &self,
+        rel_id: RelId,
         row_id: RowId,
         ptr: TuplePtr,
         horizon: Csn,
         tx_status: &ConcurrentTxStatus,
         stats: &mut VacuumStats,
     ) -> Result<()> {
-        if self.head(row_id)? != Some(ptr) {
+        if self.head_for_relation(rel_id, row_id)? != Some(ptr) {
             return Ok(());
         }
 
@@ -800,10 +852,8 @@ impl PageBackedHeap {
             } else {
                 current.rel_id
             };
-            if current_csn < horizon
-                && self.remove_head_if(row_id, ptr)?
-                && self.remove_relation_head_if(rel_id, row_id, ptr)?
-            {
+            if current_csn < horizon && self.remove_relation_head_if(rel_id, row_id, ptr)? {
+                let _ = self.remove_head_if(row_id, ptr)?;
                 stats.dead_rows_removed += 1;
                 if self.page_has_no_heads(ptr.page_id)? {
                     self.mark_page_reusable(ptr.page_id, PageKind::Heap)?;
@@ -820,7 +870,7 @@ impl PageBackedHeap {
         if removable == 0 {
             return Ok(());
         }
-        if self.head(row_id)? != Some(ptr) {
+        if self.head_for_relation(rel_id, row_id)? != Some(ptr) {
             return Ok(());
         }
 
@@ -875,11 +925,14 @@ impl PageBackedHeap {
     }
 
     fn page_has_no_heads(&self, page_id: PageId) -> Result<bool> {
-        for shard in &self.row_dir {
+        for shard in &self.relation_row_dir {
             let shard = shard
                 .read()
-                .map_err(|_| Error::CorruptPage("row dir shard poisoned"))?;
-            if shard.values().any(|ptr| ptr.page_id == page_id) {
+                .map_err(|_| Error::CorruptPage("relation row dir shard poisoned"))?;
+            if shard
+                .values()
+                .any(|entries| entries.values().any(|ptr| ptr.page_id == page_id))
+            {
                 return Ok(false);
             }
         }

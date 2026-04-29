@@ -294,10 +294,14 @@ impl BtreeIndex {
                 },
             )
         })?;
-        // LSN sentinel: mutation. Index-create writes the meta page; the page
-        // image is logged separately so any non-zero LSN works as a "dirty"
-        // marker.
-        meta_guard.mark_dirty(crate::format::Lsn(1))?;
+        // Keep newly-created WAL-backed index pages unflushable until the
+        // create path records real page images for the DDL transaction.
+        let create_lsn = if wal.is_some() {
+            crate::format::Lsn(u64::MAX)
+        } else {
+            crate::format::Lsn(1)
+        };
+        meta_guard.mark_dirty(create_lsn)?;
         root_guard.with_page_mut(|page| {
             page.reinitialize_with_special(
                 PageKind::BtreeLeaf,
@@ -318,8 +322,7 @@ impl BtreeIndex {
                 },
             )
         })?;
-        // LSN sentinel: mutation. Index-create writes the empty leaf root.
-        root_guard.mark_dirty(crate::format::Lsn(1))?;
+        root_guard.mark_dirty(create_lsn)?;
 
         Ok(Self {
             inner: Arc::new(IndexInner {
@@ -454,9 +457,6 @@ impl BtreeIndex {
             // (mark_dirty + record_page_image). A crash here proves the index
             // entry is either fully reflected post-recovery or absent.
             crate::fail_point!("index::insert");
-            // LSN sentinel: mutation. Leaf insert path; record_page_image logs
-            // the post-image, so any non-zero LSN is fine as the dirty marker.
-            guard.mark_dirty(crate::format::Lsn(1))?;
             self.record_page_image(leaf_id, tx_id)?;
             return Ok(());
         }
@@ -566,8 +566,6 @@ impl BtreeIndex {
                 // verifies that recovery either restores the entry (if pre-fsync)
                 // or surfaces the tombstone (if post-fsync) but never both.
                 crate::fail_point!("index::delete");
-                // LSN sentinel: mutation. Leaf delete-mark path.
-                guard.mark_dirty(crate::format::Lsn(1))?;
                 self.record_page_image(leaf_id, tx_id)?;
                 return Ok(());
             }
@@ -633,21 +631,22 @@ impl BtreeIndex {
     }
 
     fn record_page_image(&self, page_id: PageId, tx_id: crate::format::TxId) -> Result<()> {
+        let guard = self.inner.buffer.pin(page_id)?;
         if tx_id == crate::format::TxId::ZERO {
-            return Ok(());
+            return guard.mark_dirty(crate::format::Lsn(1));
         }
         let Some(wal) = &self.inner.wal else {
-            return Ok(());
+            return guard.mark_dirty(crate::format::Lsn(1));
         };
-        let guard = self.inner.buffer.pin(page_id)?;
-        let page = guard.with_page(|page| Ok(page.clone()))?;
+        let mut page = guard.with_page(|page| Ok(page.clone()))?;
+        page.set_page_lsn(crate::format::Lsn::ZERO)?;
         let payload = WalPayload::PageImage {
             page_id,
-            page_lsn: page.header()?.page_lsn,
+            page_lsn: crate::format::Lsn::ZERO,
             page_bytes: page.as_bytes().to_vec(),
         };
-        wal.append(WalRecordKind::PageImage, tx_id, payload.encode()?)?;
-        Ok(())
+        let append = wal.append(WalRecordKind::PageImage, tx_id, payload.encode()?)?;
+        guard.mark_dirty(append.end_lsn)
     }
 
     pub fn point_lookup(&self, logical_key: &[u8]) -> Result<Vec<IndexRowRef>> {
@@ -906,9 +905,6 @@ impl BtreeIndex {
                 header.high_key.clone(),
             )
         })?;
-        // LSN sentinel: mutation. Leaf split rewrites left, right pages.
-        guard.mark_dirty(crate::format::Lsn(1))?;
-        right_guard.mark_dirty(crate::format::Lsn(1))?;
         self.record_page_image(leaf_id, tx_id)?;
         self.record_page_image(right_guard.page_id(), tx_id)?;
 
@@ -969,8 +965,6 @@ impl BtreeIndex {
                             header.high_key.clone(),
                         )
                     })?;
-                    // LSN sentinel: mutation. Parent absorbed the split entry.
-                    guard.mark_dirty(crate::format::Lsn(1))?;
                     self.record_page_image(parent_id, tx_id)?;
                     return Ok(());
                 }
@@ -1020,9 +1014,6 @@ impl BtreeIndex {
                         header.high_key.clone(),
                     )
                 })?;
-                // LSN sentinel: mutation. Internal split rewrites both halves.
-                guard.mark_dirty(crate::format::Lsn(1))?;
-                right_guard.mark_dirty(crate::format::Lsn(1))?;
                 self.record_page_image(parent_id, tx_id)?;
                 self.record_page_image(right_guard.page_id(), tx_id)?;
                 current_left = parent_id;
@@ -1070,10 +1061,8 @@ impl BtreeIndex {
                     Vec::new(),
                 )
             })?;
-            // LSN sentinel: mutation. New root page promoted from split.
-            root_guard.mark_dirty(crate::format::Lsn(1))?;
             self.record_page_image(root_guard.page_id(), tx_id)?;
-            self.set_meta_root(root_guard.page_id(), left_level)?;
+            self.set_meta_root(root_guard.page_id(), left_level, tx_id)?;
             return Ok(());
         }
     }
@@ -1232,7 +1221,12 @@ impl BtreeIndex {
         guard.with_page(Self::read_meta)
     }
 
-    fn set_meta_root(&self, root_page_id: PageId, root_level: u16) -> Result<()> {
+    fn set_meta_root(
+        &self,
+        root_page_id: PageId,
+        root_level: u16,
+        tx_id: crate::format::TxId,
+    ) -> Result<()> {
         let guard = self.inner.buffer.pin(self.inner.meta_page_id)?;
         guard.with_page_mut(|page| {
             let mut meta = Self::read_meta(page)?;
@@ -1240,9 +1234,7 @@ impl BtreeIndex {
             meta.root_level = root_level;
             Self::write_meta(page, &meta)
         })?;
-        // LSN sentinel: mutation. Meta page root pointer updated after split.
-        guard.mark_dirty(crate::format::Lsn(1))?;
-        Ok(())
+        self.record_page_image(self.inner.meta_page_id, tx_id)
     }
 
     fn read_entries(&self, page: &Page) -> Result<Vec<Entry>> {

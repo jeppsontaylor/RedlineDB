@@ -1,10 +1,10 @@
 use redlinedb_kernel::Error;
 use redlinedb_kernel::catalog::{
     ColumnConstraintSpec, ColumnSpec, ConflictAction, CreateIndexSpec, CreateTableSpec, DbName,
-    IndexColumnSpec, IndexOrigin, QualifiedName, SchemaId, SortDir,
+    IndexColumnSpec, IndexOrigin, QualifiedName, SchemaId, SortDir, ValueRef, encode_record,
 };
 use redlinedb_kernel::engine::{Engine, EngineConfig};
-use redlinedb_kernel::format::{Csn, RelId};
+use redlinedb_kernel::format::{Csn, RelId, RowId};
 use redlinedb_kernel::txn::{Isolation, TxState};
 use redlinedb_kernel::wal::{WalConfig, WalPayload, WalReader, WalRecordKind};
 use std::sync::{Arc, Barrier};
@@ -98,6 +98,73 @@ fn engine_heap_pages_do_not_flush_before_wal_is_durable() {
 }
 
 #[test]
+fn uncommitted_index_pages_do_not_flush_before_wal_is_durable() {
+    let (_temp, engine) = test_engine();
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    let table = engine
+        .create_table(
+            &mut tx,
+            CreateTableSpec {
+                schema: None,
+                name: DbName::new("t"),
+                if_not_exists: false,
+                columns: vec![ColumnSpec {
+                    name: DbName::new("v"),
+                    declared_type: Some("TEXT".to_owned()),
+                    constraints: vec![],
+                    collation: None,
+                    default_value: None,
+                }],
+                constraints: vec![],
+                strict: false,
+                without_rowid: false,
+                normalized_sql: Some("CREATE TABLE t(v TEXT)".to_owned()),
+            },
+        )
+        .unwrap();
+    engine.commit(tx).unwrap();
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    let row = engine.reserve_row_id();
+    let mut payload = Vec::new();
+    encode_record(&[ValueRef::Text("alpha")], &mut payload).unwrap();
+    engine
+        .insert_for_relation(&mut tx, table.relation_id, row, payload)
+        .unwrap();
+    engine.commit(tx).unwrap();
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    engine
+        .create_index(
+            &mut tx,
+            CreateIndexSpec {
+                schema: None,
+                name: DbName::new("ix_t_v"),
+                table: QualifiedName {
+                    schema: DbName::new("main"),
+                    name: DbName::new("t"),
+                },
+                unique: false,
+                columns: vec![IndexColumnSpec {
+                    name: DbName::new("v"),
+                    sort_dir: SortDir::Asc,
+                    collation: None,
+                }],
+                origin: IndexOrigin::User,
+                normalized_sql: Some("CREATE INDEX ix_t_v ON t(v)".to_owned()),
+            },
+        )
+        .unwrap();
+
+    let err = engine.flush_heap_pages().unwrap_err();
+    assert_eq!(
+        err,
+        Error::CorruptPage("dirty page lsn exceeds durable wal lsn")
+    );
+    engine.rollback(tx).unwrap();
+}
+
+#[test]
 fn committed_insert_becomes_visible_only_after_commit() {
     let (_temp, engine) = test_engine();
     let mut writer = engine.begin(Isolation::Snapshot).unwrap();
@@ -151,6 +218,59 @@ fn rollback_insert_update_and_delete_remain_invisible() {
         engine.get(&mut observer, row).unwrap(),
         Some(b"live".to_vec())
     );
+}
+
+#[test]
+fn same_rowid_in_different_relations_survives_update_delete_rollback_and_vacuum() {
+    let (_temp, engine) = test_engine();
+    let rel_a = RelId(21);
+    let rel_b = RelId(22);
+    let row = RowId(100);
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    engine
+        .insert_for_relation(&mut tx, rel_a, row, b"a0".to_vec())
+        .unwrap();
+    engine
+        .insert_for_relation(&mut tx, rel_b, row, b"b0".to_vec())
+        .unwrap();
+    engine.commit(tx).unwrap();
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    engine
+        .update_for_relation(&mut tx, rel_a, row, b"a1".to_vec())
+        .unwrap();
+    engine.delete_for_relation(&mut tx, rel_b, row).unwrap();
+    engine.rollback(tx).unwrap();
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    assert_eq!(
+        engine.get_for_relation(&mut tx, rel_a, row).unwrap(),
+        Some(b"a0".to_vec())
+    );
+    assert_eq!(
+        engine.get_for_relation(&mut tx, rel_b, row).unwrap(),
+        Some(b"b0".to_vec())
+    );
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    engine
+        .update_for_relation(&mut tx, rel_a, row, b"a2".to_vec())
+        .unwrap();
+    engine.delete_for_relation(&mut tx, rel_b, row).unwrap();
+    let delete_csn = engine.commit(tx).unwrap();
+
+    let retained = engine.vacuum_with_horizon(delete_csn).unwrap();
+    assert_eq!(retained.dead_rows_removed, 0);
+    let removed = engine.vacuum_with_horizon(Csn(delete_csn.0 + 1)).unwrap();
+    assert_eq!(removed.dead_rows_removed, 1);
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    assert_eq!(
+        engine.get_for_relation(&mut tx, rel_a, row).unwrap(),
+        Some(b"a2".to_vec())
+    );
+    assert_eq!(engine.get_for_relation(&mut tx, rel_b, row).unwrap(), None);
 }
 
 #[test]

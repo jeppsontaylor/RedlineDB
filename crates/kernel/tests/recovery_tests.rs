@@ -1,6 +1,6 @@
 use redlinedb_kernel::Error;
 use redlinedb_kernel::engine::{Engine, EngineConfig};
-use redlinedb_kernel::format::{Csn, RelId};
+use redlinedb_kernel::format::{Csn, RelId, RowId};
 use redlinedb_kernel::txn::Isolation;
 use redlinedb_kernel::wal::{WalConfig, WalPayload};
 use std::fs::OpenOptions;
@@ -98,6 +98,43 @@ fn committed_update_and_delete_survive_open() {
         Some(b"new".to_vec())
     );
     assert_eq!(reopened.get(&mut tx, deleted).unwrap(), None);
+}
+
+#[test]
+fn same_rowid_relation_update_and_delete_survive_recovery() {
+    let temp = TempDir::new().unwrap();
+    let engine = Engine::create(temp.path(), config()).unwrap();
+    let rel_a = RelId(31);
+    let rel_b = RelId(32);
+    let row = RowId(9);
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    engine
+        .insert_for_relation(&mut tx, rel_a, row, b"a0".to_vec())
+        .unwrap();
+    engine
+        .insert_for_relation(&mut tx, rel_b, row, b"b0".to_vec())
+        .unwrap();
+    engine.commit(tx).unwrap();
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    engine
+        .update_for_relation(&mut tx, rel_a, row, b"a1".to_vec())
+        .unwrap();
+    engine.delete_for_relation(&mut tx, rel_b, row).unwrap();
+    engine.commit(tx).unwrap();
+    drop(engine);
+
+    let reopened = Engine::open(temp.path(), config()).unwrap();
+    let mut tx = reopened.begin(Isolation::Snapshot).unwrap();
+    assert_eq!(
+        reopened.get_for_relation(&mut tx, rel_a, row).unwrap(),
+        Some(b"a1".to_vec())
+    );
+    assert_eq!(
+        reopened.get_for_relation(&mut tx, rel_b, row).unwrap(),
+        None
+    );
 }
 
 #[test]

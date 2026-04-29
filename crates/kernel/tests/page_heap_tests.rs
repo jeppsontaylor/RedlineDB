@@ -1,6 +1,6 @@
-use redlinedb_kernel::engine::page_heap::PageBackedHeap;
+use redlinedb_kernel::engine::page_heap::{PageBackedHeap, RelationWriteTarget};
 use redlinedb_kernel::engine::tx::ConcurrentTxStatus;
-use redlinedb_kernel::format::{Csn, Lsn, RelId};
+use redlinedb_kernel::format::{Csn, Lsn, RelId, RowId};
 use redlinedb_kernel::storage::{BufferPool, PageFile};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -88,6 +88,55 @@ fn page_backed_heap_delete_keeps_old_snapshot_visible() {
         Some(b"live".to_vec())
     );
     assert_eq!(heap.get(&txs, &new_snapshot, None, row).unwrap(), None);
+}
+
+#[test]
+fn page_backed_heap_relation_writes_are_keyed_by_relation_and_rowid() {
+    let (_temp, heap, txs) = page_heap();
+    let rel_a = RelId(11);
+    let rel_b = RelId(12);
+    let row = RowId(7);
+
+    let tx = txs.begin();
+    heap.insert_for_relation(tx, rel_a, row, b"a0".to_vec(), Lsn(10))
+        .unwrap();
+    heap.insert_for_relation(tx, rel_b, row, b"b0".to_vec(), Lsn(11))
+        .unwrap();
+    let csn = txs.reserve_csn();
+    txs.publish_commit(tx, csn);
+
+    let tx = txs.begin();
+    heap.update_for_relation(
+        tx,
+        &txs.snapshot(),
+        &txs,
+        RelationWriteTarget {
+            rel_id: rel_a,
+            row_id: row,
+        },
+        b"a1".to_vec(),
+        Lsn(20),
+    )
+    .unwrap();
+    let csn = txs.reserve_csn();
+    txs.publish_commit(tx, csn);
+
+    let tx = txs.begin();
+    heap.delete_for_relation(tx, &txs.snapshot(), &txs, rel_b, row, Lsn(30))
+        .unwrap();
+    txs.abort(tx);
+
+    let snapshot = txs.snapshot();
+    assert_eq!(
+        heap.get_for_relation(&txs, &snapshot, None, rel_a, row)
+            .unwrap(),
+        Some(b"a1".to_vec())
+    );
+    assert_eq!(
+        heap.get_for_relation(&txs, &snapshot, None, rel_b, row)
+            .unwrap(),
+        Some(b"b0".to_vec())
+    );
 }
 
 #[test]
