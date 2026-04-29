@@ -436,9 +436,16 @@ fn eval_binary(
             },
         )?,
         BinaryOperator::Eq => compare_binary(left_value, right_value, |o| o == Ordering::Equal)?,
-        BinaryOperator::NotEq | BinaryOperator::Spaceship => {
-            compare_binary(left_value, right_value, |o| o != Ordering::Equal)?
-        }
+        // Phase-10 Lane V1: pgvector borrows `<=>` for cosine distance. We
+        // overload it the same way: if BOTH operands decode as vector blobs,
+        // emit `vector_distance_cosine`. Otherwise we fall back to the
+        // historical SQLite-flavoured null-safe inequality so we don't break
+        // existing comparison tests. (See `vector_pair_or_compare`.)
+        BinaryOperator::Spaceship => match try_vector_pair(&left_value, &right_value) {
+            Some((a, b)) => vector_distance_to_value(VectorOpMetric::Cosine, &a, &b)?,
+            None => compare_binary(left_value, right_value, |o| o != Ordering::Equal)?,
+        },
+        BinaryOperator::NotEq => compare_binary(left_value, right_value, |o| o != Ordering::Equal)?,
         BinaryOperator::Gt => compare_binary(left_value, right_value, |o| o == Ordering::Greater)?,
         BinaryOperator::GtEq => compare_binary(left_value, right_value, |o| o != Ordering::Less)?,
         BinaryOperator::Lt => compare_binary(left_value, right_value, |o| o == Ordering::Less)?,
@@ -1012,11 +1019,6 @@ fn eval_function(
             }
         }
         "round" => round_function(&values),
-        "vector" => vector_blob(&values),
-        "vector_from_json" => vector_from_json(&values),
-        "vector_dims" => vector_dims(&values),
-        "vector_distance_l2" => vector_distance_l2(&values),
-        "vector_distance_cosine" => vector_distance_cosine(&values),
         "hex" => match values.first() {
             Some(SqlValue::Null) | None => Ok(SqlValue::Null),
             Some(other) => Ok(SqlValue::Text(Arc::from(hex_value(other)))),
@@ -1054,135 +1056,104 @@ fn eval_function(
         "json_valid" => crate::json::scalar::json_valid(&values),
         "json_quote" => crate::json::scalar::json_quote(&values),
         "json_minify" => crate::json::scalar::json_minify(&values),
+        "vector" | "vector_blob" | "vector_from_json" => {
+            let arg = values.first().unwrap_or(&SqlValue::Null);
+            vector_construct_from_value(arg)
+        }
+        "vector_dims" => {
+            let arg = values.first().unwrap_or(&SqlValue::Null);
+            vector_dims_value(arg)
+        }
+        "vector_distance_l2" => vector_pair_distance(&values, VectorOpMetric::L2),
+        "vector_distance_cosine" => vector_pair_distance(&values, VectorOpMetric::Cosine),
+        "vector_distance_ip" => vector_pair_distance(&values, VectorOpMetric::InnerProduct),
         _ => Err(Error::UnsupportedSql(format!(
             "unsupported function {name}"
         ))),
     }
 }
 
-
-const VECTOR_MAGIC: &[u8; 4] = b"RLV1";
-
-fn vector_blob(values: &[SqlValue]) -> Result<SqlValue> {
-    let floats = values
-        .iter()
-        .map(sql_value_to_f32)
-        .collect::<Result<Vec<_>>>()?;
-    encode_vector(&floats)
+#[derive(Copy, Clone)]
+pub(crate) enum VectorOpMetric {
+    L2,
+    Cosine,
+    InnerProduct,
 }
 
-fn vector_from_json(values: &[SqlValue]) -> Result<SqlValue> {
-    let value = values
-        .first()
-        .ok_or_else(|| Error::UnsupportedSql("vector_from_json requires 1 arg".to_owned()))?;
-    if matches!(value, SqlValue::Null) {
-        return Ok(SqlValue::Null);
+impl From<VectorOpMetric> for redlinedb_kernel::vector::VectorMetric {
+    fn from(m: VectorOpMetric) -> Self {
+        match m {
+            VectorOpMetric::L2 => Self::L2,
+            VectorOpMetric::Cosine => Self::Cosine,
+            VectorOpMetric::InnerProduct => Self::InnerProduct,
+        }
     }
-    let json: serde_json::Value =
-        serde_json::from_str(&value_to_string(value)).map_err(|_| Error::DatatypeMismatch)?;
-    let serde_json::Value::Array(items) = json else {
-        return Err(Error::DatatypeMismatch);
-    };
-    let mut floats = Vec::with_capacity(items.len());
-    for item in items {
-        let Some(value) = item.as_f64() else {
-            return Err(Error::DatatypeMismatch);
-        };
-        floats.push(value as f32);
-    }
-    encode_vector(&floats)
 }
 
-fn vector_dims(values: &[SqlValue]) -> Result<SqlValue> {
-    let vector = values
-        .first()
-        .ok_or_else(|| Error::UnsupportedSql("vector_dims requires 1 arg".to_owned()))?;
-    if matches!(vector, SqlValue::Null) {
-        return Ok(SqlValue::Null);
-    }
-    Ok(SqlValue::Integer(decode_vector(vector)?.len() as i64))
-}
-
-fn vector_distance_l2(values: &[SqlValue]) -> Result<SqlValue> {
-    let (left, right) = decode_two_vectors(values, "vector_distance_l2")?;
-    let mut sum = 0.0_f64;
-    for (a, b) in left.iter().zip(right.iter()) {
-        let delta = *a as f64 - *b as f64;
-        sum += delta * delta;
-    }
-    Ok(SqlValue::Real(sum.sqrt()))
-}
-
-fn vector_distance_cosine(values: &[SqlValue]) -> Result<SqlValue> {
-    let (left, right) = decode_two_vectors(values, "vector_distance_cosine")?;
-    let mut dot = 0.0_f64;
-    let mut left_norm = 0.0_f64;
-    let mut right_norm = 0.0_f64;
-    for (a, b) in left.iter().zip(right.iter()) {
-        let a = *a as f64;
-        let b = *b as f64;
-        dot += a * b;
-        left_norm += a * a;
-        right_norm += b * b;
-    }
-    if left_norm == 0.0 || right_norm == 0.0 {
-        return Ok(SqlValue::Null);
-    }
-    Ok(SqlValue::Real(
-        1.0 - dot / (left_norm.sqrt() * right_norm.sqrt()),
-    ))
-}
-
-fn decode_two_vectors(values: &[SqlValue], name: &str) -> Result<(Vec<f32>, Vec<f32>)> {
-    if values.len() != 2 {
-        return Err(Error::UnsupportedSql(format!("{name} requires 2 args")));
-    }
-    if matches!(values[0], SqlValue::Null) || matches!(values[1], SqlValue::Null) {
-        return Err(Error::DatatypeMismatch);
-    }
-    let left = decode_vector(&values[0])?;
-    let right = decode_vector(&values[1])?;
-    if left.len() != right.len() {
-        return Err(Error::DatatypeMismatch);
-    }
-    Ok((left, right))
-}
-
-fn sql_value_to_f32(value: &SqlValue) -> Result<f32> {
+fn vector_construct_from_value(value: &SqlValue) -> Result<SqlValue> {
     match value {
-        SqlValue::Integer(v) => Ok(*v as f32),
-        SqlValue::Real(v) => Ok(*v as f32),
-        SqlValue::Text(v) => v.parse::<f32>().map_err(|_| Error::DatatypeMismatch),
+        SqlValue::Null => Ok(SqlValue::Null),
+        SqlValue::Text(s) => {
+            let v = redlinedb_kernel::vector::Vector::from_json_literal(s.as_ref())
+                .map_err(|e| Error::UnsupportedSql(format!("vector(): {e}")))?;
+            Ok(SqlValue::Blob(Arc::from(v.encode())))
+        }
+        SqlValue::Blob(bytes) => {
+            redlinedb_kernel::vector::decode_vector(bytes)
+                .map_err(|e| Error::UnsupportedSql(format!("vector(): {e}")))?;
+            Ok(SqlValue::Blob(bytes.clone()))
+        }
         _ => Err(Error::DatatypeMismatch),
     }
 }
 
-fn encode_vector(values: &[f32]) -> Result<SqlValue> {
-    let mut out = Vec::with_capacity(8 + values.len() * 4);
-    out.extend_from_slice(VECTOR_MAGIC);
-    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
-    for value in values {
-        out.extend_from_slice(&value.to_le_bytes());
+/// Return the vector's dimension as INTEGER, or NULL for a Null input.
+fn vector_dims_value(value: &SqlValue) -> Result<SqlValue> {
+    match value {
+        SqlValue::Null => Ok(SqlValue::Null),
+        SqlValue::Blob(bytes) => {
+            let v = redlinedb_kernel::vector::decode_vector(bytes)
+                .map_err(|e| Error::UnsupportedSql(format!("vector_dims: {e}")))?;
+            Ok(SqlValue::Integer(v.len() as i64))
+        }
+        _ => Err(Error::DatatypeMismatch),
     }
-    Ok(SqlValue::Blob(Arc::from(out.into_boxed_slice())))
 }
 
-fn decode_vector(value: &SqlValue) -> Result<Vec<f32>> {
-    let SqlValue::Blob(bytes) = value else {
-        return Err(Error::DatatypeMismatch);
+fn vector_pair_distance(values: &[SqlValue], metric: VectorOpMetric) -> Result<SqlValue> {
+    if values.len() != 2 {
+        return Err(Error::UnsupportedSql(
+            "vector_distance_* requires exactly 2 args".to_owned(),
+        ));
+    }
+    if matches!(values[0], SqlValue::Null) || matches!(values[1], SqlValue::Null) {
+        return Ok(SqlValue::Null);
+    }
+    let (a, b) = match try_vector_pair(&values[0], &values[1]) {
+        Some(p) => p,
+        None => return Err(Error::DatatypeMismatch),
     };
-    if bytes.len() < 8 || &bytes[0..4] != VECTOR_MAGIC {
-        return Err(Error::DatatypeMismatch);
-    }
-    let dims = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    if bytes.len() != 8 + dims * 4 {
-        return Err(Error::DatatypeMismatch);
-    }
-    let mut values = Vec::with_capacity(dims);
-    for chunk in bytes[8..].chunks_exact(4) {
-        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-    }
-    Ok(values)
+    vector_distance_to_value(metric, &a, &b)
+}
+
+fn try_vector_pair(left: &SqlValue, right: &SqlValue) -> Option<(Vec<f32>, Vec<f32>)> {
+    let SqlValue::Blob(la) = left else {
+        return None;
+    };
+    let SqlValue::Blob(rb) = right else {
+        return None;
+    };
+    let a = redlinedb_kernel::vector::decode_vector(la).ok()?;
+    let b = redlinedb_kernel::vector::decode_vector(rb).ok()?;
+    Some((a, b))
+}
+
+fn vector_distance_to_value(metric: VectorOpMetric, a: &[f32], b: &[f32]) -> Result<SqlValue> {
+    let m: redlinedb_kernel::vector::VectorMetric = metric.into();
+    let d = m
+        .distance(a, b)
+        .map_err(|e| Error::UnsupportedSql(format!("vector distance: {e}")))?;
+    Ok(SqlValue::Real(d as f64))
 }
 
 pub(crate) fn cast_value(

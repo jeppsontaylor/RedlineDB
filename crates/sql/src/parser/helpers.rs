@@ -6,7 +6,7 @@ pub(crate) fn is_param_char(byte: u8) -> bool {
 
 pub(crate) fn convert_column_def(
     column: ColumnDef,
-    _ordinal: usize,
+    ordinal: usize,
     column_lookup: &std::collections::HashMap<String, usize>,
 ) -> Result<ColumnSpec> {
     let mut constraints = Vec::new();
@@ -17,6 +17,16 @@ pub(crate) fn convert_column_def(
     } else {
         Some(column.data_type.to_string())
     };
+
+    // Phase-10 Lane V1: a `VECTOR(d)` / `VECTOR(d, f32)` column gets an
+    // auto-generated CHECK constraint that pins the encoded blob length to
+    // exactly `expected_bytes(d)`. This is the SQL surface's only
+    // dimension-enforcement hook (kernel-side affinity remains BLOB), and it
+    // composes naturally with `apply_constraints` — Null values pass, wrong
+    // dim or wrong type fail.
+    if let Some(dim) = parse_vector_declared_type(&column.data_type)? {
+        constraints.push(vector_dim_check(ordinal, dim));
+    }
 
     for option in column.options {
         match option.option {
@@ -742,5 +752,89 @@ pub(crate) fn object_name_part_to_string(part: &ObjectNamePart) -> Result<String
         ObjectNamePart::Function(_) => Err(Error::UnsupportedSql(
             "function-style object names are not supported".to_owned(),
         )),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// VECTOR(d[, f32]) — phase-10 Lane V1.
+// -----------------------------------------------------------------------------
+
+/// Recognise `VECTOR(d)` / `VECTOR(d, f32)` and extract the dimension. Returns
+/// `Ok(None)` for non-vector types so `convert_column_def` can stay flat.
+///
+/// `sqlparser` parses unknown parameterised types as
+/// `DataType::Custom(ObjectName, Vec<String>)`, where the second tuple field
+/// holds the parenthesised arguments verbatim — so `VECTOR(384, f32)` arrives
+/// as `("VECTOR", ["384", "f32"])`. We accept any case, only the f32 element
+/// kind today, and reject zero / unparseable dimensions.
+pub(crate) fn parse_vector_declared_type(
+    data_type: &sqlparser::ast::DataType,
+) -> Result<Option<u32>> {
+    let sqlparser::ast::DataType::Custom(name, args) = data_type else {
+        return Ok(None);
+    };
+    let Some(part) = name.0.first() else {
+        return Ok(None);
+    };
+    let raw = match part {
+        ObjectNamePart::Identifier(ident) => ident.value.as_str(),
+        ObjectNamePart::Function(_) => return Ok(None),
+    };
+    if !raw.eq_ignore_ascii_case("VECTOR") {
+        return Ok(None);
+    }
+    if args.is_empty() || args.len() > 2 {
+        return Err(Error::UnsupportedSql(format!(
+            "VECTOR type expects 1 or 2 args (dim[, element_kind]); got {}",
+            args.len()
+        )));
+    }
+    let dim: u32 = args[0].parse().map_err(|_| {
+        Error::UnsupportedSql(format!(
+            "VECTOR dim must be a positive integer; got {}",
+            args[0]
+        ))
+    })?;
+    if dim == 0 {
+        return Err(Error::UnsupportedSql("VECTOR dim must be > 0".to_owned()));
+    }
+    if let Some(kind) = args.get(1)
+        && !kind.eq_ignore_ascii_case("f32")
+    {
+        return Err(Error::UnsupportedSql(format!(
+            "VECTOR element kind '{kind}' is not supported yet (only f32)"
+        )));
+    }
+    Ok(Some(dim))
+}
+
+/// Compute the exact wire-format byte length for a vector with `dim` f32
+/// components, matching `kernel::vector::codec::encode_vector`.
+fn vector_encoded_len(dim: u32) -> u64 {
+    // varint length: 1 byte per 7 bits of `dim`. `dim > 0` (caller checked).
+    let mut varint = 0u64;
+    let mut tmp = dim;
+    loop {
+        varint += 1;
+        tmp >>= 7;
+        if tmp == 0 {
+            break;
+        }
+    }
+    varint + 1 /* element kind */ + (dim as u64) * 4
+}
+
+/// Build the auto-generated CHECK constraint that enforces `BlobLen(col) = K`
+/// for vector columns. The check is named `__vec_dim_<col>` so it shows up
+/// recognisably in `sqlite_schema.sql` and EXPLAIN output.
+fn vector_dim_check(ordinal: usize, dim: u32) -> ColumnConstraintSpec {
+    let expected = vector_encoded_len(dim) as i64;
+    let expr = ExprAst::Eq(
+        Box::new(ExprAst::BlobLen(Box::new(ExprAst::Column(ordinal as u16)))),
+        Box::new(ExprAst::Const(OwnedValue::Integer(expected))),
+    );
+    ColumnConstraintSpec::Check {
+        expr,
+        normalized_sql: format!("/* auto: vector_dim={dim} */"),
     }
 }

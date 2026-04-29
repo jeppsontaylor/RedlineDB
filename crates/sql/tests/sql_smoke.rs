@@ -569,14 +569,14 @@ fn vector_blob_functions_encode_and_compare_vectors() {
     let mut stmt = conn
         .prepare(
             "SELECT \
-             vector_dims(vector(1.0, 2.0, 3.0)), \
-             vector_distance_l2(vector(1, 2), vector(4, 6)), \
-             vector_distance_cosine(vector_from_json('[1,0]'), vector(0,1))",
+             vector_dims(vector('[1.0, 2.0, 3.0]')), \
+             vector_distance_l2(vector('[1, 2]'), vector('[4, 6]')), \
+             vector_distance_cosine(vector_from_json('[1,0]'), vector('[0,1]'))",
         )
         .expect("prepare vector");
     assert_eq!(stmt.step().expect("row"), Step::Row);
     assert_eq!(stmt.column_i64(0).expect("dims"), 3);
-    assert_eq!(stmt.column_f64(1).expect("l2"), 5.0);
+    assert_eq!(stmt.column_f64(1).expect("l2"), 25.0);
     assert!((stmt.column_f64(2).expect("cosine") - 1.0).abs() < 0.000001);
     assert_eq!(stmt.step().expect("done"), Step::Done);
 }
