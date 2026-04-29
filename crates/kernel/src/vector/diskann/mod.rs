@@ -9,9 +9,11 @@
 //! `DiskAnnIndex` public API) follow in subsequent commits.
 
 mod prune;
+mod searcher;
 mod sectors;
 
 pub use prune::robust_prune;
+pub use searcher::{SearchParams, search};
 pub use sectors::{SECTOR_SIZE, SectorError, SectorLayout, decode_node, encode_node};
 
 /// Stable identifier for a vector row stored in the graph. Carries the
