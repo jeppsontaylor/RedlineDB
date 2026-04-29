@@ -149,7 +149,6 @@ pub(crate) fn maintain_indexes_on_delete(
 /// Reflect an UPDATE: delete-mark old entries whose key or rowid changed,
 /// then insert the new entries. Indexes whose key column set is untouched
 /// AND whose rowid is unchanged are left alone (no churn).
-#[allow(dead_code)] // wired up in the /lane-b/update commit
 pub(crate) fn maintain_indexes_on_update(
     engine: &Engine,
     tx: &Txn,

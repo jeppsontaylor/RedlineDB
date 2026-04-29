@@ -367,16 +367,23 @@ pub(crate) fn execute_update(
             if !selection_passes(&plan.selection, &SqlRow::Table(row.clone()), bindings)? {
                 continue;
             }
-            let mut values = row.values.clone();
+            // Reload the heap row before mutating so we trust the
+            // freshest committed/own-tx state when computing the index
+            // delta. The plan-time `row` might be stale if a sibling
+            // statement in the same tx already touched it.
+            let fresh = load_table_row_by_rowid(conn.engine(), tx, &plan.table, row.rowid)?
+                .unwrap_or_else(|| row.clone());
+            let old_values = fresh.values.clone();
+            let mut values = fresh.values.clone();
             for (ordinal, expr) in &plan.assignments {
                 if *ordinal >= values.len() {
                     return Err(Error::UnknownColumn(format!("ordinal {ordinal}")));
                 }
-                values[*ordinal] = eval_scalar(expr, &RowContext::Table(&row), bindings)?;
+                values[*ordinal] = eval_scalar(expr, &RowContext::Table(&fresh), bindings)?;
             }
             values = apply_row_affinity(&plan.table, values)?;
             let new_rowid =
-                choose_rowid_for_update(conn.engine(), &plan.table, &values, row.rowid)?;
+                choose_rowid_for_update(conn.engine(), &plan.table, &values, fresh.rowid)?;
             if let Some(alias) = plan.table.rowid_alias_column
                 && let Some(slot) = values.get_mut(alias as usize)
                 && matches!(slot, SqlValue::Null)
@@ -384,18 +391,18 @@ pub(crate) fn execute_update(
                 *slot = SqlValue::Integer(new_rowid.0 as i64);
             }
             apply_constraints(&plan.table, &values)?;
-            ensure_unique_constraints(conn, session, tx, &plan.table, &values, Some(row.rowid))?;
+            ensure_unique_constraints(conn, session, tx, &plan.table, &values, Some(fresh.rowid))?;
             let payload = encode_sql_row(plan.table.table_id.0, &values)?;
-            if new_rowid == row.rowid {
+            if new_rowid == fresh.rowid {
                 conn.engine().update_for_relation(
                     tx,
                     plan.table.relation_id,
-                    row.rowid,
+                    fresh.rowid,
                     payload,
                 )?;
             } else {
                 conn.engine()
-                    .delete_for_relation(tx, plan.table.relation_id, row.rowid)?;
+                    .delete_for_relation(tx, plan.table.relation_id, fresh.rowid)?;
                 conn.engine().insert_for_relation(
                     tx,
                     plan.table.relation_id,
@@ -403,6 +410,15 @@ pub(crate) fn execute_update(
                     payload,
                 )?;
             }
+            crate::exec::index_dml::maintain_indexes_on_update(
+                conn.engine(),
+                tx,
+                &plan.table,
+                &old_values,
+                &values,
+                fresh.rowid,
+                new_rowid,
+            )?;
             if let Some(returning) = &plan.returning {
                 returning_rows.push(project_returning_row(
                     &plan.table,
@@ -785,6 +801,7 @@ fn apply_upsert_update(
     {
         return Ok(InsertOutcome::Ignored);
     }
+    let old_values = existing.values.clone();
     let mut values = existing.values.clone();
     for (ordinal, expr) in &update.assignments {
         if *ordinal >= values.len() {
@@ -825,6 +842,15 @@ fn apply_upsert_update(
             .engine()
             .insert_for_relation(ctx.tx, ctx.table.relation_id, new_rowid, payload)?;
     }
+    crate::exec::index_dml::maintain_indexes_on_update(
+        ctx.conn.engine(),
+        ctx.tx,
+        ctx.table,
+        &old_values,
+        &values,
+        existing.rowid,
+        new_rowid,
+    )?;
     Ok(InsertOutcome::Updated {
         rowid: new_rowid,
         values,
