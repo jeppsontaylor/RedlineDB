@@ -19,7 +19,8 @@ use redlinedb_kernel::txn::Isolation;
 
 use crate::error::{Error, Result};
 use crate::parser::parse_prepared_template;
-use crate::session::{BeginMode, SessionState, UniqueLockTable};
+use crate::parser::savepoint::{SavepointAction, try_parse_savepoint};
+use crate::session::{BeginMode, JournalEntry, SavepointFrame, SessionState, UniqueLockTable};
 use crate::statement::{PreparedTemplate, Statement, Step};
 
 const USER_VERSION_FILE: &str = "user_version.redline";
@@ -335,22 +336,242 @@ impl Database {
 }
 
 impl Connection {
+    /// Prepare a single SQL statement, ignoring any trailing statements.
+    ///
+    /// Most callers want this for backward compatibility — the returned
+    /// statement is the *first* statement in `sql`, and any remaining text is
+    /// silently dropped. Use [`Connection::prepare_v2`] for the
+    /// `sqlite3_prepare_v2`-style API that returns the unconsumed tail.
     pub fn prepare(self: &Arc<Self>, sql: &str) -> Result<Statement> {
-        let template = self.prepare_cached(sql)?;
-        Ok(Statement::new(Arc::clone(self), template))
+        let (stmt, _tail) = self.prepare_v2(sql)?;
+        match stmt {
+            Some(stmt) => Ok(stmt),
+            None => Err(Error::UnsupportedSql(
+                "no statement in SQL input".to_owned(),
+            )),
+        }
     }
 
+    /// Prepare the first statement in `sql` and return it together with the
+    /// tail (the byte slice of `sql` that was not consumed). When `sql` is
+    /// blank/comment-only the `Option<Statement>` is `None` and the tail is
+    /// empty — this matches `sqlite3_prepare_v2(db, "  --x", _, &stmt, &tail)`
+    /// which sets `stmt = NULL` and returns OK.
+    ///
+    /// SAVEPOINT / RELEASE / ROLLBACK TO are handled eagerly here: their
+    /// side-effects fire during preparation and the returned statement is a
+    /// fully-completed no-op (`step` immediately yields `Step::Done`).
+    pub fn prepare_v2<'a>(self: &Arc<Self>, sql: &'a str) -> Result<(Option<Statement>, &'a str)> {
+        let (head, tail) = crate::parser::split_first_statement(sql);
+        if crate::parser::is_blank_sql(head) {
+            // Either fully blank input, or a remaining comment-only tail.
+            return Ok((None, tail));
+        }
+        if let Some(action) = try_parse_savepoint(head)? {
+            self.apply_savepoint_action(&action)?;
+            // Build a no-op completed statement so the FFI still returns a
+            // valid handle that the caller can step() / finalize().
+            let template = self.savepoint_marker_template(head);
+            let stmt = Statement::new_completed(Arc::clone(self), template);
+            return Ok((Some(stmt), tail));
+        }
+        let template = self.prepare_cached(head)?;
+        Ok((Some(Statement::new(Arc::clone(self), template)), tail))
+    }
+
+    /// Execute every statement in `sql`. For multi-statement input, runs
+    /// them in order; the result is the affected-rows count of the last
+    /// non-readonly statement (or the row count of the last SELECT).
     pub fn execute(self: &Arc<Self>, sql: &str) -> Result<usize> {
-        let mut stmt = self.prepare(sql)?;
-        let mut rows = 0usize;
-        while let Step::Row = stmt.step()? {
-            rows += 1;
+        let mut rest = sql;
+        let mut last: usize = 0;
+        loop {
+            let (stmt_opt, tail) = self.prepare_v2(rest)?;
+            if let Some(mut stmt) = stmt_opt {
+                let mut rows = 0usize;
+                while let Step::Row = stmt.step()? {
+                    rows += 1;
+                }
+                last = if stmt.is_readonly() {
+                    rows
+                } else {
+                    stmt.affected_rows()
+                };
+            }
+            if tail.is_empty() {
+                break;
+            }
+            rest = tail;
         }
-        if stmt.is_readonly() {
-            Ok(rows)
+        Ok(last)
+    }
+
+    /// Build a "marker" template for savepoint statements. The side-effects
+    /// fire during `prepare_v2`; the returned `Statement` is constructed
+    /// with `runtime = Done` so it never invokes the executor. We tag the
+    /// template's `sql` field with a sentinel prefix so any later `reset`/
+    /// `step` cycle is also a no-op.
+    fn savepoint_marker_template(self: &Arc<Self>, sql: &str) -> Arc<PreparedTemplate> {
+        let tagged = format!("{}{}", crate::statement::SAVEPOINT_MARKER_SQL_PREFIX, sql);
+        Arc::new(PreparedTemplate {
+            sql: Arc::from(tagged.as_str()),
+            schema_epoch: self.schema_epoch(),
+            stats_epoch: self.stats_epoch().0,
+            optimizer_hash: self.optimizer_hash(),
+            param_layout: crate::statement::ParamLayout::default(),
+            output_columns: Arc::from([]),
+            readonly: true,
+            // The marker template never reaches `execute_prepared`; we pick
+            // an existing variant with a trivial, idempotent handler so the
+            // exec.rs match stays exhaustive without requiring edits.
+            kind: crate::statement::PreparedKind::Pragma(
+                crate::statement::PragmaPlan::SetForeignKeys(false),
+            ),
+        })
+    }
+
+    /// Push, release, or rewind a savepoint. Implements SQLite's three
+    /// commands; called from both the SQL prepare-time interceptor and the
+    /// programmatic Rust APIs (`Connection::savepoint` etc.).
+    pub(crate) fn apply_savepoint_action(self: &Arc<Self>, action: &SavepointAction) -> Result<()> {
+        match action {
+            SavepointAction::Savepoint(name) => self.savepoint(name),
+            SavepointAction::Release(name) => self.release(name),
+            SavepointAction::RollbackTo(name) => self.rollback_to(name),
+        }
+    }
+
+    /// Open a SAVEPOINT named `name`. If no transaction is active, opens an
+    /// implicit deferred transaction first (matching SQLite, where SAVEPOINT
+    /// outside a tx works as if BEGIN had been called).
+    pub fn savepoint(&self, name: &str) -> Result<()> {
+        let mut session = self.session.lock().expect("session poisoned");
+        let implicit_tx = if session.tx.is_none() {
+            let tx = self.db.engine.begin(Isolation::Snapshot)?;
+            session.tx = Some(tx);
+            session.failed = false;
+            true
         } else {
-            Ok(stmt.affected_rows())
+            false
+        };
+        let frame = SavepointFrame {
+            name: name.to_owned(),
+            journal_len: session.journal.len(),
+            changes: session.changes,
+            total_changes: session.total_changes,
+            last_insert_rowid: session.last_insert_rowid,
+            implicit_tx,
+        };
+        session.savepoints.push(frame);
+        Ok(())
+    }
+
+    /// RELEASE a SAVEPOINT: pop frames down to and including the most-recent
+    /// frame whose name matches. The journal stays intact (the released
+    /// frame's work merges into its parent / the outer transaction).
+    pub fn release(&self, name: &str) -> Result<()> {
+        let mut session = self.session.lock().expect("session poisoned");
+        let pos = session
+            .savepoints
+            .iter()
+            .rposition(|frame| frame.name == name)
+            .ok_or(Error::TransactionState("no such savepoint"))?;
+        // Track whether the bottom-most popped frame was implicit. If yes
+        // and the stack is now empty AND no nested releases shadowed the
+        // implicit-tx flag, we commit the surrounding tx (the SAVEPOINT
+        // outside-of-tx contract).
+        let bottom_was_implicit = session
+            .savepoints
+            .get(pos)
+            .map(|frame| frame.implicit_tx)
+            .unwrap_or(false);
+        session.savepoints.truncate(pos);
+        let stack_now_empty = session.savepoints.is_empty();
+        if stack_now_empty {
+            // No more savepoints — clear the journal too. The DML up to
+            // this point will commit (or rollback) at the outer tx
+            // boundary; we don't need to keep replay material.
+            session.journal.clear();
         }
+        if stack_now_empty && bottom_was_implicit {
+            // Drop the lock before going through commit() which re-locks.
+            drop(session);
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// ROLLBACK TO SAVEPOINT: rewind the active transaction to the state
+    /// captured when `name` was created. Implementation: close the kernel
+    /// tx, open a fresh one, replay the journal up to the savepoint's
+    /// prefix length. The savepoint frame stays on the stack (per SQLite).
+    pub fn rollback_to(self: &Arc<Self>, name: &str) -> Result<()> {
+        // Phase 1: locate frame, snapshot the journal prefix, drop the
+        // active tx. The replay runs in phase 2 with no session lock held.
+        let (replay_entries, target_changes, target_total, target_last_rowid, target_journal_len) = {
+            let mut session = self.session.lock().expect("session poisoned");
+            let pos = session
+                .savepoints
+                .iter()
+                .rposition(|frame| frame.name == name)
+                .ok_or(Error::TransactionState("no such savepoint"))?;
+            // Drop frames *above* `pos` (they're rewound away), keep the
+            // matching frame on the stack — RELEASE is a separate op.
+            session.savepoints.truncate(pos + 1);
+            let frame = session.savepoints[pos].clone();
+            let journal_prefix: Vec<JournalEntry> = session.journal[..frame.journal_len].to_vec();
+            session.journal.truncate(frame.journal_len);
+            if let Some(tx) = session.tx.take() {
+                let _ = self.db.engine.rollback(tx);
+            }
+            session.kernel_unique_guards.clear();
+            session.unique_guards.clear();
+            session.failed = false;
+            session.changes = 0;
+            session.total_changes = 0;
+            session.last_insert_rowid = None;
+            (
+                journal_prefix,
+                frame.changes,
+                frame.total_changes,
+                frame.last_insert_rowid,
+                frame.journal_len,
+            )
+        };
+
+        // Phase 2: open a fresh tx and replay the journal prefix.
+        {
+            let mut session = self.session.lock().expect("session poisoned");
+            let tx = self.db.engine.begin(Isolation::Snapshot)?;
+            session.tx = Some(tx);
+            session.replay_in_progress = true;
+        }
+        let replay_result = self.replay_journal(&replay_entries);
+        {
+            let mut session = self.session.lock().expect("session poisoned");
+            session.replay_in_progress = false;
+            session.changes = target_changes;
+            session.total_changes = target_total;
+            session.last_insert_rowid = target_last_rowid;
+            session.journal.truncate(target_journal_len);
+        }
+        replay_result
+    }
+
+    fn replay_journal(self: &Arc<Self>, entries: &[JournalEntry]) -> Result<()> {
+        for entry in entries {
+            let template = self.prepare_cached(&entry.sql)?;
+            let mut stmt = Statement::new(Arc::clone(self), template);
+            if !entry.bindings.is_empty() {
+                for (idx, slot) in entry.bindings.iter().enumerate().skip(1) {
+                    if let Some(value) = slot {
+                        stmt.bind_value(idx, value.clone())?;
+                    }
+                }
+            }
+            while let Step::Row = stmt.step()? {}
+        }
+        Ok(())
     }
 
     pub fn begin(&self, mode: BeginMode) -> Result<()> {
@@ -368,6 +589,37 @@ impl Connection {
         }
         session.tx = Some(tx);
         session.failed = false;
+        // A fresh tx can never replay — drop any leftover journal/savepoint
+        // state from a prior rolled-back tx.
+        session.clear_savepoints();
+        Ok(())
+    }
+
+    /// Append a successful non-readonly statement to the per-tx replay
+    /// journal. Skipped when:
+    ///   * the journal is currently being replayed (avoid feeding itself),
+    ///   * no transaction is active (no replay possible).
+    ///
+    /// We journal eagerly for *every* active tx — even before any
+    /// `SAVEPOINT` lands on the stack — because a later SAVEPOINT records
+    /// the journal length at its creation moment, and ROLLBACK TO that
+    /// savepoint must be able to replay the prefix up to that index. If we
+    /// only journaled while a savepoint frame existed, the prefix would be
+    /// missing the pre-savepoint statements and ROLLBACK TO would lose
+    /// rows that should still be visible.
+    pub(crate) fn journal_statement(
+        &self,
+        sql: &str,
+        bindings: Vec<Option<crate::value::SqlValue>>,
+    ) -> Result<()> {
+        let mut session = self.session.lock().expect("session poisoned");
+        if session.replay_in_progress || session.tx.is_none() {
+            return Ok(());
+        }
+        session.journal.push(JournalEntry {
+            sql: sql.to_owned(),
+            bindings,
+        });
         Ok(())
     }
 
@@ -386,21 +638,25 @@ impl Connection {
             Ok(CommitOutcome::Committed(_)) => {
                 session.kernel_unique_guards.clear();
                 session.unique_guards.clear();
+                session.clear_savepoints();
                 Ok(())
             }
             Ok(CommitOutcome::MaybeCommitted) => {
                 session.kernel_unique_guards.clear();
                 session.unique_guards.clear();
+                session.clear_savepoints();
                 Err(Error::CommitMaybeCommitted)
             }
             Ok(CommitOutcome::RolledBack) => {
                 session.kernel_unique_guards.clear();
                 session.unique_guards.clear();
+                session.clear_savepoints();
                 Err(Error::TransactionState("transaction rolled back"))
             }
             Err(err) => {
                 session.kernel_unique_guards.clear();
                 session.unique_guards.clear();
+                session.clear_savepoints();
                 Err(err.into())
             }
         }
@@ -416,6 +672,7 @@ impl Connection {
         session.kernel_unique_guards.clear();
         session.unique_guards.clear();
         session.failed = false;
+        session.clear_savepoints();
         result?;
         Ok(())
     }
