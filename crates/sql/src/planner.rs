@@ -963,6 +963,10 @@ fn wrap_limit(input: PhysicalPlan, plan: &SelectPlan) -> PhysicalPlan {
     node
 }
 
+// One arg per planner-side input the access-path resolver might
+// need; flattening into a struct would scatter call sites without
+// shrinking the contract.
+#[allow(clippy::too_many_arguments)]
 fn choose_access_path(
     table: &Arc<TableDef>,
     _projection: &[SelectItem],
@@ -1035,27 +1039,6 @@ fn access_path_is_consumable_by_executor(access: &AccessPath) -> bool {
         AccessPath::CoveringIndexScan { .. }
         | AccessPath::MultiIndexOr { .. }
         | AccessPath::MultiIndexAnd { .. } => false,
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod planner_conservatism_tests {
-    use super::*;
-
-    /// The executor must be able to consume every variant the planner
-    /// could emit today. Extend the match arms in
-    /// `access_path_is_consumable_by_executor` when adding a new
-    /// variant — and add a paired executor arm before flipping the
-    /// answer to `true`.
-    #[test]
-    fn planner_only_emits_executor_consumable_variants() {
-        // TableScan is consumable.
-        assert!(access_path_is_consumable_by_executor(&AccessPath::TableScan));
-        // RowIdGet is consumable.
-        assert!(access_path_is_consumable_by_executor(&AccessPath::RowIdGet {
-            rowid: redlinedb_kernel::format::RowId::new(1),
-        }));
     }
 }
 
@@ -1330,4 +1313,29 @@ fn output_order_satisfies(output_order: &[String], order_by: &[OrderByExpr]) -> 
         .iter()
         .zip(order_by.iter())
         .all(|(left, right)| *left == expr_to_string(&right.expr))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod planner_conservatism_tests {
+    use super::*;
+
+    /// The executor must be able to consume every variant the planner
+    /// could emit today. Extend the match arms in
+    /// `access_path_is_consumable_by_executor` when adding a new
+    /// variant — and add a paired executor arm before flipping the
+    /// answer to `true`.
+    #[test]
+    fn planner_only_emits_executor_consumable_variants() {
+        // TableScan is consumable.
+        assert!(access_path_is_consumable_by_executor(
+            &AccessPath::TableScan
+        ));
+        // RowIdGet is consumable.
+        assert!(access_path_is_consumable_by_executor(
+            &AccessPath::RowIdGet {
+                rowid: redlinedb_kernel::format::RowId::new(1),
+            }
+        ));
+    }
 }

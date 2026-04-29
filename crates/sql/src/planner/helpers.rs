@@ -355,17 +355,19 @@ pub(crate) fn render_detail(node: &PhysicalPlan) -> String {
             // Render the probe kind (PointLookup vs RangeScan) so
             // EXPLAIN consumers can distinguish equality probes from
             // range scans even though both reuse `IndexScan` as the
-            // physical kind. Covering-index renders keep their legacy
-            // wording until that optimization is enabled.
+            // physical kind. The COVERING render is reserved for the
+            // covering-index access path (which today is gated off);
+            // an `index_probe_kind` of "PointLookup" or "RangeScan"
+            // is the signal that we picked one of the IndexPointLookup
+            // / IndexRangeScan paths and should NOT be rendered as
+            // covering even if the projection happens to be a subset
+            // of the index keys.
             if let Some(index) = &node.index {
                 let probe = node.index_probe_kind.unwrap_or("");
-                if !node.projected_columns.is_empty() {
+                if !probe.is_empty() {
+                    let _ = write!(out, "SEARCH TABLE {relation} USING INDEX {index}: {probe}");
+                } else if !node.projected_columns.is_empty() {
                     let _ = write!(out, "SEARCH TABLE {relation} USING COVERING INDEX {index}");
-                } else if !probe.is_empty() {
-                    let _ = write!(
-                        out,
-                        "SEARCH TABLE {relation} USING INDEX {index}: {probe}"
-                    );
                 } else {
                     let _ = write!(out, "SEARCH TABLE {relation} USING INDEX {index}");
                 }

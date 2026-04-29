@@ -520,11 +520,9 @@ fn execute_select(
                             selection_rowid_eq(table, &plan.selection, bindings)?
                         {
                             vec![rowid]
-                        } else if let Some(matched) = index_access::try_match_index_access(
-                            table,
-                            &plan.selection,
-                            bindings,
-                        ) {
+                        } else if let Some(matched) =
+                            index_access::try_match_index_access(table, &plan.selection, bindings)
+                        {
                             let tx = tx.as_mut().expect("tx present");
                             // Conservatism: if the kernel can't honor
                             // the probe (e.g. the index has no live
@@ -535,9 +533,7 @@ fn execute_select(
                             // executor can satisfy them, but stale
                             // schema snapshots still exist as a
                             // possibility.
-                            if index_access::open_handle(conn.engine(), &matched.index)
-                                .is_some()
-                            {
+                            if index_access::open_handle(conn.engine(), &matched.index).is_some() {
                                 index_access::execute_index_probe(
                                     conn.engine(),
                                     tx,

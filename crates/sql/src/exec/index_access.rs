@@ -141,7 +141,7 @@ pub(crate) fn try_match_index_access(
             }
             // Leading-prefix range scan: encode just the leading value
             // and walk every key that starts with that prefix.
-            let prefix = encode_prefix_key(index, &[leading_value.clone()]);
+            let prefix = encode_prefix_key(index, std::slice::from_ref(&leading_value));
             let (start, end) = prefix_bounds(&prefix);
             let predicates = vec![format!(
                 "{} = {}",
@@ -164,22 +164,14 @@ pub(crate) fn try_match_index_access(
             let start = match &bounds.lower {
                 Some((value, inclusive)) => {
                     let bytes = encode_prefix_key(index, std::slice::from_ref(value));
-                    if *inclusive {
-                        bytes
-                    } else {
-                        next_key(&bytes)
-                    }
+                    if *inclusive { bytes } else { next_key(&bytes) }
                 }
                 None => Vec::new(),
             };
             let end = match &bounds.upper {
                 Some((value, inclusive)) => {
                     let bytes = encode_prefix_key(index, std::slice::from_ref(value));
-                    if *inclusive {
-                        next_key(&bytes)
-                    } else {
-                        bytes
-                    }
+                    if *inclusive { next_key(&bytes) } else { bytes }
                 }
                 None => max_key_for(index),
             };
@@ -370,51 +362,51 @@ fn leading_range_bounds(
     let column_name = table.columns.get(column).map(|c| c.name.to_string())?;
     for expr in conjuncts {
         let stripped = strip_nested(expr);
-        if let Expr::BinaryOp { left, op, right } = stripped {
-            if let Some(side) = comparison_constant_for_column(left, right, table, column, bindings) {
-                let (value, inclusive_lower, inclusive_upper, is_lower) = match op {
-                    BinaryOperator::Gt if side == ColumnSide::Left => {
-                        (side.value(), false, false, true)
-                    }
-                    BinaryOperator::GtEq if side == ColumnSide::Left => {
-                        (side.value(), true, false, true)
-                    }
-                    BinaryOperator::Lt if side == ColumnSide::Left => {
-                        (side.value(), false, false, false)
-                    }
-                    BinaryOperator::LtEq if side == ColumnSide::Left => {
-                        (side.value(), false, true, false)
-                    }
-                    BinaryOperator::Gt if side == ColumnSide::Right => {
-                        (side.value(), false, false, false)
-                    }
-                    BinaryOperator::GtEq if side == ColumnSide::Right => {
-                        (side.value(), false, true, false)
-                    }
-                    BinaryOperator::Lt if side == ColumnSide::Right => {
-                        (side.value(), false, false, true)
-                    }
-                    BinaryOperator::LtEq if side == ColumnSide::Right => {
-                        (side.value(), true, false, true)
-                    }
-                    _ => continue,
-                };
-                if matches!(value, SqlValue::Null) {
-                    continue;
+        if let Expr::BinaryOp { left, op, right } = stripped
+            && let Some(side) = comparison_constant_for_column(left, right, table, column, bindings)
+        {
+            let (value, inclusive_lower, inclusive_upper, is_lower) = match op {
+                BinaryOperator::Gt if side == ColumnSide::Left => {
+                    (side.value(), false, false, true)
                 }
-                predicates.push(format!(
-                    "{} {} {}",
-                    column_name,
-                    binary_op_to_str(op, side.side),
-                    sql_value_to_explain(&value)
-                ));
-                if is_lower {
-                    bounds.lower = Some((value, inclusive_lower));
-                } else {
-                    bounds.upper = Some((value, inclusive_upper));
+                BinaryOperator::GtEq if side == ColumnSide::Left => {
+                    (side.value(), true, false, true)
                 }
+                BinaryOperator::Lt if side == ColumnSide::Left => {
+                    (side.value(), false, false, false)
+                }
+                BinaryOperator::LtEq if side == ColumnSide::Left => {
+                    (side.value(), false, true, false)
+                }
+                BinaryOperator::Gt if side == ColumnSide::Right => {
+                    (side.value(), false, false, false)
+                }
+                BinaryOperator::GtEq if side == ColumnSide::Right => {
+                    (side.value(), false, true, false)
+                }
+                BinaryOperator::Lt if side == ColumnSide::Right => {
+                    (side.value(), false, false, true)
+                }
+                BinaryOperator::LtEq if side == ColumnSide::Right => {
+                    (side.value(), true, false, true)
+                }
+                _ => continue,
+            };
+            if matches!(value, SqlValue::Null) {
                 continue;
             }
+            predicates.push(format!(
+                "{} {} {}",
+                column_name,
+                binary_op_to_str(op, side.side),
+                sql_value_to_explain(&value)
+            ));
+            if is_lower {
+                bounds.lower = Some((value, inclusive_lower));
+            } else {
+                bounds.upper = Some((value, inclusive_upper));
+            }
+            continue;
         }
         if let Expr::Between {
             expr: ident,
@@ -626,12 +618,8 @@ fn eval_constant(expr: &Expr, bindings: &[Option<SqlValue>]) -> Option<SqlValue>
                 .ok()
                 .map(SqlValue::Integer)
                 .unwrap_or(SqlValue::Null),
-            Value::SingleQuotedString(s) => {
-                SqlValue::Text(std::sync::Arc::from(s.as_str()))
-            }
-            Value::DoubleQuotedString(s) => {
-                SqlValue::Text(std::sync::Arc::from(s.as_str()))
-            }
+            Value::SingleQuotedString(s) => SqlValue::Text(std::sync::Arc::from(s.as_str())),
+            Value::DoubleQuotedString(s) => SqlValue::Text(std::sync::Arc::from(s.as_str())),
             Value::Placeholder(name) => {
                 let slot = name
                     .strip_prefix('?')
