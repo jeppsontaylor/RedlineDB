@@ -5,6 +5,11 @@
     "rtk cargo check --workspace --locked",
     "rtk cargo test --workspace --quiet --locked"
   ],
+  "phase10/lane-int": [
+    "rtk cargo test -p redlinedb-kernel --test integrity_tests --quiet --locked",
+    "rtk cargo test -p redlinedb-sql --test sql_smoke pragma_redline --quiet --locked",
+    "rtk cargo test -p redlinedb-bench checksum:: --quiet --locked"
+  ],
   "clippy": [
     "rtk cargo clippy --workspace --all-targets --locked -- -D warnings"
   ],
