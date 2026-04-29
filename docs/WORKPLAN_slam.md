@@ -45,6 +45,31 @@ Wave 1 artifact SHA-256 (target/bench/wave1-certify/):
 - `summary.csv` — `facef8706bf05ba469819e55814761a0d177aec969ab4b0f0ebdf0251d970081`
 - `report.md` — `c50aef81e4315047728b5801e460bde64dacc7b03bc58c159bbba15bb0cea24a`
 
+## Phase 9 Wave 2 Fusion (A + H combined)
+
+Lane A+H landed on top of `wave1-fused` (4d48dd6) and tagged `wave2-fused`. Four commits, fast-forwarded into main:
+
+- `9bf5c3a phase:9/lane-a/catalog-set-meta: add apply_set_index_meta_page_id helper`
+- `754e3dc phase:9/lane-h/lsn-sentinels: distinguish mutation from legit-init Lsn use`
+- `24e43f0 phase:9/lane-a/btree-create: allocate physical pages for CREATE INDEX`
+- `47b8526 phase:9/lane-a/tests: end-to-end create_index, recover, and atomicity`
+
+Engine `create_index()` now allocates a `BtreeIndex` via `BtreeIndex::create_with_wal()` and persists `IndexDef.meta_page_id` through the existing `WalPayload::CatalogSnapshot` path (no new `CatalogDelta`). DDL backfill scans the heap and inserts via `BtreeIndex::insert_tx`. `Engine::open()` rehydrates index handles from catalog. New accessor `Engine::index_handle()` ready for SQL exec layer.
+
+Lane H flipped 12 mutation-sentinel `Lsn::ZERO` → `Lsn(1)` in `crates/kernel/src/index/mod.rs` (create-meta, create-root, leaf insert, delete-mark, leaf compact, leaf-split L/R, internal split absorbed/rewrite/right, root promotion, set_meta_root). Legitimate-init sites in `engine/page_heap.rs` recovery replay paths confirmed and audit-commented. Engine-side mutation calls (insert/update/delete) already used `Lsn(1)`; an audit comment was added at the first call.
+
+Post-fusion proof:
+- `cargo fmt --check` — green
+- `./scripts/check_file_sizes.sh` — green (largest active file `index/mod.rs` at 1441 LOC)
+- `cargo check --workspace --locked` — green
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
+- `cargo test --workspace --quiet --locked` — `181 passed (29 suites, 3.85s)` (178 → 181, +3 new kernel tests)
+- `cargo test -p redlinedb-kernel --quiet --locked` — 130 passed (was 127)
+- `cargo run -p redlinedb-bench -- recover-matrix --config crates/bench/bench/recovery-matrix.toml --out target/bench/wave2-recovery.json --seed 7` — exit 0, 24/36 cases passed (same as pre-Wave-2; the 12 pre-existing failures are Lane E failpoint-matrix work, not regressed)
+
+Wave 2 artifact SHA-256:
+- `target/bench/wave2-recovery.json` — `58568ff50625e2e57508ba0584263924162cc39fe59f0f8db8604d3a70fb96a8`
+
 ## Verified Proof
 
 These commands passed in the current workspace:
