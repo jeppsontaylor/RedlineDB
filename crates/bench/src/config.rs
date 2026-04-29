@@ -269,6 +269,11 @@ pub enum WorkloadKind {
     /// ignored. Output is a single record with
     /// `engine_stats.max_stable_connections` populated.
     ConnectionLimit,
+    /// Lane VE: forces the spillable-sort path. Inserts `rows` (default
+    /// 200_000 with a 64-byte payload) and repeatedly issues
+    /// `SELECT * FROM t ORDER BY payload` with a tight `work_mem_bytes`,
+    /// surfacing `engine_stats.spill_bytes_ratio`.
+    LargeSortSpill,
 }
 
 impl WorkloadKind {
@@ -290,6 +295,7 @@ impl WorkloadKind {
             Self::Mixed80Read20Write => "mixed80-read20-write",
             Self::Mixed50Read50Write => "mixed50-read50-write",
             Self::ConnectionLimit => "connection-limit",
+            Self::LargeSortSpill => "large-sort-spill",
         }
     }
 }
@@ -549,6 +555,7 @@ impl FromStr for WorkloadKind {
             "mixed80-read20-write" => Ok(Self::Mixed80Read20Write),
             "mixed50-read50-write" => Ok(Self::Mixed50Read50Write),
             "connection-limit" => Ok(Self::ConnectionLimit),
+            "large-sort-spill" => Ok(Self::LargeSortSpill),
             _ => bail!("unknown workload {value}"),
         }
     }
