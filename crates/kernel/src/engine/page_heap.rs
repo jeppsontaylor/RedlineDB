@@ -106,6 +106,9 @@ impl PageBackedHeap {
     }
 
     pub fn insert_recovered(&self, tx_id: TxId, row_id: RowId, payload: Vec<u8>) -> Result<()> {
+        // LSN sentinel: legit init. Recovery is replaying an already-logged
+        // mutation; no fresh WAL record is appended, so the page-LSN argument
+        // routes the heap append through the no-WAL branch of `append_cell`.
         self.insert_recovered_at(tx_id, self.rel_id, row_id, payload, Lsn::ZERO)
     }
 
@@ -116,6 +119,7 @@ impl PageBackedHeap {
         row_id: RowId,
         payload: Vec<u8>,
     ) -> Result<()> {
+        // LSN sentinel: legit init. Recovery replay path; see `insert_recovered`.
         self.insert_recovered_at(tx_id, rel_id, row_id, payload, Lsn::ZERO)
     }
 
@@ -167,6 +171,7 @@ impl PageBackedHeap {
 
     pub fn update_recovered(&self, tx_id: TxId, row_id: RowId, payload: Vec<u8>) -> Result<()> {
         let current = self.current_tuple(row_id)?;
+        // LSN sentinel: legit init. Recovery replay; no fresh WAL record.
         self.append_update_version(tx_id, self.rel_id, row_id, payload, current, Lsn::ZERO)
     }
 
@@ -178,6 +183,7 @@ impl PageBackedHeap {
         payload: Vec<u8>,
     ) -> Result<()> {
         let current = self.current_tuple(row_id)?;
+        // LSN sentinel: legit init. Recovery replay; no fresh WAL record.
         self.append_update_version(tx_id, rel_id, row_id, payload, current, Lsn::ZERO)
     }
 
@@ -208,6 +214,7 @@ impl PageBackedHeap {
 
     pub fn delete_recovered(&self, tx_id: TxId, row_id: RowId) -> Result<()> {
         let current = self.current_tuple(row_id)?;
+        // LSN sentinel: legit init. Recovery replay; no fresh WAL record.
         self.append_delete_version(tx_id, self.rel_id, row_id, current, Lsn::ZERO)
     }
 
@@ -218,6 +225,7 @@ impl PageBackedHeap {
         row_id: RowId,
     ) -> Result<()> {
         let current = self.current_tuple(row_id)?;
+        // LSN sentinel: legit init. Recovery replay; no fresh WAL record.
         self.append_delete_version(tx_id, rel_id, row_id, current, Lsn::ZERO)
     }
 
@@ -503,9 +511,16 @@ impl PageBackedHeap {
                 match staged_page.insert_cell(encoded) {
                     Ok(slot) => {
                         if let Some(wal) = &self.wal {
+                            // LSN sentinel: legit logic. Caller passes Lsn(1)
+                            // when this is a real, durable mutation; Lsn::ZERO
+                            // signals recovery replay where we must NOT append
+                            // a new WAL record.
                             if lsn != Lsn::ZERO {
                                 let snapshot = staged_page.clone();
                                 let generation = snapshot.header()?.generation;
+                                // LSN sentinel: legit init. The page-LSN field
+                                // of the WAL payload is rewritten to the real
+                                // end-LSN on line below after `wal.append`.
                                 let payload = WalPayload::PageImage {
                                     page_id: snapshot.header()?.page_id,
                                     page_lsn: Lsn::ZERO,
@@ -633,6 +648,10 @@ impl PageBackedHeap {
         let encoded = tuple.encode()?;
         let guard = self.buffer.pin(ptr.page_id)?;
         guard.with_page_mut(|page| page.overwrite_cell(ptr.slot, &encoded))?;
+        // LSN sentinel: legit init. Vacuum/horizon prunes already-committed
+        // dead undo links in place; no fresh WAL record is appended for this
+        // checkpoint-side maintenance, and this preserves the legacy
+        // "no-WAL-dependency" marker for the page-LSN field.
         guard.mark_dirty(Lsn::ZERO)
     }
 

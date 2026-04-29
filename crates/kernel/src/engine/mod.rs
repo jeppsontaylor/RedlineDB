@@ -282,6 +282,8 @@ impl Engine {
             );
             checkpoint.checkpoint_lsn
         } else {
+            // LSN sentinel: legit init. No checkpoint exists yet, so recovery
+            // replays the entire WAL starting from the very beginning.
             Lsn::ZERO
         };
         let metrics = recover_heap(&scan_report.records, replay_from_lsn, target, &txs, &heap)?;
@@ -359,6 +361,8 @@ impl Engine {
         tx.ensure_open()?;
         self.refresh_read_committed(tx);
         let row_id = self.heap.reserve_row_id();
+        // LSN sentinel: mutation. The heap append_cell logs a PageImage with
+        // the real WAL end-LSN; this argument only flags the page as dirty.
         self.heap
             .insert_with_row_id(tx.id(), row_id, payload, Lsn(1))?;
         Ok(row_id)

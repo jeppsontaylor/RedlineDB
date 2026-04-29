@@ -275,7 +275,10 @@ impl BtreeIndex {
                 },
             )
         })?;
-        meta_guard.mark_dirty(crate::format::Lsn::ZERO)?;
+        // LSN sentinel: mutation. Index-create writes the meta page; the page
+        // image is logged separately so any non-zero LSN works as a "dirty"
+        // marker.
+        meta_guard.mark_dirty(crate::format::Lsn(1))?;
         root_guard.with_page_mut(|page| {
             page.reinitialize_with_special(
                 PageKind::BtreeLeaf,
@@ -296,7 +299,8 @@ impl BtreeIndex {
                 },
             )
         })?;
-        root_guard.mark_dirty(crate::format::Lsn::ZERO)?;
+        // LSN sentinel: mutation. Index-create writes the empty leaf root.
+        root_guard.mark_dirty(crate::format::Lsn(1))?;
 
         Ok(Self {
             inner: Arc::new(IndexInner {
@@ -417,7 +421,9 @@ impl BtreeIndex {
                 header.high_key,
             )?;
             drop(page);
-            guard.mark_dirty(crate::format::Lsn::ZERO)?;
+            // LSN sentinel: mutation. Leaf insert path; record_page_image logs
+            // the post-image, so any non-zero LSN is fine as the dirty marker.
+            guard.mark_dirty(crate::format::Lsn(1))?;
             self.record_page_image(leaf_id, tx_id)?;
             return Ok(());
         }
@@ -486,7 +492,8 @@ impl BtreeIndex {
                 header.high_key,
             )?;
             drop(page);
-            guard.mark_dirty(crate::format::Lsn::ZERO)?;
+            // LSN sentinel: mutation. Leaf delete-mark path.
+            guard.mark_dirty(crate::format::Lsn(1))?;
             self.record_page_image(leaf_id, tx_id)?;
         }
         Ok(())
@@ -520,7 +527,8 @@ impl BtreeIndex {
             header.high_key,
         )?;
         drop(page);
-        guard.mark_dirty(crate::format::Lsn::ZERO)?;
+        // LSN sentinel: mutation. Leaf compaction rewrites the page in place.
+        guard.mark_dirty(crate::format::Lsn(1))?;
         Ok(())
     }
 
@@ -721,8 +729,9 @@ impl BtreeIndex {
                 header.high_key.clone(),
             )
         })?;
-        guard.mark_dirty(crate::format::Lsn::ZERO)?;
-        right_guard.mark_dirty(crate::format::Lsn::ZERO)?;
+        // LSN sentinel: mutation. Leaf split rewrites left, right pages.
+        guard.mark_dirty(crate::format::Lsn(1))?;
+        right_guard.mark_dirty(crate::format::Lsn(1))?;
         self.record_page_image(leaf_id, tx_id)?;
         self.record_page_image(right_guard.page_id(), tx_id)?;
 
@@ -783,7 +792,8 @@ impl BtreeIndex {
                             header.high_key.clone(),
                         )
                     })?;
-                    guard.mark_dirty(crate::format::Lsn::ZERO)?;
+                    // LSN sentinel: mutation. Parent absorbed the split entry.
+                    guard.mark_dirty(crate::format::Lsn(1))?;
                     self.record_page_image(parent_id, tx_id)?;
                     return Ok(());
                 }
@@ -833,8 +843,9 @@ impl BtreeIndex {
                         header.high_key.clone(),
                     )
                 })?;
-                guard.mark_dirty(crate::format::Lsn::ZERO)?;
-                right_guard.mark_dirty(crate::format::Lsn::ZERO)?;
+                // LSN sentinel: mutation. Internal split rewrites both halves.
+                guard.mark_dirty(crate::format::Lsn(1))?;
+                right_guard.mark_dirty(crate::format::Lsn(1))?;
                 self.record_page_image(parent_id, tx_id)?;
                 self.record_page_image(right_guard.page_id(), tx_id)?;
                 current_left = parent_id;
@@ -882,7 +893,8 @@ impl BtreeIndex {
                     Vec::new(),
                 )
             })?;
-            root_guard.mark_dirty(crate::format::Lsn::ZERO)?;
+            // LSN sentinel: mutation. New root page promoted from split.
+            root_guard.mark_dirty(crate::format::Lsn(1))?;
             self.record_page_image(root_guard.page_id(), tx_id)?;
             self.set_meta_root(root_guard.page_id(), left_level)?;
             return Ok(());
@@ -1035,7 +1047,8 @@ impl BtreeIndex {
             meta.root_level = root_level;
             Self::write_meta(page, &meta)
         })?;
-        guard.mark_dirty(crate::format::Lsn::ZERO)?;
+        // LSN sentinel: mutation. Meta page root pointer updated after split.
+        guard.mark_dirty(crate::format::Lsn(1))?;
         Ok(())
     }
 

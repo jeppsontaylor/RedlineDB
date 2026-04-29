@@ -164,7 +164,9 @@ fn index_recovery_replays_page_images_with_torn_tail() {
             )
             .unwrap();
     }
-    source_buffer.flush_all(Lsn::ZERO).unwrap();
+    // Pages mark dirty at Lsn(1) for any mutation; flush durable horizon must
+    // cover those dirty page-LSNs in this synthetic test (no real WAL flow).
+    source_buffer.flush_all(Lsn::new(1)).unwrap();
 
     let wal_dir = source.path().join("wal");
     let mut wal = WalManager::create(&wal_dir, WalConfig::default()).unwrap();
