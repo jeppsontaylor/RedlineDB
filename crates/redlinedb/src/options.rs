@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use serde::Serialize;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MemoryOptions {
     pub cache_bytes: usize,
@@ -168,6 +170,47 @@ pub struct DatabaseStats {
     pub table_count: usize,
     pub column_count: usize,
     pub index_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct BufferStats {
+    pub resident_pages: usize,
+    pub reads: u64,
+    pub writes: u64,
+    pub evictions: u64,
+    pub checkpoint_flushes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct TxBenchStats {
+    pub next_tx: u64,
+    pub next_csn: u64,
+    pub published_csn: u64,
+    pub active_transactions: usize,
+    pub active_snapshots: usize,
+    pub committed_states: usize,
+    pub pending_csns: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct WalBenchStats {
+    pub written_lsn: u64,
+    pub durable_lsn: u64,
+    pub retained_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct CheckpointBenchStats {
+    pub generation: Option<u64>,
+    pub vacuum_horizon_csn: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct BenchmarkStats {
+    pub buffer: BufferStats,
+    pub tx: TxBenchStats,
+    pub wal: WalBenchStats,
+    pub checkpoint: CheckpointBenchStats,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

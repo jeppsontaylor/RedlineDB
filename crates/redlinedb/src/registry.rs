@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -48,7 +49,7 @@ pub(crate) struct DatabaseEntry {
     pub _owner_lock: Option<Arc<File>>,
     pub path: PathBuf,
     pub interrupt: Arc<AtomicBool>,
-    pub busy_timeout: Duration,
+    pub busy_timeout: Mutex<Duration>,
 }
 
 #[derive(Default)]
@@ -115,7 +116,7 @@ pub(crate) fn open_database(
         _owner_lock: owner_lock,
         path: path.clone(),
         interrupt: Arc::new(AtomicBool::new(false)),
-        busy_timeout: options.busy_timeout,
+        busy_timeout: Mutex::new(options.busy_timeout),
     });
     registry.entries.insert(path, Arc::downgrade(&entry));
     Ok(entry)
@@ -139,9 +140,32 @@ fn normalize_path(path: &Path, create: bool) -> Result<PathBuf> {
 
 fn acquire_owner_lock(path: &Path) -> Result<File> {
     let lock_path = path.join("owner.lock");
-    FsOpenOptions::new()
-        .create_new(true)
+    let file = FsOpenOptions::new()
+        .create(true)
+        .read(true)
         .write(true)
-        .open(lock_path)
-        .map_err(Into::into)
+        .truncate(false)
+        .open(lock_path)?;
+    lock_owner_file(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn lock_owner_file(file: &File) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorCode::Busy,
+            format!("database already open: {}", io::Error::last_os_error()),
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_owner_file(_file: &File) -> Result<()> {
+    Ok(())
 }

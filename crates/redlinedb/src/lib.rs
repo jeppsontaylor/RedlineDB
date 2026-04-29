@@ -21,9 +21,10 @@ pub use machine::{
     SelectSpec, TableRef, UnaryOp, UpdateSpec,
 };
 pub use options::{
-    AnalyzeOptions, BackupOptions, BackupStats, CheckpointStats, CommitStats, ConnectionStats,
-    DatabaseStats, Durability, ExecuteSummary, FunctionArity, FunctionFlags, MemoryOptions,
-    OpenOptions, OptimizerOptions, QueryMemoryOptions, VacuumStats,
+    AnalyzeOptions, BackupOptions, BackupStats, BenchmarkStats, BufferStats, CheckpointBenchStats,
+    CheckpointStats, CommitStats, ConnectionStats, DatabaseStats, Durability, ExecuteSummary,
+    FunctionArity, FunctionFlags, MemoryOptions, OpenOptions, OptimizerOptions, QueryMemoryOptions,
+    TxBenchStats, VacuumStats, WalBenchStats,
 };
 pub use params::Params;
 pub use phase8::{
@@ -115,13 +116,27 @@ impl Database {
     }
 
     pub fn connect(&self) -> Result<Connection> {
+        let busy_timeout = *self
+            .inner
+            .busy_timeout
+            .lock()
+            .expect("busy timeout poisoned");
         Ok(Connection {
             inner: self.inner.db.connect(),
             read_only: self.inner.fingerprint.read_only,
-            busy_timeout: self.inner.busy_timeout,
+            busy_timeout,
             interrupted: Arc::clone(&self.inner.interrupt),
             _sync_marker: Cell::new(()),
         })
+    }
+
+    pub fn set_busy_timeout(&self, timeout: Duration) {
+        *self
+            .inner
+            .busy_timeout
+            .lock()
+            .expect("busy timeout poisoned") = timeout;
+        self.inner.db.set_busy_timeout(timeout);
     }
 
     pub fn prepare(&self, sql: &str) -> Result<Prepared> {
@@ -167,6 +182,41 @@ impl Database {
             table_count: stats.tx.committed_states,
             column_count: stats.tx.active_transactions,
             index_count: stats.tx.active_snapshots,
+        })
+    }
+
+    pub fn benchmark_stats(&self) -> Result<BenchmarkStats> {
+        let stats = self.inner.db.stats()?;
+        let retained_bytes = self
+            .archive_stats()
+            .map(|archive| archive.archived_bytes)
+            .unwrap_or(0);
+        Ok(BenchmarkStats {
+            buffer: BufferStats {
+                resident_pages: stats.buffer.resident_pages,
+                reads: stats.buffer.reads,
+                writes: stats.buffer.writes,
+                evictions: stats.buffer.evictions,
+                checkpoint_flushes: stats.buffer.checkpoint_flushes,
+            },
+            tx: TxBenchStats {
+                next_tx: stats.tx.next_tx.0,
+                next_csn: stats.tx.next_csn.0,
+                published_csn: stats.tx.published_csn.0,
+                active_transactions: stats.tx.active_transactions,
+                active_snapshots: stats.tx.active_snapshots,
+                committed_states: stats.tx.committed_states,
+                pending_csns: stats.tx.pending_csns,
+            },
+            wal: WalBenchStats {
+                written_lsn: stats.wal_written_lsn.0,
+                durable_lsn: stats.wal_durable_lsn.0,
+                retained_bytes,
+            },
+            checkpoint: CheckpointBenchStats {
+                generation: stats.checkpoint.map(|control| control.generation),
+                vacuum_horizon_csn: stats.vacuum_horizon_csn.0,
+            },
         })
     }
 
@@ -344,6 +394,7 @@ impl Connection {
 
     pub fn set_busy_timeout(&mut self, timeout: Duration) {
         self.busy_timeout = timeout;
+        self.inner.set_busy_timeout(timeout);
     }
 
     pub fn interrupt_handle(&self) -> InterruptHandle {
@@ -695,6 +746,7 @@ fn sql_options(options: &OpenOptions) -> redlinedb_sql::DbOptions {
     let page_size = db.engine.page_size.max(1);
     let buffer_pages = (options.memory.cache_bytes / page_size).max(16);
     db.engine.buffer_pool_pages = buffer_pages;
+    db.engine.busy_timeout = options.busy_timeout;
     db.optimizer.enabled = options.optimizer.enabled;
     db.optimizer.max_exact_join_tables = options.optimizer.max_exact_join_tables;
     db.optimizer.max_join_alternatives = options.optimizer.max_join_alternatives;
@@ -714,6 +766,7 @@ fn sql_options(options: &OpenOptions) -> redlinedb_sql::DbOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn owned_and_borrowed_statements_return_the_same_row() {
@@ -757,5 +810,46 @@ mod tests {
             OwnedStep::Done => panic!("expected row"),
         }
         assert!(matches!(owned.step().expect("done"), OwnedStep::Done));
+    }
+
+    #[test]
+    fn benchmark_stats_surface_current_storage_counters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::create(dir.path().join("stats.redline")).expect("db");
+        let mut conn = db.connect().expect("conn");
+        conn.execute(
+            "CREATE TABLE kv(k INTEGER PRIMARY KEY, tenant INTEGER, v BLOB, version INTEGER)",
+            (),
+        )
+        .expect("create");
+        conn.execute(
+            "INSERT INTO kv(k, tenant, v, version) VALUES (?, ?, ?, ?)",
+            params![1_i64, 1_i64, vec![1_u8, 2, 3], 1_i64],
+        )
+        .expect("insert");
+
+        let stats = db.benchmark_stats().expect("benchmark stats");
+        assert!(stats.buffer.resident_pages > 0);
+        assert!(stats.wal.written_lsn >= stats.wal.durable_lsn);
+        assert!(stats.tx.next_tx >= 1);
+    }
+
+    #[test]
+    fn connection_set_busy_timeout_applies_to_future_lock_conflicts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::create(dir.path().join("timeout.redline")).expect("db");
+        let mut conn1 = db.connect().expect("conn1");
+        let mut conn2 = db.connect().expect("conn2");
+
+        conn1
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", ())
+            .expect("create");
+        conn1.begin(BeginMode::Immediate).expect("begin immediate");
+        conn2.set_busy_timeout(Duration::from_millis(25));
+
+        let err = conn2.begin(BeginMode::Immediate).expect_err("conflict");
+        assert_eq!(err.code(), ErrorCode::Busy);
+
+        conn1.rollback().expect("rollback");
     }
 }
