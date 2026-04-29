@@ -50,12 +50,29 @@ impl CatalogStore {
         let bytes = encode_snapshot_file(snapshot)?;
         let tmp = self.path.with_extension("tmp");
         {
+            // Lane E failpoint: armed before the temp catalog file is created.
+            // A crash here yields no `.tmp`, so recovery must observe the old
+            // catalog generation untouched.
+            crate::fail_point!("catalog::save::temp_write");
             let mut file = fs::File::create(&tmp)?;
             file.write_all(&bytes)?;
+            // Lane E failpoint: armed after the temp write but before fsync.
+            // Crashing here lets the OS keep the temp file in page cache only;
+            // recovery must still see the prior atomic snapshot.
+            crate::fail_point!("catalog::save::fsync");
             file.sync_all()?;
         }
+        // Lane E failpoint: armed before the atomic rename. The temp file is
+        // fully durable on disk; a crash here guarantees the rename never
+        // happened, so the prior schema snapshot remains the canonical one.
+        crate::fail_point!("catalog::save::rename");
         fs::rename(tmp, &self.path)?;
         if let Some(parent) = self.path.parent() {
+            // Lane E failpoint: armed before the parent-directory fsync that
+            // makes the rename durable. A crash here may lose the rename even
+            // though the inode bytes are durable, exercising the parent-fsync
+            // contract.
+            crate::fail_point!("catalog::save::parent_fsync");
             let dir = fs::File::open(parent)?;
             dir.sync_all()?;
         }

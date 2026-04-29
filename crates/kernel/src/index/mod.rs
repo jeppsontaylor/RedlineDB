@@ -421,6 +421,10 @@ impl BtreeIndex {
                 header.high_key,
             )?;
             drop(page);
+            // Lane E failpoint: armed before the leaf-write becomes visible
+            // (mark_dirty + record_page_image). A crash here proves the index
+            // entry is either fully reflected post-recovery or absent.
+            crate::fail_point!("index::insert");
             // LSN sentinel: mutation. Leaf insert path; record_page_image logs
             // the post-image, so any non-zero LSN is fine as the dirty marker.
             guard.mark_dirty(crate::format::Lsn(1))?;
@@ -492,6 +496,10 @@ impl BtreeIndex {
                 header.high_key,
             )?;
             drop(page);
+            // Lane E failpoint: armed before the delete-mark becomes durable;
+            // verifies that recovery either restores the entry (if pre-fsync)
+            // or surfaces the tombstone (if post-fsync) but never both.
+            crate::fail_point!("index::delete");
             // LSN sentinel: mutation. Leaf delete-mark path.
             guard.mark_dirty(crate::format::Lsn(1))?;
             self.record_page_image(leaf_id, tx_id)?;
@@ -697,6 +705,10 @@ impl BtreeIndex {
         physical: Vec<u8>,
         tx_id: crate::format::TxId,
     ) -> Result<()> {
+        // Lane E failpoint: armed at the start of leaf split, before any
+        // structural change is applied. Crashing here exercises recovery from
+        // a half-applied split (no new pages allocated yet on disk).
+        crate::fail_point!("index::split");
         let rel_id = self.descriptor().rel_id;
         let index_id = self.descriptor().index_id;
         let guard = self.inner.buffer.pin(leaf_id)?;
