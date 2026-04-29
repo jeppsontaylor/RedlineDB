@@ -1,0 +1,42 @@
+use std::time::Duration;
+
+use redlinedb_bench::Cli;
+
+fn run_spec(engine: redlinedb_bench::config::EngineKind) -> redlinedb_bench::config::RunSpec {
+    redlinedb_bench::config::RunSpec {
+        engine,
+        workload: redlinedb_bench::config::WorkloadKind::PointReadPk,
+        durability: redlinedb_bench::config::DurabilityKind::Strict,
+        threads: 1,
+        rows: 32,
+        duration: Duration::from_millis(100),
+        cache_bytes: 4 * 1024 * 1024,
+        seed: 7,
+        base_dir: std::env::temp_dir().join("redlinedb-bench-tests"),
+    }
+}
+
+#[test]
+fn redline_run_produces_operations() {
+    let record = redlinedb_bench::workload::run_once(&run_spec(
+        redlinedb_bench::config::EngineKind::Redline,
+    ))
+    .expect("record");
+    assert!(record.metrics.operations > 0);
+}
+
+#[test]
+fn sqlite_run_produces_operations() {
+    let record =
+        redlinedb_bench::workload::run_once(&run_spec(redlinedb_bench::config::EngineKind::Sqlite))
+            .expect("record");
+    assert!(record.metrics.operations > 0);
+}
+
+#[test]
+fn smoke_compare_config_exists() {
+    assert!(redlinedb_bench::default_smoke_config_path().exists());
+    assert!(redlinedb_bench::default_certification_config_path().exists());
+    assert!(redlinedb_bench::default_recovery_matrix_path().exists());
+    let _ = std::mem::size_of::<Cli>();
+}
