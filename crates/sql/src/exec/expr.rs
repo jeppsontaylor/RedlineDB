@@ -404,6 +404,8 @@ fn eval_binary(
             value_to_string(&left_value),
             value_to_string(&right_value)
         ))),
+        BinaryOperator::Arrow => crate::json::scalar::arrow_json(&left_value, &right_value)?,
+        BinaryOperator::LongArrow => crate::json::scalar::arrow_sql(&left_value, &right_value)?,
         other => {
             return Err(Error::UnsupportedSql(format!(
                 "unsupported binary op {other:?}"
@@ -872,6 +874,20 @@ fn eval_function(
             Some(SqlValue::Text(_)) => "text",
             Some(SqlValue::Blob(_)) => "blob",
         }))),
+        "json" => crate::json::scalar::json_func(&values),
+        "json_array" => crate::json::scalar::json_array(&values),
+        "json_array_length" => crate::json::scalar::json_array_length(&values),
+        "json_object" => crate::json::scalar::json_object(&values),
+        "json_extract" => crate::json::scalar::json_extract(&values),
+        "json_set" => crate::json::scalar::json_set(&values),
+        "json_insert" => crate::json::scalar::json_insert(&values),
+        "json_replace" => crate::json::scalar::json_replace(&values),
+        "json_remove" => crate::json::scalar::json_remove(&values),
+        "json_patch" => crate::json::scalar::json_patch(&values),
+        "json_type" => crate::json::scalar::json_type(&values),
+        "json_valid" => crate::json::scalar::json_valid(&values),
+        "json_quote" => crate::json::scalar::json_quote(&values),
+        "json_minify" => crate::json::scalar::json_minify(&values),
         _ => Err(Error::UnsupportedSql(format!(
             "unsupported function {name}"
         ))),
