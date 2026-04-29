@@ -74,6 +74,12 @@ pub enum Error {
 
     #[error("invalid record: {0}")]
     InvalidRecord(&'static str),
+
+    #[error("invalid jsonb: {0}")]
+    InvalidJsonb(&'static str),
+
+    #[error("invalid json path: {0}")]
+    InvalidJsonPath(&'static str),
 }
 
 impl PartialEq for Error {
@@ -120,6 +126,8 @@ impl PartialEq for Error {
             (Self::DatatypeMismatch, Self::DatatypeMismatch) => true,
             (Self::UnsupportedDdl(left), Self::UnsupportedDdl(right)) => left == right,
             (Self::InvalidRecord(left), Self::InvalidRecord(right)) => left == right,
+            (Self::InvalidJsonb(left), Self::InvalidJsonb(right)) => left == right,
+            (Self::InvalidJsonPath(left), Self::InvalidJsonPath(right)) => left == right,
             _ => false,
         }
     }
