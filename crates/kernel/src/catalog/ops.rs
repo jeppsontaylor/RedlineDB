@@ -16,7 +16,7 @@ use super::schema::{
     TableDef,
 };
 use super::value::OwnedValue;
-use crate::format::RelId;
+use crate::format::{PageId, RelId};
 use crate::{Error, Result};
 
 pub fn resolve_schema_id(snapshot: &SchemaSnapshot, schema: Option<&DbName>) -> Result<SchemaId> {
@@ -399,6 +399,39 @@ pub fn apply_create_index(
     }
     snapshot.meta.next_object_id = next_object_id;
     snapshot.meta.next_relation_id = next_relation_id;
+    snapshot.meta.schema_epoch = SchemaEpoch(snapshot.meta.schema_epoch.0.saturating_add(1));
+    snapshot.rebuild_indexes();
+    Ok(snapshot)
+}
+
+/// Update the `meta_page_id` for an index inside the snapshot. Lane A wires
+/// this together with `apply_create_index` so the catalog snapshot durably
+/// records the freshly-allocated B-tree meta page. Returns an error if the
+/// index id is not present in the snapshot. Bumps the schema epoch so the
+/// catalog snapshot is treated as fresh by recovery and consumers.
+pub fn apply_set_index_meta_page_id(
+    mut snapshot: SchemaSnapshot,
+    index_id: IndexId,
+    meta_page_id: PageId,
+) -> Result<SchemaSnapshot> {
+    let mut updated = false;
+    for slot in &mut snapshot.tables {
+        if slot.indexes.iter().any(|idx| idx.index_id == index_id) {
+            let mut table = (**slot).clone();
+            for idx in &mut table.indexes {
+                if idx.index_id == index_id {
+                    idx.meta_page_id = Some(meta_page_id);
+                    updated = true;
+                    break;
+                }
+            }
+            *slot = Arc::new(table);
+            break;
+        }
+    }
+    if !updated {
+        return Err(Error::ObjectNotFound);
+    }
     snapshot.meta.schema_epoch = SchemaEpoch(snapshot.meta.schema_epoch.0.saturating_add(1));
     snapshot.rebuild_indexes();
     Ok(snapshot)

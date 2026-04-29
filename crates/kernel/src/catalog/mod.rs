@@ -33,7 +33,7 @@ pub use manager::CatalogManager;
 pub use names::{DbName, QualifiedName};
 pub use ops::{
     apply_alter_table, apply_create_index, apply_create_table, apply_drop_index, apply_drop_table,
-    lookup_index, lookup_table, resolve_schema_id,
+    apply_set_index_meta_page_id, lookup_index, lookup_table, resolve_schema_id,
 };
 pub use record::{RecordRef, RecordScratch, encode_record};
 pub use schema::{
