@@ -52,6 +52,30 @@ fn create_insert_select_round_trip() {
 }
 
 #[test]
+fn select_distinct_deduplicates_rows() {
+    let (_dir, conn) = open_database();
+
+    conn.execute("CREATE TABLE t(v TEXT)")
+        .expect("create table");
+    conn.execute("INSERT INTO t VALUES ('a')")
+        .expect("insert a");
+    conn.execute("INSERT INTO t VALUES ('a')")
+        .expect("insert duplicate a");
+    conn.execute("INSERT INTO t VALUES ('b')")
+        .expect("insert b");
+
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT v FROM t ORDER BY v")
+        .expect("prepare distinct");
+    let mut rows = Vec::new();
+    while let Step::Row = stmt.step().expect("step distinct") {
+        rows.push(stmt.column_text(0).expect("v").to_owned());
+    }
+
+    assert_eq!(rows, vec!["a".to_owned(), "b".to_owned()]);
+}
+
+#[test]
 fn begin_commit_and_rollback_persist_and_discard_rows() {
     let (_dir, conn) = open_database();
 
@@ -129,6 +153,163 @@ fn sqlite_schema_lists_created_objects() {
         rows.iter()
             .any(|row| row.0 == "index" && row.1 == "t_b_idx" && row.2 == "t")
     );
+}
+
+#[test]
+fn pragma_introspection_and_state_round_trips_work() {
+    let (dir, conn) = open_database();
+    let db_path = dir.path().join("redlinedb-sql-smoke.db");
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT NOT NULL DEFAULT 'bee')")
+        .expect("create table");
+    conn.execute("CREATE INDEX t_b_idx ON t(b)")
+        .expect("create index");
+
+    let mut table_info = conn.prepare("PRAGMA table_info(t)").expect("table info");
+    let mut table_rows = Vec::new();
+    while let Step::Row = table_info.step().expect("step table_info") {
+        table_rows.push((
+            table_info.column_i64(0).expect("cid"),
+            table_info.column_text(1).expect("name").to_owned(),
+            table_info.column_text(2).expect("type").to_owned(),
+            table_info.column_i64(3).expect("notnull"),
+            table_info.column_value(4).expect("default").clone(),
+            table_info.column_i64(5).expect("pk"),
+        ));
+    }
+    assert_eq!(table_rows.len(), 2);
+    assert_eq!(table_rows[0].1, "a");
+    assert_eq!(table_rows[0].5, 1);
+    assert_eq!(table_rows[1].1, "b");
+    assert_eq!(table_rows[1].3, 1);
+
+    let mut index_list = conn.prepare("PRAGMA index_list(t)").expect("index list");
+    let mut index_rows = Vec::new();
+    while let Step::Row = index_list.step().expect("step index_list") {
+        index_rows.push((
+            index_list.column_i64(0).expect("seq"),
+            index_list.column_text(1).expect("name").to_owned(),
+            index_list.column_i64(2).expect("unique"),
+            index_list.column_text(3).expect("origin").to_owned(),
+            index_list.column_i64(4).expect("partial"),
+        ));
+    }
+    assert!(
+        index_rows
+            .iter()
+            .any(|row| row.1 == "t_b_idx" && row.2 == 0 && row.3 == "c")
+    );
+    assert!(index_rows.iter().any(|row| row.3 == "pk"));
+
+    let mut index_info = conn
+        .prepare("PRAGMA index_info(t_b_idx)")
+        .expect("index info");
+    assert_eq!(index_info.step().expect("step"), Step::Row);
+    assert_eq!(index_info.column_i64(0).expect("seqno"), 0);
+    assert_eq!(index_info.column_i64(1).expect("cid"), 1);
+    assert_eq!(index_info.column_text(2).expect("name"), "b");
+    assert_eq!(index_info.step().expect("done"), Step::Done);
+
+    let mut table_xinfo = conn.prepare("PRAGMA table_xinfo(t)").expect("table xinfo");
+    let mut xinfo_rows = Vec::new();
+    while let Step::Row = table_xinfo.step().expect("step table_xinfo") {
+        xinfo_rows.push((
+            table_xinfo.column_i64(0).expect("cid"),
+            table_xinfo.column_text(1).expect("name").to_owned(),
+            table_xinfo.column_i64(6).expect("hidden"),
+        ));
+    }
+    assert_eq!(xinfo_rows.len(), 2);
+    assert!(xinfo_rows.iter().all(|row| row.2 == 0));
+
+    let mut table_list = conn.prepare("PRAGMA table_list").expect("table list");
+    let mut table_list_rows = Vec::new();
+    while let Step::Row = table_list.step().expect("step table_list") {
+        table_list_rows.push((
+            table_list.column_text(0).expect("schema").to_owned(),
+            table_list.column_text(1).expect("name").to_owned(),
+            table_list.column_text(2).expect("type").to_owned(),
+            table_list.column_i64(3).expect("ncol"),
+            table_list.column_i64(4).expect("wr"),
+            table_list.column_i64(5).expect("strict"),
+        ));
+    }
+    assert!(
+        table_list_rows
+            .iter()
+            .any(|row| row.1 == "t" && row.2 == "table")
+    );
+
+    let mut index_xinfo = conn
+        .prepare("PRAGMA index_xinfo(t_b_idx)")
+        .expect("index xinfo");
+    assert_eq!(index_xinfo.step().expect("step"), Step::Row);
+    assert_eq!(index_xinfo.column_i64(0).expect("seqno"), 0);
+    assert_eq!(index_xinfo.column_i64(1).expect("cid"), 1);
+    assert_eq!(index_xinfo.column_text(2).expect("name"), "b");
+    assert_eq!(index_xinfo.column_i64(3).expect("desc"), 0);
+    assert_eq!(index_xinfo.column_text(4).expect("coll"), "BINARY");
+    assert_eq!(index_xinfo.column_i64(5).expect("key"), 1);
+    assert_eq!(index_xinfo.step().expect("done"), Step::Done);
+
+    let mut fk_list = conn
+        .prepare("PRAGMA foreign_key_list(t)")
+        .expect("foreign key list");
+    assert_eq!(fk_list.step().expect("done"), Step::Done);
+
+    let mut foreign_keys = conn.prepare("PRAGMA foreign_keys").expect("foreign_keys");
+    assert_eq!(foreign_keys.step().expect("step"), Step::Row);
+    assert_eq!(foreign_keys.column_i64(0).expect("foreign_keys"), 0);
+    assert_eq!(foreign_keys.step().expect("done"), Step::Done);
+
+    let mut set_foreign_keys = conn
+        .prepare("PRAGMA foreign_keys = ON")
+        .expect("set foreign_keys");
+    step_done(&mut set_foreign_keys);
+
+    let mut foreign_keys = conn.prepare("PRAGMA foreign_keys").expect("foreign_keys");
+    assert_eq!(foreign_keys.step().expect("step"), Step::Row);
+    assert_eq!(foreign_keys.column_i64(0).expect("foreign_keys"), 1);
+    assert_eq!(foreign_keys.step().expect("done"), Step::Done);
+
+    let mut user_version = conn.prepare("PRAGMA user_version").expect("user version");
+    assert_eq!(user_version.step().expect("step"), Step::Row);
+    assert_eq!(user_version.column_i64(0).expect("user_version"), 0);
+    assert_eq!(user_version.step().expect("done"), Step::Done);
+
+    let mut set_user_version = conn
+        .prepare("PRAGMA user_version = 7")
+        .expect("set user version");
+    step_done(&mut set_user_version);
+
+    let mut user_version = conn.prepare("PRAGMA user_version").expect("user version");
+    assert_eq!(user_version.step().expect("step"), Step::Row);
+    assert_eq!(user_version.column_i64(0).expect("user_version"), 7);
+    assert_eq!(user_version.step().expect("done"), Step::Done);
+
+    let mut schema_version = conn
+        .prepare("PRAGMA schema_version")
+        .expect("schema version");
+    assert_eq!(schema_version.step().expect("step"), Step::Row);
+    assert!(schema_version.column_i64(0).expect("schema_version") > 0);
+    assert_eq!(schema_version.step().expect("done"), Step::Done);
+
+    let mut db_list = conn.prepare("PRAGMA database_list").expect("database_list");
+    assert_eq!(db_list.step().expect("step"), Step::Row);
+    assert_eq!(db_list.column_i64(0).expect("seq"), 0);
+    assert_eq!(db_list.column_text(1).expect("name"), "main");
+    assert_eq!(
+        db_list.column_text(2).expect("file"),
+        db_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(db_list.step().expect("done"), Step::Done);
+
+    let mut integrity_check = conn
+        .prepare("PRAGMA integrity_check")
+        .expect("integrity_check");
+    assert_eq!(integrity_check.step().expect("step"), Step::Row);
+    assert_eq!(integrity_check.column_text(0).expect("integrity"), "ok");
+    assert_eq!(integrity_check.step().expect("done"), Step::Done);
 }
 
 #[test]
@@ -280,6 +461,216 @@ fn execute_returns_read_and_write_counts() {
         1
     );
     assert_eq!(conn.execute("SELECT a, b FROM t").expect("select"), 1);
+}
+
+#[test]
+fn alter_table_rename_add_and_rename_column_work() {
+    let (_dir, conn) = open_database();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT NOT NULL DEFAULT 'bee')")
+        .expect("create table");
+    conn.execute("INSERT INTO t(a) VALUES (1)")
+        .expect("insert row");
+
+    conn.execute("ALTER TABLE t RENAME TO t2")
+        .expect("rename table");
+    conn.execute("ALTER TABLE t2 ADD COLUMN c TEXT DEFAULT 'cee'")
+        .expect("add column");
+    conn.execute("ALTER TABLE t2 RENAME COLUMN b TO renamed_b")
+        .expect("rename column");
+
+    let mut stmt = conn
+        .prepare("SELECT a, renamed_b, c FROM t2 ORDER BY a")
+        .expect("select renamed table");
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("a"), 1);
+    assert_eq!(stmt.column_text(1).expect("renamed_b"), "bee");
+    assert_eq!(stmt.column_text(2).expect("c"), "cee");
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+
+    conn.execute("INSERT INTO t2(a, renamed_b) VALUES (2, 'row2')")
+        .expect("insert post alter");
+    let mut stmt = conn
+        .prepare("SELECT a, renamed_b, c FROM t2 ORDER BY a")
+        .expect("select after insert");
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_text(2).expect("c"), "cee");
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_text(1).expect("renamed_b"), "row2");
+    assert_eq!(stmt.column_text(2).expect("c"), "cee");
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+}
+
+#[test]
+fn returning_clauses_surface_write_rows() {
+    let (_dir, conn) = open_database();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+        .expect("create table");
+
+    let mut insert = conn
+        .prepare("INSERT INTO t(a, b) VALUES (1, 'one') RETURNING a, b")
+        .expect("prepare insert returning");
+    assert_eq!(insert.step().expect("step"), Step::Row);
+    assert_eq!(insert.column_i64(0).expect("a"), 1);
+    assert_eq!(insert.column_text(1).expect("b"), "one");
+    assert_eq!(insert.step().expect("done"), Step::Done);
+
+    let mut update = conn
+        .prepare("UPDATE t SET b = 'two' WHERE a = 1 RETURNING a, b")
+        .expect("prepare update returning");
+    assert_eq!(update.step().expect("step"), Step::Row);
+    assert_eq!(update.column_i64(0).expect("a"), 1);
+    assert_eq!(update.column_text(1).expect("b"), "two");
+    assert_eq!(update.step().expect("done"), Step::Done);
+
+    let mut delete = conn
+        .prepare("DELETE FROM t WHERE a = 1 RETURNING a")
+        .expect("prepare delete returning");
+    assert_eq!(delete.step().expect("step"), Step::Row);
+    assert_eq!(delete.column_i64(0).expect("a"), 1);
+    assert_eq!(delete.step().expect("done"), Step::Done);
+}
+
+#[test]
+fn upsert_and_conflict_algorithms_work() {
+    let (_dir, conn) = open_database();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE, note TEXT)")
+        .expect("create table");
+    conn.execute("INSERT INTO t VALUES (1, 'one', 'original')")
+        .expect("insert original");
+
+    conn.execute("INSERT OR IGNORE INTO t VALUES (2, 'one', 'ignored')")
+        .expect("insert or ignore");
+
+    let mut stmt = conn
+        .prepare("SELECT id, v, note FROM t ORDER BY id")
+        .expect("select after ignore");
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("id"), 1);
+    assert_eq!(stmt.column_text(1).expect("v"), "one");
+    assert_eq!(stmt.column_text(2).expect("note"), "original");
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+
+    conn.execute("INSERT OR REPLACE INTO t VALUES (2, 'one', 'replaced')")
+        .expect("insert or replace");
+
+    let mut stmt = conn
+        .prepare("SELECT id, v, note FROM t ORDER BY id")
+        .expect("select after replace");
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("id"), 2);
+    assert_eq!(stmt.column_text(1).expect("v"), "one");
+    assert_eq!(stmt.column_text(2).expect("note"), "replaced");
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+
+    conn.execute("INSERT INTO t VALUES (3, 'two', 'second')")
+        .expect("insert second");
+    conn.execute(
+        "INSERT INTO t(id, v, note) VALUES (4, 'two', 'updated') ON CONFLICT(v) DO NOTHING",
+    )
+    .expect("insert on conflict do nothing");
+
+    let mut stmt = conn
+        .prepare("SELECT id, v, note FROM t WHERE v = 'two'")
+        .expect("select after do nothing");
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("id"), 3);
+    assert_eq!(stmt.column_text(2).expect("note"), "second");
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+
+    conn.execute("INSERT INTO t(id, v, note) VALUES (4, 'two', 'conflict update') ON CONFLICT(v) DO UPDATE SET note = excluded.note")
+        .expect("insert on conflict do update");
+
+    let mut stmt = conn
+        .prepare("SELECT id, v, note FROM t WHERE v = 'two'")
+        .expect("select after do update");
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("id"), 3);
+    assert_eq!(stmt.column_text(2).expect("note"), "conflict update");
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+}
+
+#[test]
+fn union_all_concatenates_rows() {
+    let (_dir, conn) = open_database();
+
+    let mut stmt = conn
+        .prepare("SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3")
+        .expect("prepare union all");
+
+    let mut rows = Vec::new();
+    while let Step::Row = stmt.step().expect("step union all") {
+        rows.push(stmt.column_i64(0).expect("v"));
+    }
+
+    assert_eq!(rows, vec![1, 2, 3]);
+}
+
+#[test]
+fn exists_and_in_subqueries_follow_membership_rules() {
+    let (_dir, conn) = open_database();
+
+    conn.execute("CREATE TABLE t(x INTEGER)")
+        .expect("create table");
+    conn.execute("INSERT INTO t VALUES (1)")
+        .expect("insert row 1");
+    conn.execute("INSERT INTO t VALUES (3)")
+        .expect("insert row 3");
+
+    let mut exists = conn
+        .prepare("SELECT EXISTS(SELECT 1 FROM t WHERE x = 3), EXISTS(SELECT 1 FROM t WHERE x = 9)")
+        .expect("prepare exists");
+    assert_eq!(exists.step().expect("step"), Step::Row);
+    assert_eq!(exists.column_i64(0).expect("exists true"), 1);
+    assert_eq!(exists.column_i64(1).expect("exists false"), 0);
+    assert_eq!(exists.step().expect("done"), Step::Done);
+
+    let mut membership = conn
+        .prepare("SELECT 3 IN (SELECT x FROM t), 9 IN (SELECT x FROM t)")
+        .expect("prepare in subquery");
+    assert_eq!(membership.step().expect("step"), Step::Row);
+    assert_eq!(membership.column_i64(0).expect("in true"), 1);
+    assert_eq!(membership.column_i64(1).expect("in false"), 0);
+    assert_eq!(membership.step().expect("done"), Step::Done);
+}
+
+#[test]
+fn left_join_null_extends_missing_rows() {
+    let (_dir, conn) = open_database();
+
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT)")
+        .expect("create parent");
+    conn.execute("CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER, note TEXT)")
+        .expect("create child");
+    conn.execute("INSERT INTO parent VALUES (1, 'one')")
+        .expect("insert parent 1");
+    conn.execute("INSERT INTO parent VALUES (2, 'two')")
+        .expect("insert parent 2");
+    conn.execute("INSERT INTO child VALUES (10, 1, 'matched')")
+        .expect("insert matched child");
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT parent.id, child.note \
+             FROM parent LEFT JOIN child ON parent.id = child.parent_id \
+             ORDER BY parent.id",
+        )
+        .expect("prepare left join");
+
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("parent id"), 1);
+    assert_eq!(stmt.column_text(1).expect("child note"), "matched");
+
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("parent id"), 2);
+    assert_eq!(
+        stmt.column_value(1).expect("child note"),
+        &redlinedb_sql::SqlValue::Null
+    );
+
+    assert_eq!(stmt.step().expect("done"), Step::Done);
 }
 
 #[test]

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::Duration;
 
 use redlinedb_kernel::engine::Txn;
+use redlinedb_kernel::error::Error as KernelError;
 use redlinedb_kernel::format::RowId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,6 +18,8 @@ pub struct SessionState {
     pub tx: Option<Txn>,
     pub failed: bool,
     pub changes: usize,
+    pub total_changes: usize,
+    pub foreign_keys: bool,
     pub last_insert_rowid: Option<i64>,
     pub unique_guards: Vec<UniqueKeyGuard>,
 }
@@ -26,6 +30,8 @@ impl SessionState {
         self.tx = None;
         self.failed = false;
         self.changes = 0;
+        self.total_changes = 0;
+        self.foreign_keys = false;
         self.last_insert_rowid = None;
         self.unique_guards.clear();
     }
@@ -35,6 +41,7 @@ impl SessionState {
 pub struct UniqueLockTable {
     shards: Vec<Mutex<HashMap<Vec<u8>, UniqueLockState>>>,
     cvars: Vec<Condvar>,
+    timeout: RwLock<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,7 +59,7 @@ pub struct UniqueKeyGuard {
 }
 
 impl UniqueLockTable {
-    pub fn new(shards: usize) -> Arc<Self> {
+    pub fn new(shards: usize, timeout: Duration) -> Arc<Self> {
         let shards = shards.max(1);
         let mut tables = Vec::with_capacity(shards);
         let mut cvars = Vec::with_capacity(shards);
@@ -63,25 +70,47 @@ impl UniqueLockTable {
         Arc::new(Self {
             shards: tables,
             cvars,
+            timeout: RwLock::new(timeout),
         })
     }
 
-    pub fn lock(self: &Arc<Self>, key: Vec<u8>, owner: u64) -> UniqueKeyGuard {
+    pub fn set_timeout(&self, timeout: Duration) {
+        *self.timeout.write().expect("unique lock timeout poisoned") = timeout;
+    }
+
+    pub fn lock(
+        self: &Arc<Self>,
+        key: Vec<u8>,
+        owner: u64,
+    ) -> crate::error::Result<UniqueKeyGuard> {
         let shard = self.shard(&key);
         let mut map = self.shards[shard].lock().expect("unique lock poisoned");
+        let timeout = *self.timeout.read().expect("unique lock timeout poisoned");
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             let state = map.entry(key.clone()).or_default();
             if state.owner == 0 || state.owner == owner {
                 state.owner = owner;
                 state.depth += 1;
-                return UniqueKeyGuard {
+                return Ok(UniqueKeyGuard {
                     table: Arc::clone(self),
                     shard,
                     key,
                     owner,
-                };
+                });
             }
-            map = self.cvars[shard].wait(map).expect("unique lock poisoned");
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(crate::error::Error::Kernel(KernelError::LockTimeout));
+            }
+            let wait = deadline.saturating_duration_since(now);
+            let (next_map, timeout) = self.cvars[shard]
+                .wait_timeout(map, wait)
+                .expect("unique lock poisoned");
+            map = next_map;
+            if timeout.timed_out() {
+                return Err(crate::error::Error::Kernel(KernelError::LockTimeout));
+            }
         }
     }
 

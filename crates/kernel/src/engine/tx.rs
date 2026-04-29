@@ -1,5 +1,6 @@
 use crate::catalog::SchemaSnapshot;
-use crate::format::{Csn, RowId, TxId};
+use crate::engine::lock::RowKey;
+use crate::format::{Csn, TxId};
 use crate::txn::{Isolation, Snapshot, TxState};
 use crate::{Error, Result};
 use std::collections::{BTreeSet, HashMap};
@@ -12,7 +13,7 @@ pub struct Txn {
     isolation: Isolation,
     snapshot: Snapshot,
     pending_schema_snapshot: Option<Arc<SchemaSnapshot>>,
-    row_locks: Vec<RowId>,
+    row_locks: Vec<RowKey>,
     open: bool,
     lifecycle: Option<Arc<TxnLifecycle>>,
 }
@@ -77,15 +78,15 @@ impl Txn {
         }
     }
 
-    pub(crate) fn has_row_lock(&self, row_id: RowId) -> bool {
-        self.row_locks.contains(&row_id)
+    pub(crate) fn has_row_lock(&self, key: RowKey) -> bool {
+        self.row_locks.contains(&key)
     }
 
-    pub(crate) fn push_row_lock(&mut self, row_id: RowId) {
-        self.row_locks.push(row_id);
+    pub(crate) fn push_row_lock(&mut self, key: RowKey) {
+        self.row_locks.push(key);
     }
 
-    pub(crate) fn drain_row_locks(&mut self) -> impl Iterator<Item = RowId> + '_ {
+    pub(crate) fn drain_row_locks(&mut self) -> impl Iterator<Item = RowKey> + '_ {
         self.row_locks.drain(..)
     }
 }
@@ -121,6 +122,32 @@ impl Drop for TxnLifecycle {
             inner.abort(self.tx_id);
             inner.unregister_active(self.tx_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::lock::RowKey;
+    use crate::format::{RelId, RowId};
+
+    #[test]
+    fn row_locks_track_relation_identity() {
+        let txs = ConcurrentTxStatus::new();
+        let mut tx = txs.begin_txn(Isolation::Snapshot);
+        let first = RowKey {
+            rel_id: RelId(1),
+            row_id: RowId(7),
+        };
+        let second = RowKey {
+            rel_id: RelId(2),
+            row_id: RowId(7),
+        };
+        tx.push_row_lock(first);
+        assert!(tx.has_row_lock(first));
+        assert!(!tx.has_row_lock(second));
+        let locked: Vec<_> = tx.drain_row_locks().collect();
+        assert_eq!(locked, vec![first]);
     }
 }
 

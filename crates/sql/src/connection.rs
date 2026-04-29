@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
@@ -60,6 +61,7 @@ impl StatementCache {
 pub struct DbOptions {
     pub engine: EngineConfig,
     pub unique_lock_shards: usize,
+    pub busy_timeout: Duration,
     pub optimizer: OptimizerConfig,
     pub query_memory: QueryMemoryConfig,
     pub stats: StatsConfig,
@@ -70,6 +72,7 @@ impl Default for DbOptions {
         Self {
             engine: EngineConfig::default(),
             unique_lock_shards: 128,
+            busy_timeout: Duration::from_secs(5),
             optimizer: OptimizerConfig::default(),
             query_memory: QueryMemoryConfig::default(),
             stats: StatsConfig::default(),
@@ -138,6 +141,7 @@ impl Default for StatsConfig {
 
 #[derive(Debug)]
 pub struct Database {
+    path: Arc<PathBuf>,
     engine: Arc<Engine>,
     unique_locks: Arc<UniqueLockTable>,
     stmt_cache: StatementCache,
@@ -147,6 +151,7 @@ pub struct Database {
     stats_config: StatsConfig,
     query_memory: QueryMemoryConfig,
     optimizer: OptimizerConfig,
+    user_version: Mutex<i64>,
 }
 
 #[derive(Debug)]
@@ -166,8 +171,9 @@ impl Database {
             .unwrap_or_else(|| Arc::new(StatsSnapshot::default()));
         let optimizer_hash = hash_optimizer(&opts.optimizer, &opts.query_memory);
         Ok(Arc::new(Self {
+            path: Arc::new(base.to_path_buf()),
             engine,
-            unique_locks: UniqueLockTable::new(opts.unique_lock_shards),
+            unique_locks: UniqueLockTable::new(opts.unique_lock_shards, opts.busy_timeout),
             stmt_cache: StatementCache::new(),
             optimizer_hash,
             stats_store,
@@ -175,6 +181,7 @@ impl Database {
             stats_config: opts.stats,
             query_memory: opts.query_memory,
             optimizer: opts.optimizer,
+            user_version: Mutex::new(0),
         }))
     }
 
@@ -187,8 +194,9 @@ impl Database {
             .unwrap_or_else(|| Arc::new(StatsSnapshot::default()));
         let optimizer_hash = hash_optimizer(&opts.optimizer, &opts.query_memory);
         Ok(Arc::new(Self {
+            path: Arc::new(base.to_path_buf()),
             engine,
-            unique_locks: UniqueLockTable::new(opts.unique_lock_shards),
+            unique_locks: UniqueLockTable::new(opts.unique_lock_shards, opts.busy_timeout),
             stmt_cache: StatementCache::new(),
             optimizer_hash,
             stats_store,
@@ -196,6 +204,7 @@ impl Database {
             stats_config: opts.stats,
             query_memory: opts.query_memory,
             optimizer: opts.optimizer,
+            user_version: Mutex::new(0),
         }))
     }
 
@@ -212,8 +221,9 @@ impl Database {
             .unwrap_or_else(|| Arc::new(StatsSnapshot::default()));
         let optimizer_hash = hash_optimizer(&opts.optimizer, &opts.query_memory);
         Ok(Arc::new(Self {
+            path: Arc::new(base.to_path_buf()),
             engine,
-            unique_locks: UniqueLockTable::new(opts.unique_lock_shards),
+            unique_locks: UniqueLockTable::new(opts.unique_lock_shards, opts.busy_timeout),
             stmt_cache: StatementCache::new(),
             optimizer_hash,
             stats_store,
@@ -221,6 +231,7 @@ impl Database {
             stats_config: opts.stats,
             query_memory: opts.query_memory,
             optimizer: opts.optimizer,
+            user_version: Mutex::new(0),
         }))
     }
 
@@ -246,6 +257,11 @@ impl Database {
 
     pub(crate) fn stats_config(&self) -> &StatsConfig {
         &self.stats_config
+    }
+
+    pub fn set_busy_timeout(&self, timeout: Duration) {
+        self.engine.set_busy_timeout(timeout);
+        self.unique_locks.set_timeout(timeout);
     }
 
     pub(crate) fn query_memory(&self) -> &QueryMemoryConfig {
@@ -289,6 +305,18 @@ impl Database {
     pub fn engine_config(&self) -> EngineConfig {
         self.engine.config().clone()
     }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.path.as_ref()
+    }
+
+    pub(crate) fn user_version(&self) -> i64 {
+        *self.user_version.lock().expect("user_version poisoned")
+    }
+
+    pub(crate) fn set_user_version(&self, value: i64) {
+        *self.user_version.lock().expect("user_version poisoned") = value;
+    }
 }
 
 impl Connection {
@@ -315,11 +343,14 @@ impl Connection {
         if session.tx.is_some() {
             return Err(Error::TransactionState("transaction already active"));
         }
-        let tx = self.db.engine.begin(match mode {
+        let mut tx = self.db.engine.begin(match mode {
             BeginMode::Deferred | BeginMode::Immediate | BeginMode::Exclusive => {
                 Isolation::Snapshot
             }
         })?;
+        if matches!(mode, BeginMode::Immediate | BeginMode::Exclusive) {
+            self.db.engine.reserve_begin_lock(&mut tx)?;
+        }
         session.tx = Some(tx);
         session.failed = false;
         Ok(())
@@ -366,6 +397,34 @@ impl Connection {
         self.session.lock().expect("session poisoned").changes
     }
 
+    pub fn total_changes(&self) -> usize {
+        self.session.lock().expect("session poisoned").total_changes
+    }
+
+    pub fn in_transaction(&self) -> bool {
+        self.session.lock().expect("session poisoned").tx.is_some()
+    }
+
+    pub(crate) fn database_path(&self) -> &Path {
+        self.db.path()
+    }
+
+    pub(crate) fn foreign_keys(&self) -> bool {
+        self.session.lock().expect("session poisoned").foreign_keys
+    }
+
+    pub(crate) fn set_foreign_keys(&self, value: bool) {
+        self.session.lock().expect("session poisoned").foreign_keys = value;
+    }
+
+    pub(crate) fn user_version(&self) -> i64 {
+        self.db.user_version()
+    }
+
+    pub(crate) fn set_user_version(&self, value: i64) {
+        self.db.set_user_version(value);
+    }
+
     pub(crate) fn schema_epoch(&self) -> redlinedb_kernel::catalog::SchemaEpoch {
         self.db.engine.schema_epoch()
     }
@@ -406,6 +465,10 @@ impl Connection {
         &self.db.unique_locks
     }
 
+    pub fn set_busy_timeout(&self, timeout: Duration) {
+        self.db.set_busy_timeout(timeout);
+    }
+
     pub(crate) fn with_session<T>(
         &self,
         f: impl FnOnce(&mut SessionState) -> Result<T>,
@@ -416,6 +479,12 @@ impl Connection {
 
     pub(crate) fn prepare_cached(self: &Arc<Self>, sql: &str) -> Result<Arc<PreparedTemplate>> {
         let normalized = sql.trim();
+        if crate::parser::is_pragma_sql(normalized) {
+            let mut template = parse_prepared_template(self.as_ref(), sql)?;
+            template.stats_epoch = self.stats_epoch().0;
+            template.optimizer_hash = self.optimizer_hash();
+            return Ok(Arc::new(template));
+        }
         let key = StatementCacheKey {
             schema_epoch: self.schema_epoch().0,
             stats_epoch: self.stats_epoch().0,
@@ -432,7 +501,7 @@ impl Connection {
             return Ok(template);
         }
 
-        let mut template = parse_prepared_template(self.db.engine.as_ref(), sql)?;
+        let mut template = parse_prepared_template(self.as_ref(), sql)?;
         template.stats_epoch = self.stats_epoch().0;
         template.optimizer_hash = self.optimizer_hash();
         let template = Arc::new(template);
@@ -456,14 +525,26 @@ fn _keep_txn_use(_: Txn) {}
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tempfile::tempdir;
 
     use super::*;
 
     fn new_db() -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
+        new_db_with_timeout(Duration::from_secs(5))
+    }
+
+    fn new_db_with_timeout(
+        timeout: Duration,
+    ) -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("sql-conn-test.db");
-        let db = Database::create(&path, DbOptions::default()).expect("db");
+        let opts = DbOptions {
+            busy_timeout: timeout,
+            ..DbOptions::default()
+        };
+        let db = Database::create(&path, opts).expect("db");
         let conn = db.connect();
         (dir, db, conn)
     }
@@ -503,5 +584,44 @@ mod tests {
         let stmt2 = conn.prepare("SELECT 1").expect("prepare");
 
         assert!(Arc::ptr_eq(&stmt1.template, &stmt2.template));
+    }
+
+    #[test]
+    fn begin_immediate_reserves_writer_slot() {
+        let (_dir, db, conn1) = new_db_with_timeout(Duration::from_millis(25));
+        let conn2 = db.connect();
+
+        conn1
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .expect("create");
+        conn1.begin(BeginMode::Immediate).expect("begin immediate");
+
+        let err = conn2.begin(BeginMode::Immediate).expect_err("conflict");
+        assert_eq!(
+            err,
+            Error::Kernel(redlinedb_kernel::error::Error::LockTimeout)
+        );
+
+        conn1.rollback().expect("rollback");
+    }
+
+    #[test]
+    fn set_busy_timeout_updates_future_lock_waits() {
+        let (_dir, db, conn1) = new_db_with_timeout(Duration::from_secs(5));
+        let conn2 = db.connect();
+
+        conn1
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .expect("create");
+        conn1.begin(BeginMode::Immediate).expect("begin immediate");
+        conn2.set_busy_timeout(Duration::from_millis(25));
+
+        let err = conn2.begin(BeginMode::Immediate).expect_err("conflict");
+        assert_eq!(
+            err,
+            Error::Kernel(redlinedb_kernel::error::Error::LockTimeout)
+        );
+
+        conn1.rollback().expect("rollback");
     }
 }

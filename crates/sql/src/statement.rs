@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use redlinedb_kernel::catalog::{
-    CreateIndexSpec, CreateTableSpec, DropIndexSpec, DropTableSpec, SchemaEpoch, SqliteSchemaRow,
-    TableDef,
+    AlterTableSpec, CreateIndexSpec, CreateTableSpec, DropIndexSpec, DropTableSpec, SchemaEpoch,
+    SqliteSchemaRow, TableDef,
 };
 use redlinedb_kernel::engine::Txn;
 use redlinedb_kernel::format::RowId;
@@ -84,10 +84,12 @@ pub enum PreparedKind {
     Begin(BeginMode),
     Commit,
     Rollback,
+    Pragma(PragmaPlan),
     CreateTable(CreateTableSpec),
     CreateIndex(CreateIndexSpec),
     DropTable(DropTableSpec),
     DropIndex(DropIndexSpec),
+    AlterTable(AlterTableSpec),
     Analyze(AnalyzePlan),
     Explain(ExplainPlan),
     Select(SelectPlan),
@@ -116,10 +118,60 @@ pub struct ExplainPlan {
 }
 
 #[derive(Debug, Clone)]
+pub enum PragmaPlan {
+    SetForeignKeys(bool),
+    SetUserVersion(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictAlgorithm {
+    Abort,
+    Rollback,
+    Fail,
+    Ignore,
+    Replace,
+}
+
+#[derive(Debug, Clone)]
+pub enum InsertConflict {
+    Sqlite(ConflictAlgorithm),
+    Upsert(Box<UpsertPlan>),
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertPlan {
+    pub target: Option<UpsertTarget>,
+    pub action: UpsertAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum UpsertTarget {
+    Columns(Vec<usize>),
+    Constraint(Arc<str>),
+}
+
+#[derive(Debug, Clone)]
+pub enum UpsertAction {
+    DoNothing,
+    DoUpdate(Box<UpsertUpdatePlan>),
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertUpdatePlan {
+    pub assignments: Vec<(usize, Expr)>,
+    pub selection: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
 pub enum SelectSource {
     Table(Arc<TableDef>),
     Tables(Vec<BoundTable>),
+    Joined(JoinSource),
+    CompoundAll(Vec<SelectPlan>),
     SqliteSchema,
+    StaticRows {
+        rows: Arc<[Vec<crate::value::SqlValue>]>,
+    },
     Empty,
 }
 
@@ -129,9 +181,29 @@ pub struct BoundTable {
     pub alias: Option<Arc<str>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinStep {
+    pub right: BoundTable,
+    pub kind: JoinKind,
+    pub selection: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinSource {
+    pub base: BoundTable,
+    pub joins: Vec<JoinStep>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SelectPlan {
     pub source: SelectSource,
+    pub distinct: bool,
     pub projection: Vec<SelectItem>,
     pub selection: Option<Expr>,
     pub group_by: Vec<Expr>,
@@ -147,6 +219,8 @@ pub struct InsertPlan {
     pub columns: Vec<usize>,
     pub rows: Vec<Vec<Expr>>,
     pub default_values: bool,
+    pub returning: Option<Vec<SelectItem>>,
+    pub conflict: Option<InsertConflict>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,12 +228,14 @@ pub struct UpdatePlan {
     pub table: Arc<TableDef>,
     pub assignments: Vec<(usize, Expr)>,
     pub selection: Option<Expr>,
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DeletePlan {
     pub table: Arc<TableDef>,
     pub selection: Option<Expr>,
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -200,6 +276,10 @@ pub(crate) enum SelectRuntimeSource {
     },
     SqliteSchema {
         rows: Vec<SqliteSchemaRow>,
+        cursor: usize,
+    },
+    StaticRows {
+        rows: Arc<[Vec<crate::value::SqlValue>]>,
         cursor: usize,
     },
     Batched {
@@ -279,45 +359,49 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<Step> {
-        if matches!(self.runtime, RuntimeState::Idle) {
-            if self.template.schema_epoch != self.conn.schema_epoch()
-                || self.template.stats_epoch != self.conn.stats_epoch().0
-                || self.template.optimizer_hash != self.conn.optimizer_hash()
-            {
-                let new_template = self.conn.prepare_cached(self.template.sql.as_ref())?;
-                let mut new_bindings = Vec::with_capacity(new_template.param_layout.count() + 1);
-                new_bindings.resize(new_template.param_layout.count() + 1, None);
-                for (idx, value) in self.bindings.iter().cloned().enumerate() {
-                    if idx < new_bindings.len() {
-                        new_bindings[idx] = value;
+        crate::exec::with_current_connection(self.conn.as_ref(), || {
+            if matches!(self.runtime, RuntimeState::Idle) {
+                if self.template.schema_epoch != self.conn.schema_epoch()
+                    || self.template.stats_epoch != self.conn.stats_epoch().0
+                    || self.template.optimizer_hash != self.conn.optimizer_hash()
+                {
+                    let new_template = self.conn.prepare_cached(self.template.sql.as_ref())?;
+                    let mut new_bindings =
+                        Vec::with_capacity(new_template.param_layout.count() + 1);
+                    new_bindings.resize(new_template.param_layout.count() + 1, None);
+                    for (idx, value) in self.bindings.iter().cloned().enumerate() {
+                        if idx < new_bindings.len() {
+                            new_bindings[idx] = value;
+                        }
+                    }
+                    self.template = new_template;
+                    self.bindings = new_bindings;
+                }
+                let result = execute_prepared(self.conn.as_ref(), &self.template, &self.bindings)?;
+                self.affected_rows = result.affected_rows;
+                self.runtime = result.runtime;
+            }
+            match &mut self.runtime {
+                RuntimeState::Select(runtime) => {
+                    let done = crate::exec::step_select_runtime(
+                        self.conn.as_ref(),
+                        runtime,
+                        &self.bindings,
+                        &mut self.current_row,
+                    )?;
+                    if done {
+                        self.runtime = RuntimeState::Done;
+                        Ok(Step::Done)
+                    } else {
+                        Ok(Step::Row)
                     }
                 }
-                self.template = new_template;
-                self.bindings = new_bindings;
-            }
-            let result = execute_prepared(self.conn.as_ref(), &self.template, &self.bindings)?;
-            self.affected_rows = result.affected_rows;
-            self.runtime = result.runtime;
-        }
-        match &mut self.runtime {
-            RuntimeState::Select(runtime) => {
-                let done = crate::exec::step_select_runtime(
-                    self.conn.as_ref(),
-                    runtime,
-                    &self.template,
-                    &self.bindings,
-                    &mut self.current_row,
-                )?;
-                if done {
-                    self.runtime = RuntimeState::Done;
-                    Ok(Step::Done)
-                } else {
-                    Ok(Step::Row)
+                RuntimeState::Done => Ok(Step::Done),
+                RuntimeState::Idle => {
+                    unreachable!("runtime state should be initialized before match")
                 }
             }
-            RuntimeState::Done => Ok(Step::Done),
-            RuntimeState::Idle => unreachable!("runtime state should be initialized before match"),
-        }
+        })
     }
 
     pub fn column_count(&self) -> usize {
@@ -381,6 +465,14 @@ impl Statement {
 
     pub fn is_readonly(&self) -> bool {
         self.template.readonly
+    }
+
+    pub fn is_busy(&self) -> bool {
+        !matches!(self.runtime, RuntimeState::Idle | RuntimeState::Done)
+    }
+
+    pub fn sql(&self) -> &str {
+        self.template.sql.as_ref()
     }
 
     pub fn affected_rows(&self) -> usize {

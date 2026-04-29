@@ -233,6 +233,63 @@ pub(crate) fn eval_scalar(
                 }
             }
         }
+        Expr::Exists { subquery, negated } => {
+            let rows = evaluate_subquery_rows(subquery, bindings)?;
+            let exists = !rows.is_empty();
+            SqlValue::Integer(if exists ^ *negated { 1 } else { 0 })
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let value = eval_scalar(expr, row, bindings)?;
+            if matches!(value, SqlValue::Null) {
+                SqlValue::Null
+            } else {
+                let rows = evaluate_subquery_rows(subquery, bindings)?;
+                let mut found = false;
+                let mut saw_null = false;
+                for row in rows {
+                    if row.len() != 1 {
+                        return Err(Error::UnsupportedSql(
+                            "IN subquery must return exactly one column".to_owned(),
+                        ));
+                    }
+                    let candidate = row.into_iter().next().unwrap_or(SqlValue::Null);
+                    match candidate {
+                        SqlValue::Null => saw_null = true,
+                        _ if compare_values(&value, &candidate) == Ordering::Equal => {
+                            found = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let mut ok = found;
+                if *negated {
+                    ok = !ok;
+                }
+                if !ok && saw_null {
+                    SqlValue::Null
+                } else {
+                    SqlValue::Integer(if ok { 1 } else { 0 })
+                }
+            }
+        }
+        Expr::Subquery(subquery) => {
+            let rows = evaluate_subquery_rows(subquery, bindings)?;
+            match rows.as_slice() {
+                [] => SqlValue::Null,
+                [row] if row.len() == 1 => row[0].clone(),
+                [row] if row.is_empty() => SqlValue::Null,
+                _ => {
+                    return Err(Error::UnsupportedSql(
+                        "scalar subquery must return exactly one row and one column".to_owned(),
+                    ));
+                }
+            }
+        }
         Expr::IsNull(expr) => SqlValue::Integer(
             if matches!(eval_scalar(expr, row, bindings)?, SqlValue::Null) {
                 1
@@ -431,6 +488,26 @@ fn eval_case(
         Some(expr) => eval_scalar(expr, row, bindings),
         None => Ok(SqlValue::Null),
     }
+}
+
+fn evaluate_subquery_rows(
+    subquery: &sqlparser::ast::Query,
+    bindings: &[Option<SqlValue>],
+) -> Result<Vec<Vec<SqlValue>>> {
+    let Some(conn) = current_connection() else {
+        return Err(Error::TransactionState(
+            "subquery evaluation requires an active connection",
+        ));
+    };
+    let schema = conn.engine().schema_snapshot();
+    let template = crate::parser::bind_query(
+        conn,
+        schema,
+        conn.schema_epoch(),
+        "<subquery>",
+        subquery.clone(),
+    )?;
+    materialize_prepared_rows(conn, &template, bindings)
 }
 
 fn like_result(
@@ -904,10 +981,14 @@ fn resolve_binding(name: &str, bindings: &[Option<SqlValue>]) -> Result<SqlValue
 fn lookup_column(row: &RowContext<'_>, name: &str) -> Result<SqlValue> {
     match row {
         RowContext::Table(row) => lookup_table_column(row, name),
+        RowContext::Upsert { current, .. } => lookup_table_column(current, name),
         RowContext::Joined(rows) => {
             let mut found = None;
             for row in rows.iter() {
-                if let Ok(value) = lookup_table_column(row, name) {
+                if row.row.is_none() {
+                    continue;
+                }
+                if let Ok(value) = lookup_joined_row_column(row, name) {
                     if found.is_some() {
                         return Err(Error::UnsupportedSql(format!(
                             "ambiguous column name: {name}"
@@ -942,8 +1023,8 @@ fn lookup_qualified_column(row: &RowContext<'_>, qualifier: &str, name: &str) ->
         RowContext::Joined(rows) => {
             let mut found = None;
             for row in rows.iter() {
-                if row_matches_qualifier(row, qualifier) {
-                    let value = lookup_table_column(row, name)?;
+                if row_matches_joined_qualifier(row, qualifier) {
+                    let value = lookup_joined_row_column(row, name)?;
                     if found.is_some() {
                         return Err(Error::UnsupportedSql(format!(
                             "ambiguous column reference: {qualifier}.{name}"
@@ -954,6 +1035,15 @@ fn lookup_qualified_column(row: &RowContext<'_>, qualifier: &str, name: &str) ->
             }
             found.ok_or_else(|| Error::UnknownColumn(format!("{qualifier}.{name}")))
         }
+        RowContext::Upsert { current, excluded } => {
+            if row_matches_qualifier(current, qualifier) {
+                lookup_table_column(current, name)
+            } else if qualifier.eq_ignore_ascii_case("excluded") {
+                lookup_excluded_column(current.table.as_ref(), excluded, name)
+            } else {
+                Err(Error::UnknownColumn(format!("{qualifier}.{name}")))
+            }
+        }
         RowContext::SqliteSchema(row) => match qualifier.to_ascii_lowercase().as_str() {
             "sqlite_schema" | "sqlite_master" => lookup_schema_column(row, name),
             _ => Err(Error::UnknownColumn(format!("{qualifier}.{name}"))),
@@ -963,6 +1053,15 @@ fn lookup_qualified_column(row: &RowContext<'_>, qualifier: &str, name: &str) ->
 }
 
 fn row_matches_qualifier(row: &TableRow, qualifier: &str) -> bool {
+    if let Some(alias) = &row.alias
+        && alias.as_ref().eq_ignore_ascii_case(qualifier)
+    {
+        return true;
+    }
+    row.table.name.to_string().eq_ignore_ascii_case(qualifier)
+}
+
+fn row_matches_joined_qualifier(row: &JoinedRow, qualifier: &str) -> bool {
     if let Some(alias) = &row.alias
         && alias.as_ref().eq_ignore_ascii_case(qualifier)
     {
@@ -996,6 +1095,46 @@ fn lookup_table_column(row: &TableRow, name: &str) -> Result<SqlValue> {
         .position(|col| col.folded.as_ref().eq_ignore_ascii_case(name))
         .ok_or_else(|| Error::UnknownColumn(name.to_owned()))?;
     Ok(row.values[idx].clone())
+}
+
+fn lookup_joined_row_column(row: &JoinedRow, name: &str) -> Result<SqlValue> {
+    match &row.row {
+        Some(present) => lookup_table_column(present, name),
+        None => {
+            if name.eq_ignore_ascii_case("rowid")
+                || name.eq_ignore_ascii_case("_rowid_")
+                || name.eq_ignore_ascii_case("oid")
+            {
+                return Ok(SqlValue::Null);
+            }
+            row.table
+                .columns
+                .iter()
+                .position(|col| col.folded.as_ref().eq_ignore_ascii_case(name))
+                .ok_or_else(|| Error::UnknownColumn(name.to_owned()))?;
+            Ok(SqlValue::Null)
+        }
+    }
+}
+
+fn lookup_excluded_column(table: &TableDef, excluded: &[SqlValue], name: &str) -> Result<SqlValue> {
+    if name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid")
+    {
+        if let Some(alias) = table.rowid_alias_column
+            && let Some(value) = excluded.get(alias as usize)
+        {
+            return Ok(value.clone());
+        }
+        return Err(Error::UnknownColumn(name.to_owned()));
+    }
+    let idx = table
+        .columns
+        .iter()
+        .position(|col| col.folded.as_ref().eq_ignore_ascii_case(name))
+        .ok_or_else(|| Error::UnknownColumn(name.to_owned()))?;
+    Ok(excluded.get(idx).cloned().unwrap_or(SqlValue::Null))
 }
 
 pub(crate) fn unique_key_bytes(
@@ -1068,6 +1207,13 @@ pub(crate) struct TableRow {
     pub(crate) alias: Option<Arc<str>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct JoinedRow {
+    pub(crate) table: Arc<TableDef>,
+    pub(crate) alias: Option<Arc<str>>,
+    pub(crate) row: Option<TableRow>,
+}
+
 pub(crate) struct TableRowSource<'a> {
     pub(crate) values: &'a [SqlValue],
 }
@@ -1081,14 +1227,19 @@ impl RowValueSource for TableRowSource<'_> {
 #[derive(Clone)]
 pub(crate) enum SqlRow {
     Table(TableRow),
-    Joined(Vec<TableRow>),
+    Joined(Vec<JoinedRow>),
     SqliteSchema(SqliteSchemaRow),
+    Static(Vec<SqlValue>),
     Empty,
 }
 
 pub(crate) enum RowContext<'a> {
     Table(&'a TableRow),
-    Joined(&'a [TableRow]),
+    Joined(&'a [JoinedRow]),
+    Upsert {
+        current: &'a TableRow,
+        excluded: &'a [SqlValue],
+    },
     SqliteSchema(&'a SqliteSchemaRow),
     Empty,
 }
@@ -1099,6 +1250,7 @@ impl SqlRow {
             SqlRow::Table(row) => RowContext::Table(row),
             SqlRow::Joined(rows) => RowContext::Joined(rows),
             SqlRow::SqliteSchema(row) => RowContext::SqliteSchema(row),
+            SqlRow::Static(_) => RowContext::Empty,
             SqlRow::Empty => RowContext::Empty,
         }
     }
@@ -1108,7 +1260,10 @@ impl SqlRow {
             SqlRow::Table(row) => Ok(row.values.clone()),
             SqlRow::Joined(rows) => Ok(rows
                 .iter()
-                .flat_map(|row| row.values.clone())
+                .flat_map(|row| match &row.row {
+                    Some(present) => present.values.clone(),
+                    None => vec![SqlValue::Null; row.table.columns.len()],
+                })
                 .collect::<Vec<_>>()),
             SqlRow::SqliteSchema(row) => Ok(vec![
                 SqlValue::Text(Arc::from(row.type_name.as_ref())),
@@ -1117,6 +1272,7 @@ impl SqlRow {
                 SqlValue::Integer(row.rootpage as i64),
                 SqlValue::Text(Arc::from(row.sql.as_ref())),
             ]),
+            SqlRow::Static(values) => Ok(values.clone()),
             SqlRow::Empty => Ok(Vec::new()),
         }
     }

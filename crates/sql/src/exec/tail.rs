@@ -55,7 +55,7 @@ pub(crate) fn execute_explain(
             let mut current_row = None;
             loop {
                 loops += 1;
-                if step_select_runtime(conn, runtime, &plan.inner, bindings, &mut current_row)? {
+                if step_select_runtime(conn, runtime, bindings, &mut current_row)? {
                     break;
                 }
                 actual_rows += 1;
@@ -358,10 +358,11 @@ pub(crate) fn execute_update(
     conn: &Connection,
     plan: &crate::statement::UpdatePlan,
     bindings: &[Option<SqlValue>],
-) -> Result<usize> {
+) -> Result<ExecutionResult> {
     with_write_tx(conn, |session, tx| {
         let rows = collect_table_rows(conn.engine(), tx, &plan.table)?;
         let mut count = 0usize;
+        let mut returning_rows = Vec::new();
         for row in rows {
             if !selection_passes(&plan.selection, &SqlRow::Table(row.clone()), bindings)? {
                 continue;
@@ -402,9 +403,22 @@ pub(crate) fn execute_update(
                     payload,
                 )?;
             }
+            if let Some(returning) = &plan.returning {
+                returning_rows.push(project_returning_row(
+                    &plan.table,
+                    &values,
+                    new_rowid,
+                    returning,
+                    bindings,
+                )?);
+            }
             count += 1;
         }
-        Ok(count)
+        Ok(build_dml_execution_result(
+            count,
+            returning_rows,
+            plan.returning.is_some(),
+        ))
     })
 }
 
@@ -412,39 +426,92 @@ pub(crate) fn execute_delete(
     conn: &Connection,
     plan: &crate::statement::DeletePlan,
     bindings: &[Option<SqlValue>],
-) -> Result<usize> {
+) -> Result<ExecutionResult> {
     with_write_tx(conn, |_, tx| {
         let rows = collect_table_rows(conn.engine(), tx, &plan.table)?;
         let mut count = 0usize;
+        let mut returning_rows = Vec::new();
         for row in rows {
             if !selection_passes(&plan.selection, &SqlRow::Table(row.clone()), bindings)? {
                 continue;
+            }
+            if let Some(returning) = &plan.returning {
+                returning_rows.push(project_returning_row(
+                    &plan.table,
+                    &row.values,
+                    row.rowid,
+                    returning,
+                    bindings,
+                )?);
             }
             conn.engine()
                 .delete_for_relation(tx, plan.table.relation_id, row.rowid)?;
             count += 1;
         }
-        Ok(count)
+        Ok(build_dml_execution_result(
+            count,
+            returning_rows,
+            plan.returning.is_some(),
+        ))
     })
 }
 
-pub(crate) fn insert_row(
-    conn: &Connection,
-    session: &mut SessionState,
-    tx: &mut Txn,
+pub(super) fn project_returning_row(
     table: &Arc<TableDef>,
-    values: &mut Vec<SqlValue>,
-) -> Result<RowId> {
-    values.resize(table.columns.len(), SqlValue::Null);
-    *values = apply_row_affinity(table, std::mem::take(values))?;
-    let rowid = choose_rowid_for_insert(conn.engine(), table, values)?;
-    apply_constraints(table, values)?;
-    ensure_unique_constraints(conn, session, tx, table, values, None)?;
-    let payload = encode_sql_row(table.table_id.0, values)?;
-    conn.engine()
-        .insert_for_relation(tx, table.relation_id, rowid, payload)?;
-    session.last_insert_rowid = Some(rowid.0 as i64);
-    Ok(rowid)
+    values: &[SqlValue],
+    rowid: RowId,
+    returning: &[SelectItem],
+    bindings: &[Option<SqlValue>],
+) -> Result<Vec<SqlValue>> {
+    let row = TableRow {
+        rowid,
+        values: values.to_vec(),
+        table: Arc::clone(table),
+        alias: None,
+    };
+    project_row(returning, &SqlRow::Table(row), bindings)
+}
+
+pub(super) fn build_dml_execution_result(
+    affected_rows: usize,
+    returning_rows: Vec<Vec<SqlValue>>,
+    has_returning: bool,
+) -> ExecutionResult {
+    if has_returning {
+        ExecutionResult {
+            runtime: returning_rows.into_returning_runtime(),
+            affected_rows,
+        }
+    } else {
+        ExecutionResult {
+            runtime: RuntimeState::Done,
+            affected_rows,
+        }
+    }
+}
+
+trait ReturningRuntimeExt {
+    fn into_returning_runtime(self) -> RuntimeState;
+}
+
+impl ReturningRuntimeExt for Vec<Vec<SqlValue>> {
+    fn into_returning_runtime(self) -> RuntimeState {
+        RuntimeState::Select(SelectRuntime {
+            tx: None,
+            restore_tx: false,
+            source: SelectRuntimeSource::StaticRows {
+                rows: Arc::from(self),
+                cursor: 0,
+            },
+            selection: None,
+            projection: Vec::new(),
+            limit: usize::MAX,
+            offset: 0,
+            seen: 0,
+            yielded: 0,
+            memory: QueryMemoryBroker::new(0, 0),
+        })
+    }
 }
 
 pub(crate) fn build_row(
@@ -517,15 +584,40 @@ pub(crate) fn apply_constraints(table: &TableDef, values: &[SqlValue]) -> Result
     Ok(())
 }
 
-pub(crate) fn ensure_unique_constraints(
+#[derive(Debug, Clone)]
+struct UniqueConflict {
+    rowid: RowId,
+    constraint_name: Option<Arc<str>>,
+    key_ordinals: Vec<usize>,
+}
+
+struct UpsertUpdateContext<'a> {
+    conn: &'a Connection,
+    session: &'a mut SessionState,
+    tx: &'a mut Txn,
+    table: &'a Arc<TableDef>,
+    excluded: &'a [SqlValue],
+    conflict: &'a UniqueConflict,
+    bindings: &'a [Option<SqlValue>],
+}
+
+#[derive(Debug)]
+pub(super) enum InsertOutcome {
+    Inserted { rowid: RowId, values: Vec<SqlValue> },
+    Updated { rowid: RowId, values: Vec<SqlValue> },
+    Ignored,
+}
+
+fn collect_unique_conflicts(
     conn: &Connection,
     session: &mut SessionState,
     tx: &mut Txn,
     table: &Arc<TableDef>,
     values: &[SqlValue],
     skip_rowid: Option<RowId>,
-) -> Result<()> {
+) -> Result<Vec<UniqueConflict>> {
     let rows = collect_table_rows(conn.engine(), tx, table)?;
+    let mut conflicts = Vec::new();
     for constraint in &table.constraints {
         if constraint.kind != ConstraintKind::Unique
             && constraint.kind != ConstraintKind::PrimaryKey
@@ -559,7 +651,7 @@ pub(crate) fn ensure_unique_constraints(
             continue;
         }
         let key = unique_key_bytes(table.table_id.0, index.index_id.0, &key_values)?;
-        let guard = conn.unique_locks().lock(key, tx.id().0);
+        let guard = conn.unique_locks().lock(key, tx.id().0)?;
         session.unique_guards.push(guard);
         for row in &rows {
             if skip_rowid == Some(row.rowid) {
@@ -576,14 +668,213 @@ pub(crate) fn ensure_unique_constraints(
                 })
                 .collect::<Vec<_>>();
             if key_values_equal(&key_values, &other) {
+                conflicts.push(UniqueConflict {
+                    rowid: row.rowid,
+                    constraint_name: constraint
+                        .name
+                        .as_deref()
+                        .map(Arc::<str>::from)
+                        .or_else(|| Some(Arc::from(index.name.as_ref()))),
+                    key_ordinals: index.keys.iter().map(|key| key.ordinal as usize).collect(),
+                });
+                break;
+            }
+        }
+    }
+    Ok(conflicts)
+}
+
+fn unique_conflict_matches_target(
+    conflict: &UniqueConflict,
+    target: &crate::statement::UpsertTarget,
+) -> bool {
+    match target {
+        crate::statement::UpsertTarget::Columns(columns) => conflict.key_ordinals == *columns,
+        crate::statement::UpsertTarget::Constraint(name) => conflict
+            .constraint_name
+            .as_ref()
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name)),
+    }
+}
+
+fn apply_upsert_update(
+    ctx: UpsertUpdateContext<'_>,
+    update: &crate::statement::UpsertUpdatePlan,
+) -> Result<InsertOutcome> {
+    let existing =
+        load_table_row_by_rowid(ctx.conn.engine(), ctx.tx, ctx.table, ctx.conflict.rowid)?
+            .ok_or_else(|| {
+                Error::ConstraintViolation(format!(
+                    "UPSERT conflict row missing for table {}",
+                    ctx.table.name
+                ))
+            })?;
+    let upsert_row = RowContext::Upsert {
+        current: &existing,
+        excluded: ctx.excluded,
+    };
+    if let Some(selection) = &update.selection
+        && !is_truthy(&eval_scalar(selection, &upsert_row, ctx.bindings)?)
+    {
+        return Ok(InsertOutcome::Ignored);
+    }
+    let mut values = existing.values.clone();
+    for (ordinal, expr) in &update.assignments {
+        if *ordinal >= values.len() {
+            return Err(Error::UnknownColumn(format!("ordinal {ordinal}")));
+        }
+        values[*ordinal] = eval_scalar(expr, &upsert_row, ctx.bindings)?;
+    }
+    values = apply_row_affinity(ctx.table, values)?;
+    let new_rowid = choose_rowid_for_update(ctx.conn.engine(), ctx.table, &values, existing.rowid)?;
+    if let Some(alias) = ctx.table.rowid_alias_column
+        && let Some(slot) = values.get_mut(alias as usize)
+        && matches!(&*slot, SqlValue::Null)
+    {
+        *slot = SqlValue::Integer(new_rowid.0 as i64);
+    }
+    apply_constraints(ctx.table, &values)?;
+    ensure_unique_constraints(
+        ctx.conn,
+        ctx.session,
+        ctx.tx,
+        ctx.table,
+        &values,
+        Some(existing.rowid),
+    )?;
+    let payload = encode_sql_row(ctx.table.table_id.0, &values)?;
+    if new_rowid == existing.rowid {
+        ctx.conn.engine().update_for_relation(
+            ctx.tx,
+            ctx.table.relation_id,
+            existing.rowid,
+            payload,
+        )?;
+    } else {
+        ctx.conn
+            .engine()
+            .delete_for_relation(ctx.tx, ctx.table.relation_id, existing.rowid)?;
+        ctx.conn
+            .engine()
+            .insert_for_relation(ctx.tx, ctx.table.relation_id, new_rowid, payload)?;
+    }
+    Ok(InsertOutcome::Updated {
+        rowid: new_rowid,
+        values,
+    })
+}
+
+pub(super) fn insert_row_with_resolution(
+    conn: &Connection,
+    session: &mut SessionState,
+    tx: &mut Txn,
+    table: &Arc<TableDef>,
+    values: &mut Vec<SqlValue>,
+    conflict: Option<&crate::statement::InsertConflict>,
+    bindings: &[Option<SqlValue>],
+) -> Result<InsertOutcome> {
+    values.resize(table.columns.len(), SqlValue::Null);
+    *values = apply_row_affinity(table, std::mem::take(values))?;
+    let rowid = choose_rowid_for_insert(conn.engine(), table, values)?;
+    apply_constraints(table, values)?;
+    let conflicts = collect_unique_conflicts(conn, session, tx, table, values, None)?;
+    if conflicts.is_empty() {
+        let payload = encode_sql_row(table.table_id.0, values)?;
+        conn.engine()
+            .insert_for_relation(tx, table.relation_id, rowid, payload)?;
+        session.last_insert_rowid = Some(rowid.0 as i64);
+        return Ok(InsertOutcome::Inserted {
+            rowid,
+            values: values.clone(),
+        });
+    }
+
+    match conflict {
+        Some(crate::statement::InsertConflict::Sqlite(
+            crate::statement::ConflictAlgorithm::Ignore,
+        )) => Ok(InsertOutcome::Ignored),
+        Some(crate::statement::InsertConflict::Sqlite(
+            crate::statement::ConflictAlgorithm::Replace,
+        )) => {
+            let mut deleted = std::collections::HashSet::new();
+            for conflict in &conflicts {
+                if deleted.insert(conflict.rowid) {
+                    conn.engine()
+                        .delete_for_relation(tx, table.relation_id, conflict.rowid)?;
+                }
+            }
+            let rowid = choose_rowid_for_insert(conn.engine(), table, values)?;
+            let payload = encode_sql_row(table.table_id.0, values)?;
+            conn.engine()
+                .insert_for_relation(tx, table.relation_id, rowid, payload)?;
+            session.last_insert_rowid = Some(rowid.0 as i64);
+            Ok(InsertOutcome::Inserted {
+                rowid,
+                values: values.clone(),
+            })
+        }
+        Some(crate::statement::InsertConflict::Upsert(upsert)) => {
+            let hit = if let Some(target) = &upsert.target {
+                conflicts
+                    .iter()
+                    .find(|conflict| unique_conflict_matches_target(conflict, target))
+            } else {
+                conflicts.first()
+            };
+            let Some(hit) = hit else {
                 return Err(Error::ConstraintViolation(format!(
                     "UNIQUE constraint failed: {}",
                     table.name
                 )));
+            };
+            match &upsert.action {
+                crate::statement::UpsertAction::DoNothing => Ok(InsertOutcome::Ignored),
+                crate::statement::UpsertAction::DoUpdate(update) => apply_upsert_update(
+                    UpsertUpdateContext {
+                        conn,
+                        session,
+                        tx,
+                        table,
+                        excluded: values,
+                        conflict: hit,
+                        bindings,
+                    },
+                    update,
+                ),
             }
         }
+        Some(crate::statement::InsertConflict::Sqlite(
+            crate::statement::ConflictAlgorithm::Abort,
+        ))
+        | Some(crate::statement::InsertConflict::Sqlite(
+            crate::statement::ConflictAlgorithm::Fail,
+        ))
+        | Some(crate::statement::InsertConflict::Sqlite(
+            crate::statement::ConflictAlgorithm::Rollback,
+        ))
+        | None => Err(Error::ConstraintViolation(format!(
+            "UNIQUE constraint failed: {}",
+            table.name
+        ))),
     }
-    Ok(())
+}
+
+pub(crate) fn ensure_unique_constraints(
+    conn: &Connection,
+    session: &mut SessionState,
+    tx: &mut Txn,
+    table: &Arc<TableDef>,
+    values: &[SqlValue],
+    skip_rowid: Option<RowId>,
+) -> Result<()> {
+    if collect_unique_conflicts(conn, session, tx, table, values, skip_rowid)?.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::ConstraintViolation(format!(
+            "UNIQUE constraint failed: {}",
+            table.name
+        )))
+    }
 }
 
 pub(crate) fn choose_rowid_for_insert(
@@ -647,14 +938,7 @@ pub(crate) fn collect_table_rows_with_alias(
     alias: Option<Arc<str>>,
 ) -> Result<Vec<TableRow>> {
     let mut rows = Vec::new();
-    let mut rowids = engine.relation_rowids(table.relation_id)?;
-    if rowids.is_empty() {
-        rowids = engine
-            .row_directory_entries()?
-            .into_iter()
-            .map(|(rowid, _)| rowid)
-            .collect();
-    }
+    let rowids = engine.relation_rowids(table.relation_id)?;
     for rowid in rowids {
         if let Some(row) = load_table_row_by_rowid(engine, tx, table, rowid)? {
             let mut row = row;
@@ -670,14 +954,14 @@ pub(crate) fn collect_join_rows(
     tx: &mut Txn,
     tables: &[crate::statement::BoundTable],
 ) -> Result<Vec<SqlRow>> {
-    let mut joined: Vec<Vec<TableRow>> = vec![Vec::new()];
+    let mut joined: Vec<Vec<JoinedRow>> = vec![Vec::new()];
     for table in tables {
         let rows = collect_table_rows_with_alias(engine, tx, &table.table, table.alias.clone())?;
         let mut next = Vec::new();
         for prefix in &joined {
             for row in &rows {
                 let mut combined = prefix.clone();
-                combined.push(row.clone());
+                combined.push(joined_row_from_table_row(table, Some(row.clone())));
                 next.push(combined);
             }
         }
@@ -686,20 +970,68 @@ pub(crate) fn collect_join_rows(
     Ok(joined.into_iter().map(SqlRow::Joined).collect())
 }
 
+pub(crate) fn collect_join_source_rows(
+    engine: &Engine,
+    tx: &mut Txn,
+    source: &crate::statement::JoinSource,
+    bindings: &[Option<SqlValue>],
+) -> Result<Vec<SqlRow>> {
+    let base_rows =
+        collect_table_rows_with_alias(engine, tx, &source.base.table, source.base.alias.clone())?;
+    let mut joined: Vec<Vec<JoinedRow>> = base_rows
+        .into_iter()
+        .map(|row| vec![joined_row_from_table_row(&source.base, Some(row))])
+        .collect();
+
+    for step in &source.joins {
+        let right_rows =
+            collect_table_rows_with_alias(engine, tx, &step.right.table, step.right.alias.clone())?;
+        let mut next = Vec::new();
+        for prefix in &joined {
+            let mut matched = false;
+            for row in &right_rows {
+                let mut combined = prefix.clone();
+                combined.push(joined_row_from_table_row(&step.right, Some(row.clone())));
+                if selection_passes(&step.selection, &SqlRow::Joined(combined.clone()), bindings)? {
+                    matched = true;
+                    next.push(combined);
+                }
+            }
+            if !matched && matches!(step.kind, crate::statement::JoinKind::Left) {
+                let mut combined = prefix.clone();
+                combined.push(joined_row_from_table_row(&step.right, None));
+                next.push(combined);
+            }
+        }
+        joined = next;
+    }
+
+    Ok(joined.into_iter().map(SqlRow::Joined).collect())
+}
+
+fn joined_row_from_table_row(
+    table: &crate::statement::BoundTable,
+    row: Option<TableRow>,
+) -> JoinedRow {
+    let alias = table.alias.clone();
+    let row = row.map(|mut row| {
+        row.alias = alias.clone();
+        row
+    });
+    JoinedRow {
+        table: Arc::clone(&table.table),
+        alias,
+        row,
+    }
+}
+
 pub(crate) fn collect_table_rowids(
     engine: &Engine,
     tx: &mut Txn,
     table: &Arc<TableDef>,
 ) -> Result<Vec<RowId>> {
     let mut rowids = Vec::new();
-    let mut scan = engine.relation_rowids(table.relation_id)?;
-    if scan.is_empty() {
-        scan = engine
-            .row_directory_entries()?
-            .into_iter()
-            .map(|(rowid, _)| rowid)
-            .collect();
-    }
+    let scan = engine.relation_rowids(table.relation_id)?;
     for rowid in scan {
         if load_table_row_by_rowid(engine, tx, table, rowid)?.is_some() {
             rowids.push(rowid);
@@ -714,10 +1046,15 @@ pub(crate) fn load_table_row_by_rowid(
     table: &Arc<TableDef>,
     rowid: RowId,
 ) -> Result<Option<TableRow>> {
-    if let Some(payload) = engine.get(tx, rowid)?
+    if let Some(payload) = engine.get_for_relation(tx, table.relation_id, rowid)?
         && let Some((table_id, values)) = decode_sql_row(&payload)?
         && table_id == table.table_id.0
     {
+        let mut values = values;
+        if values.len() < table.columns.len() {
+            values.resize(table.columns.len(), SqlValue::Null);
+            values = build_default_values(table, values)?;
+        }
         return Ok(Some(TableRow {
             rowid,
             values,

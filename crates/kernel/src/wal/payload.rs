@@ -12,6 +12,7 @@ const TAG_BACKUP_BEGIN: u8 = 7;
 const TAG_BACKUP_END: u8 = 8;
 const TAG_TIMELINE_FORK: u8 = 9;
 const TAG_LOGICAL_TXN: u8 = 10;
+const TAG_CATALOG_SNAPSHOT: u8 = 11;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogicalEvent {
@@ -92,6 +93,11 @@ pub enum WalPayload {
         first_lsn: Lsn,
         events: Vec<LogicalEvent>,
     },
+    CatalogSnapshot {
+        tx_id: TxId,
+        schema_epoch: u64,
+        snapshot: Vec<u8>,
+    },
 }
 
 impl WalPayload {
@@ -107,6 +113,7 @@ impl WalPayload {
             | Self::BackupEnd { .. }
             | Self::TimelineFork { .. }
             | Self::LogicalTxn { .. } => TxId::ZERO,
+            Self::CatalogSnapshot { tx_id, .. } => *tx_id,
         }
     }
 
@@ -224,6 +231,22 @@ impl WalPayload {
                 for event in events {
                     encode_logical_event(event, &mut out)?;
                 }
+                Ok(out)
+            }
+            Self::CatalogSnapshot {
+                tx_id,
+                schema_epoch,
+                snapshot,
+            } => {
+                if snapshot.len() > u32::MAX as usize {
+                    return Err(Error::CorruptWal("catalog snapshot too large"));
+                }
+                let mut out = vec![0; 21 + snapshot.len()];
+                out[0] = TAG_CATALOG_SNAPSHOT;
+                write_u64(&mut out, 1, tx_id.0)?;
+                write_u64(&mut out, 9, *schema_epoch)?;
+                write_u32(&mut out, 17, snapshot.len() as u32)?;
+                write_bytes(&mut out, 21, snapshot)?;
                 Ok(out)
             }
         }
@@ -350,6 +373,24 @@ impl WalPayload {
                     csn,
                     first_lsn,
                     events,
+                })
+            }
+            TAG_CATALOG_SNAPSHOT => {
+                if bytes.len() < 21 {
+                    return Err(Error::BufferTooSmall {
+                        needed: 21,
+                        actual: bytes.len(),
+                    });
+                }
+                let snapshot_len = read_u32(bytes, 17)? as usize;
+                let expected = 21_usize
+                    .checked_add(snapshot_len)
+                    .ok_or(Error::CorruptWal("catalog snapshot length overflow"))?;
+                require_exact_len(bytes, expected)?;
+                Ok(Self::CatalogSnapshot {
+                    tx_id: TxId(read_u64(bytes, 1)?),
+                    schema_epoch: read_u64(bytes, 9)?,
+                    snapshot: bytes[21..expected].to_vec(),
                 })
             }
             _ => Err(Error::CorruptWal("unknown wal payload tag")),

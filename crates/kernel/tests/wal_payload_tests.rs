@@ -26,6 +26,11 @@ fn wal_payload_variants_round_trip() {
             tx_id: TxId(7),
             csn: Csn(8),
         },
+        WalPayload::CatalogSnapshot {
+            tx_id: TxId(9),
+            schema_epoch: 10,
+            snapshot: b"catalog-snapshot".to_vec(),
+        },
     ];
 
     for payload in payloads {
@@ -54,4 +59,18 @@ fn wal_payload_rejects_truncated_payload() {
 fn wal_payload_rejects_unknown_tag() {
     let err = WalPayload::decode(&[99]).unwrap_err();
     assert_eq!(err, Error::CorruptWal("unknown wal payload tag"));
+}
+
+#[test]
+fn wal_payload_catalog_snapshot_rejects_truncated_body() {
+    let payload = WalPayload::CatalogSnapshot {
+        tx_id: TxId(9),
+        schema_epoch: 10,
+        snapshot: b"catalog-snapshot".to_vec(),
+    };
+    let mut encoded = payload.encode().unwrap();
+    encoded.pop();
+
+    let err = WalPayload::decode(&encoded).unwrap_err();
+    assert!(matches!(err, Error::BufferTooSmall { .. }));
 }

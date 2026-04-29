@@ -9,6 +9,7 @@ use redlinedb_kernel::txn::{Isolation, TxState};
 use redlinedb_kernel::wal::{WalConfig, WalPayload, WalReader, WalRecordKind};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn test_engine() -> (TempDir, Arc<Engine>) {
@@ -22,6 +23,7 @@ fn test_engine() -> (TempDir, Arc<Engine>) {
                 ..WalConfig::default()
             },
             lock_shards: 32,
+            busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,
             page_size: redlinedb_kernel::format::DEFAULT_PAGE_SIZE,
             buffer_pool_pages: 256,
@@ -44,6 +46,7 @@ fn engine_uses_bounded_page_backed_heap_residency() {
                 ..WalConfig::default()
             },
             lock_shards: 32,
+            busy_timeout: Duration::from_millis(250),
             heap_lanes: 4,
             page_size: redlinedb_kernel::format::DEFAULT_PAGE_SIZE,
             buffer_pool_pages: 16,
@@ -399,6 +402,7 @@ fn concurrent_autocommit_inserts_recover_after_group_commit() {
                 ..WalConfig::default()
             },
             lock_shards: 32,
+            busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,
             page_size: redlinedb_kernel::format::DEFAULT_PAGE_SIZE,
             buffer_pool_pages: 256,
@@ -501,6 +505,7 @@ fn checkpoint_reopen_restores_tx_frontier_metadata() {
                 ..WalConfig::default()
             },
             lock_shards: 32,
+            busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,
             page_size: redlinedb_kernel::format::DEFAULT_PAGE_SIZE,
             buffer_pool_pages: 256,
@@ -597,6 +602,7 @@ fn vacuumed_latest_row_survives_checkpoint_reopen() {
                 ..WalConfig::default()
             },
             lock_shards: 32,
+            busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,
             page_size: redlinedb_kernel::format::DEFAULT_PAGE_SIZE,
             buffer_pool_pages: 256,
@@ -697,6 +703,7 @@ fn ddl_create_table_and_index_survive_reopen() {
                 ..WalConfig::default()
             },
             lock_shards: 32,
+            busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,
             page_size: redlinedb_kernel::format::DEFAULT_PAGE_SIZE,
             buffer_pool_pages: 256,
@@ -717,6 +724,65 @@ fn ddl_create_table_and_index_survive_reopen() {
         schema_rows
             .iter()
             .any(|row| row.name.as_ref() == "widgets_name_idx")
+    );
+}
+
+#[test]
+fn ddl_reopens_when_catalog_sidecar_is_deleted() {
+    let (temp, engine) = test_engine();
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    engine
+        .create_table(
+            &mut tx,
+            CreateTableSpec {
+                schema: None,
+                name: DbName::new("recoverable"),
+                if_not_exists: false,
+                columns: vec![ColumnSpec {
+                    name: DbName::new("id"),
+                    declared_type: Some("INTEGER".to_owned()),
+                    constraints: vec![ColumnConstraintSpec::PrimaryKey {
+                        sort_dir: SortDir::Asc,
+                        conflict: ConflictAction::Abort,
+                    }],
+                    collation: None,
+                    default_value: None,
+                }],
+                constraints: vec![],
+                strict: false,
+                without_rowid: false,
+                normalized_sql: Some(
+                    "CREATE TABLE recoverable (id INTEGER PRIMARY KEY)".to_owned(),
+                ),
+            },
+        )
+        .unwrap();
+    engine.commit(tx).unwrap();
+    std::fs::remove_file(temp.path().join("schema.redline")).unwrap();
+    drop(engine);
+
+    let reopened = Engine::open(
+        temp.path(),
+        EngineConfig {
+            rel_id: RelId(1),
+            wal: WalConfig {
+                segment_bytes: 65536,
+                ..WalConfig::default()
+            },
+            lock_shards: 32,
+            busy_timeout: Duration::from_millis(250),
+            heap_lanes: 16,
+            page_size: redlinedb_kernel::format::DEFAULT_PAGE_SIZE,
+            buffer_pool_pages: 256,
+            data_file_name: "data.redline".to_owned(),
+        },
+    )
+    .unwrap();
+    assert!(
+        reopened
+            .schema_snapshot()
+            .lookup_table(SchemaId(1), "recoverable")
+            .is_some()
     );
 }
 

@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn config() -> EngineConfig {
@@ -17,6 +18,7 @@ fn config() -> EngineConfig {
             ..WalConfig::default()
         },
         lock_shards: 32,
+        busy_timeout: Duration::from_millis(250),
         heap_lanes: 16,
         page_size: redlinedb_kernel::format::DEFAULT_PAGE_SIZE,
         buffer_pool_pages: 256,

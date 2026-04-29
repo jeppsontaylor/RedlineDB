@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use super::affinity::derive_affinity;
 use super::ddl::{
-    ColumnConstraintSpec, ConflictAction, CreateIndexSpec, CreateTableSpec, DropIndexSpec,
-    DropTableSpec, IndexColumnSpec, IndexOrigin, TableConstraintSpec,
+    AlterTableOperationSpec, AlterTableSpec, ColumnConstraintSpec, ConflictAction, CreateIndexSpec,
+    CreateTableSpec, DropIndexSpec, DropTableSpec, IndexColumnSpec, IndexOrigin,
+    TableConstraintSpec,
 };
 use super::expr::{ExprAst, compile_expr};
 use super::ids::{ColumnId, ConstraintId, IndexId, ObjectId, SchemaId, TableId};
@@ -438,6 +439,115 @@ pub fn apply_drop_index(
         }
         return Err(Error::ObjectNotFound);
     }
+    snapshot.meta.schema_epoch = SchemaEpoch(snapshot.meta.schema_epoch.0.saturating_add(1));
+    snapshot.rebuild_indexes();
+    Ok(snapshot)
+}
+
+pub fn apply_alter_table(
+    mut snapshot: SchemaSnapshot,
+    spec: AlterTableSpec,
+) -> Result<SchemaSnapshot> {
+    let schema_id = resolve_schema_id(&snapshot, Some(&spec.name.schema))?;
+    let Some(table_index) = snapshot.tables.iter().position(|table| {
+        table.schema_id == schema_id && table.folded.as_ref() == spec.name.name.folded()
+    }) else {
+        return if spec.if_exists {
+            Ok(snapshot)
+        } else {
+            Err(Error::ObjectNotFound)
+        };
+    };
+
+    let mut table = (*snapshot.tables[table_index]).clone();
+    let mut next_object_id = snapshot.meta.next_object_id;
+
+    match spec.operation {
+        AlterTableOperationSpec::RenameTable { table_name } => {
+            let target_schema = resolve_schema_id(&snapshot, Some(&table_name.schema))?;
+            if target_schema != schema_id {
+                return Err(Error::UnsupportedDdl(
+                    "ALTER TABLE rename across schemas is not supported",
+                ));
+            }
+            if snapshot
+                .lookup_table(target_schema, table_name.name.folded())
+                .is_some()
+            {
+                return Err(Error::ObjectExists);
+            }
+            table.name = table_name.name.original().into();
+            table.folded = table_name.name.folded().into();
+        }
+        AlterTableOperationSpec::RenameColumn { old_name, new_name } => {
+            if table
+                .columns
+                .iter()
+                .any(|column| column.folded.as_ref() == new_name.folded())
+            {
+                return Err(Error::ObjectExists);
+            }
+            let column = table
+                .columns
+                .iter_mut()
+                .find(|column| column.folded.as_ref() == old_name.folded())
+                .ok_or(Error::ObjectNotFound)?;
+            column.name = new_name.original().into();
+            column.folded = new_name.folded().into();
+        }
+        AlterTableOperationSpec::AddColumn {
+            column,
+            if_not_exists,
+        } => {
+            if table
+                .columns
+                .iter()
+                .any(|existing| existing.folded.as_ref() == column.name.folded())
+            {
+                if if_not_exists {
+                    return Ok(snapshot);
+                }
+                return Err(Error::ObjectExists);
+            }
+            if column.constraints.iter().any(|constraint| {
+                !matches!(
+                    constraint,
+                    ColumnConstraintSpec::NotNull { .. } | ColumnConstraintSpec::Default { .. }
+                )
+            }) {
+                return Err(Error::UnsupportedDdl(
+                    "ALTER TABLE ADD COLUMN supports NOT NULL and DEFAULT only",
+                ));
+            }
+            let not_null = column
+                .constraints
+                .iter()
+                .any(|constraint| matches!(constraint, ColumnConstraintSpec::NotNull { .. }));
+            if not_null && column.default_value.is_none() {
+                return Err(Error::UnsupportedDdl(
+                    "ALTER TABLE ADD COLUMN NOT NULL requires a default",
+                ));
+            }
+            let ordinal = table.columns.len() as u16;
+            let column_id = ColumnId(next_object_id.0);
+            next_object_id.0 += 1;
+            let declared_type = column.declared_type.clone();
+            table.columns.push(ColumnDef {
+                column_id,
+                ordinal,
+                name: column.name.original().into(),
+                folded: column.name.folded().into(),
+                declared_type: declared_type.clone().map(|value| value.into_boxed_str()),
+                affinity: derive_affinity(declared_type.as_deref()),
+                not_null,
+                default_value: column.default_value.clone(),
+                default_expr: default_const_expr(column.default_value.as_ref()),
+            });
+        }
+    }
+
+    snapshot.tables[table_index] = Arc::new(table);
+    snapshot.meta.next_object_id = next_object_id;
     snapshot.meta.schema_epoch = SchemaEpoch(snapshot.meta.schema_epoch.0.saturating_add(1));
     snapshot.rebuild_indexes();
     Ok(snapshot)

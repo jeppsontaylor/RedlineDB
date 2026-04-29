@@ -54,6 +54,28 @@ pub struct DropIndexSpec {
 }
 
 #[derive(Debug, Clone)]
+pub struct AlterTableSpec {
+    pub name: QualifiedName,
+    pub if_exists: bool,
+    pub operation: AlterTableOperationSpec,
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterTableOperationSpec {
+    RenameTable {
+        table_name: QualifiedName,
+    },
+    RenameColumn {
+        old_name: DbName,
+        new_name: DbName,
+    },
+    AddColumn {
+        column: ColumnSpec,
+        if_not_exists: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct ColumnSpec {
     pub name: DbName,
     pub declared_type: Option<String>,

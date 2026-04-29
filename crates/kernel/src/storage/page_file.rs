@@ -34,7 +34,7 @@ impl<Fs: FileSystem> PageFile<Fs> {
 
     pub fn open_with_fs(path: impl AsRef<Path>, page_size: usize, fs: Fs) -> Result<Self> {
         validate_page_size(page_size)?;
-        let file = fs.open_rw_create(path.as_ref())?;
+        let file = fs.open_rw_existing(path.as_ref())?;
         Ok(Self {
             file: Mutex::new(file),
             page_size,
@@ -115,4 +115,33 @@ fn validate_page_size(page_size: usize) -> Result<()> {
         return Err(Error::CorruptPage("page size exceeds on-page u16 bounds"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use crate::format::{Page, PageId, PageKind, RelId};
+
+    use super::PageFile;
+
+    #[test]
+    fn open_preserves_existing_page_file() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("pages.redline");
+        let page_size = 16 * 1024;
+
+        let page_file = PageFile::create(&path, page_size).expect("create");
+        let page = Page::new(page_size, PageKind::Heap, PageId(1), RelId(42)).expect("page");
+        page_file.write_page(&page).expect("write page");
+        page_file.sync_data().expect("sync");
+
+        let reopened = PageFile::open(&path, page_size).expect("open");
+        assert_eq!(reopened.page_count().expect("count"), 1);
+        let reread = reopened.read_page(PageId(1)).expect("read");
+        assert_eq!(
+            reread.header().expect("header"),
+            page.header().expect("header")
+        );
+    }
 }

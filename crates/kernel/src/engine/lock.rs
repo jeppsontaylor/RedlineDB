@@ -2,15 +2,13 @@ use crate::format::{RelId, RowId, TxId};
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-const LOCK_TIMEOUT: Duration = Duration::from_millis(250);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct RowKey {
-    rel_id: RelId,
-    row_id: RowId,
+pub(crate) struct RowKey {
+    pub(crate) rel_id: RelId,
+    pub(crate) row_id: RowId,
 }
 
 #[derive(Debug, Default)]
@@ -22,22 +20,31 @@ struct LockShard {
 #[derive(Debug)]
 pub struct RowLockManager {
     shards: Vec<LockShard>,
+    timeout: RwLock<Duration>,
 }
 
 impl RowLockManager {
-    pub fn new(shard_count: usize) -> Self {
+    pub fn new(shard_count: usize, timeout: Duration) -> Self {
         let shard_count = shard_count.max(1);
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
             shards.push(LockShard::default());
         }
-        Self { shards }
+        Self {
+            shards,
+            timeout: RwLock::new(timeout),
+        }
+    }
+
+    pub fn set_timeout(&self, timeout: Duration) {
+        *self.timeout.write().expect("row lock timeout poisoned") = timeout;
     }
 
     pub fn lock(&self, rel_id: RelId, row_id: RowId, tx_id: TxId) -> Result<()> {
         let key = RowKey { rel_id, row_id };
         let shard = self.shard(key);
-        let deadline = Instant::now() + LOCK_TIMEOUT;
+        let timeout = *self.timeout.read().expect("row lock timeout poisoned");
+        let deadline = Instant::now() + timeout;
         let mut owners = shard
             .owners
             .lock()

@@ -43,6 +43,10 @@ impl CatalogStore {
     }
 
     pub fn save(&self, snapshot: &SchemaSnapshot) -> Result<()> {
+        self.save_atomic(snapshot)
+    }
+
+    pub fn save_atomic(&self, snapshot: &SchemaSnapshot) -> Result<()> {
         let bytes = encode_snapshot_file(snapshot)?;
         let tmp = self.path.with_extension("tmp");
         {
@@ -51,6 +55,10 @@ impl CatalogStore {
             file.sync_all()?;
         }
         fs::rename(tmp, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            let dir = fs::File::open(parent)?;
+            dir.sync_all()?;
+        }
         Ok(())
     }
 }

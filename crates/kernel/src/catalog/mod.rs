@@ -17,8 +17,9 @@ mod value;
 pub use affinity::{Affinity, CoerceError, apply_affinity, derive_affinity};
 pub use bootstrap::bootstrap_schema;
 pub use ddl::{
-    ColumnConstraintSpec, ColumnSpec, ConflictAction, CreateIndexSpec, CreateTableSpec,
-    DropIndexSpec, DropTableSpec, IndexColumnSpec, IndexOrigin, TableConstraintSpec,
+    AlterTableOperationSpec, AlterTableSpec, ColumnConstraintSpec, ColumnSpec, ConflictAction,
+    CreateIndexSpec, CreateTableSpec, DropIndexSpec, DropTableSpec, IndexColumnSpec, IndexOrigin,
+    TableConstraintSpec,
 };
 pub use expr::{
     CompiledExpr, EvalScratch, ExprAst, ExprError, ExprOp, RowValueSource, compile_expr, eval_expr,
@@ -31,8 +32,8 @@ pub use key::{
 pub use manager::CatalogManager;
 pub use names::{DbName, QualifiedName};
 pub use ops::{
-    apply_create_index, apply_create_table, apply_drop_index, apply_drop_table, lookup_index,
-    lookup_table, resolve_schema_id,
+    apply_alter_table, apply_create_index, apply_create_table, apply_drop_index, apply_drop_table,
+    lookup_index, lookup_table, resolve_schema_id,
 };
 pub use record::{RecordRef, RecordScratch, encode_record};
 pub use schema::{

@@ -241,6 +241,30 @@ impl PageBackedHeap {
         }
     }
 
+    pub fn get_for_relation(
+        &self,
+        tx_status: &ConcurrentTxStatus,
+        snapshot: &Snapshot,
+        owner: Option<TxId>,
+        rel_id: RelId,
+        row_id: RowId,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(ptr) = self.head_for_relation(rel_id, row_id)? else {
+            return Ok(None);
+        };
+        let current = self.read_tuple(ptr)?;
+        if current.rel_id != rel_id {
+            return Ok(None);
+        }
+        match current.visibility_concurrent(tx_status, snapshot, owner) {
+            TupleVisibility::Visible => Ok(Some(current.payload)),
+            TupleVisibility::Deleted => Ok(None),
+            TupleVisibility::Invisible => {
+                self.get_from_undo(tx_status, snapshot, owner, current.undo_head)
+            }
+        }
+    }
+
     pub fn flush_all(&self, durable_lsn: Lsn) -> Result<()> {
         self.buffer.flush_all(durable_lsn)
     }
@@ -629,6 +653,16 @@ impl PageBackedHeap {
         Ok(shard.get(&row_id).copied())
     }
 
+    fn head_for_relation(&self, rel_id: RelId, row_id: RowId) -> Result<Option<TuplePtr>> {
+        let shard = self.relation_row_dir_shard(rel_id);
+        let shard = shard
+            .read()
+            .map_err(|_| Error::CorruptPage("relation row dir shard poisoned"))?;
+        Ok(shard
+            .get(&rel_id)
+            .and_then(|entries| entries.get(&row_id).copied()))
+    }
+
     pub fn row_directory_entries(&self) -> Result<Vec<(RowId, TuplePtr)>> {
         let mut rows = Vec::new();
         for shard in &self.row_dir {
@@ -636,6 +670,19 @@ impl PageBackedHeap {
                 .read()
                 .map_err(|_| Error::CorruptPage("row dir shard poisoned"))?;
             rows.extend(shard.iter().map(|(row_id, ptr)| (*row_id, *ptr)));
+        }
+        Ok(rows)
+    }
+
+    pub fn relation_entries(&self, rel_id: RelId) -> Result<Vec<(RowId, TuplePtr)>> {
+        let mut rows = Vec::new();
+        for shard in &self.relation_row_dir {
+            let shard = shard
+                .read()
+                .map_err(|_| Error::CorruptPage("relation row dir shard poisoned"))?;
+            if let Some(entries) = shard.get(&rel_id) {
+                rows.extend(entries.iter().map(|(row_id, ptr)| (*row_id, *ptr)));
+            }
         }
         Ok(rows)
     }

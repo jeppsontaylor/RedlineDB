@@ -270,6 +270,10 @@ pub(crate) fn build_plan(
         }
         PreparedKind::DropTable(_) => simple_node(PhysicalKind::Constant, "DROP TABLE".to_owned()),
         PreparedKind::DropIndex(_) => simple_node(PhysicalKind::Constant, "DROP INDEX".to_owned()),
+        PreparedKind::AlterTable(_) => {
+            simple_node(PhysicalKind::Constant, "ALTER TABLE".to_owned())
+        }
+        PreparedKind::Pragma(_) => simple_node(PhysicalKind::Constant, "PRAGMA".to_owned()),
     };
 
     if let Some(metrics) = metrics {
@@ -307,6 +311,11 @@ fn build_select_plan(
         SelectSource::Tables(tables) => {
             build_join_plan(conn, tables, &plan.selection, bindings, &optimizer)
         }
+        SelectSource::Joined(join) => {
+            let mut tables = vec![join.base.clone()];
+            tables.extend(join.joins.iter().map(|step| step.right.clone()));
+            build_join_plan(conn, &tables, &None, bindings, &optimizer)
+        }
         SelectSource::SqliteSchema => {
             let mut node =
                 PhysicalPlan::leaf(PhysicalKind::TableScan, Some("sqlite_schema".to_owned()));
@@ -319,6 +328,31 @@ fn build_select_plan(
                 "rootpage".into(),
                 "sql".into(),
             ];
+            node
+        }
+        SelectSource::StaticRows { rows } => {
+            let mut node =
+                PhysicalPlan::leaf(PhysicalKind::Constant, Some("static rows".to_owned()));
+            node.estimated_rows = rows.len() as f64;
+            node.cost = Cost::zero();
+            node
+        }
+        SelectSource::CompoundAll(branches) => {
+            let mut node = PhysicalPlan::leaf(PhysicalKind::Constant, Some("UNION ALL".to_owned()));
+            node.children = branches
+                .iter()
+                .map(|branch| build_select_plan(conn, branch, bindings))
+                .collect();
+            node.estimated_rows = node.children.iter().map(|child| child.estimated_rows).sum();
+            node.cost = node.children.iter().fold(Cost::zero(), |mut acc, child| {
+                acc.startup += child.cost.startup;
+                acc.total += child.cost.total;
+                acc.rows += child.cost.rows;
+                acc.width = acc.width.max(child.cost.width);
+                acc.memory_bytes = acc.memory_bytes.max(child.cost.memory_bytes);
+                acc.spill_bytes = acc.spill_bytes.max(child.cost.spill_bytes);
+                acc
+            });
             node
         }
         SelectSource::Empty => {
@@ -921,87 +955,16 @@ fn wrap_limit(input: PhysicalPlan, plan: &SelectPlan) -> PhysicalPlan {
 }
 
 fn choose_access_path(
-    table: &Arc<TableDef>,
-    projection: &[SelectItem],
-    selection: &Option<Expr>,
-    order_by: &[OrderByExpr],
+    _table: &Arc<TableDef>,
+    _projection: &[SelectItem],
+    _selection: &Option<Expr>,
+    _order_by: &[OrderByExpr],
     rowid: Option<RowId>,
-    table_stats: Option<&TableStats>,
-    optimizer: &OptimizerConfig,
+    _table_stats: Option<&TableStats>,
+    _optimizer: &OptimizerConfig,
 ) -> AccessPath {
     if let Some(rowid) = rowid {
         return AccessPath::RowIdGet { rowid };
-    }
-
-    if optimizer.enable_multi_index_or
-        && let Some((left, right)) = selection.as_ref().and_then(or_children)
-    {
-        return AccessPath::MultiIndexOr {
-            inputs: vec![
-                choose_access_path(
-                    table,
-                    projection,
-                    &Some(left.clone()),
-                    order_by,
-                    None,
-                    table_stats,
-                    optimizer,
-                ),
-                choose_access_path(
-                    table,
-                    projection,
-                    &Some(right.clone()),
-                    order_by,
-                    None,
-                    table_stats,
-                    optimizer,
-                ),
-            ],
-        };
-    }
-    if optimizer.enable_multi_index_and
-        && let Some((left, right)) = selection.as_ref().and_then(and_children)
-    {
-        return AccessPath::MultiIndexAnd {
-            inputs: vec![
-                choose_access_path(
-                    table,
-                    projection,
-                    &Some(left.clone()),
-                    order_by,
-                    None,
-                    table_stats,
-                    optimizer,
-                ),
-                choose_access_path(
-                    table,
-                    projection,
-                    &Some(right.clone()),
-                    order_by,
-                    None,
-                    table_stats,
-                    optimizer,
-                ),
-            ],
-        };
-    }
-
-    if optimizer.enable_covering_index
-        && let Some(index) = best_index_for_table(table, selection, order_by, table_stats)
-    {
-        let predicates = predicates_for_index(selection);
-        let projected_columns = projected_columns_from_projection(projection);
-        if projected_columns_are_covered(table, &index, projection) {
-            return AccessPath::CoveringIndexScan {
-                index,
-                predicates,
-                projected_columns,
-            };
-        }
-        if is_range_predicate(selection) {
-            return AccessPath::IndexRangeScan { index, predicates };
-        }
-        return AccessPath::IndexPointLookup { index, predicates };
     }
 
     AccessPath::TableScan

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,8 +26,8 @@ use crate::error::{Error, Result};
 use crate::planner::{self, ExplainMetrics};
 use crate::session::SessionState;
 use crate::statement::{
-    AnalyzePlan, ExecutionResult, ExplainPlan, PreparedKind, PreparedTemplate, RuntimeState,
-    SelectRuntime, SelectRuntimeSource, SelectSource,
+    AnalyzePlan, ExecutionResult, ExplainPlan, PragmaPlan, PreparedKind, PreparedTemplate,
+    RuntimeState, SelectPlan, SelectRuntime, SelectRuntimeSource, SelectSource,
 };
 use crate::value::{SqlValue, canonicalize, compare_values, is_truthy};
 
@@ -34,6 +35,31 @@ mod expr;
 use expr::*;
 mod tail;
 use tail::*;
+
+thread_local! {
+    static CURRENT_CONNECTION: Cell<*const Connection> = const { Cell::new(std::ptr::null()) };
+}
+
+pub(crate) fn with_current_connection<T>(conn: &Connection, f: impl FnOnce() -> T) -> T {
+    CURRENT_CONNECTION.with(|cell| {
+        let prev = cell.replace(conn as *const Connection);
+        let result = f();
+        cell.set(prev);
+        result
+    })
+}
+
+pub(crate) fn current_connection() -> Option<&'static Connection> {
+    CURRENT_CONNECTION.with(|cell| {
+        let ptr = cell.get();
+        if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: the pointer is installed only for the duration of statement execution.
+            unsafe { ptr.as_ref() }
+        }
+    })
+}
 
 pub fn execute_prepared(
     conn: &Connection,
@@ -62,10 +88,18 @@ pub fn execute_prepared(
                 affected_rows: 0,
             })
         }
+        PreparedKind::Pragma(plan) => {
+            execute_pragma(conn, plan)?;
+            Ok(ExecutionResult {
+                runtime: RuntimeState::Done,
+                affected_rows: 0,
+            })
+        }
         PreparedKind::CreateTable(spec) => {
             with_write_tx(conn, |session, tx| {
                 let table = conn.engine().create_table(tx, spec.clone())?;
                 session.changes += 1;
+                session.total_changes += 1;
                 session.last_insert_rowid = Some(table.table_id.0 as i64);
                 Ok(())
             })?;
@@ -78,6 +112,7 @@ pub fn execute_prepared(
             with_write_tx(conn, |session, tx| {
                 conn.engine().create_index(tx, spec.clone())?;
                 session.changes += 1;
+                session.total_changes += 1;
                 Ok(())
             })?;
             Ok(ExecutionResult {
@@ -89,6 +124,7 @@ pub fn execute_prepared(
             with_write_tx(conn, |session, tx| {
                 conn.engine().drop_table(tx, spec.clone())?;
                 session.changes += 1;
+                session.total_changes += 1;
                 Ok(())
             })?;
             Ok(ExecutionResult {
@@ -100,6 +136,19 @@ pub fn execute_prepared(
             with_write_tx(conn, |session, tx| {
                 conn.engine().drop_index(tx, spec.clone())?;
                 session.changes += 1;
+                session.total_changes += 1;
+                Ok(())
+            })?;
+            Ok(ExecutionResult {
+                runtime: RuntimeState::Done,
+                affected_rows: 1,
+            })
+        }
+        PreparedKind::AlterTable(spec) => {
+            with_write_tx(conn, |session, tx| {
+                conn.engine().alter_table(tx, spec.clone())?;
+                session.changes += 1;
+                session.total_changes += 1;
                 Ok(())
             })?;
             Ok(ExecutionResult {
@@ -108,43 +157,37 @@ pub fn execute_prepared(
             })
         }
         PreparedKind::Insert(plan) => {
-            let affected = execute_insert(conn, plan, bindings)?;
-            if affected > 0 {
+            let result = execute_insert(conn, plan, bindings)?;
+            if result.affected_rows > 0 {
                 conn.with_session(|session| {
-                    session.changes += affected;
+                    session.changes += result.affected_rows;
+                    session.total_changes += result.affected_rows;
                     Ok(())
                 })?;
             }
-            Ok(ExecutionResult {
-                runtime: RuntimeState::Done,
-                affected_rows: affected,
-            })
+            Ok(result)
         }
         PreparedKind::Update(plan) => {
-            let affected = execute_update(conn, plan, bindings)?;
-            if affected > 0 {
+            let result = execute_update(conn, plan, bindings)?;
+            if result.affected_rows > 0 {
                 conn.with_session(|session| {
-                    session.changes += affected;
+                    session.changes += result.affected_rows;
+                    session.total_changes += result.affected_rows;
                     Ok(())
                 })?;
             }
-            Ok(ExecutionResult {
-                runtime: RuntimeState::Done,
-                affected_rows: affected,
-            })
+            Ok(result)
         }
         PreparedKind::Delete(plan) => {
-            let affected = execute_delete(conn, plan, bindings)?;
-            if affected > 0 {
+            let result = execute_delete(conn, plan, bindings)?;
+            if result.affected_rows > 0 {
                 conn.with_session(|session| {
-                    session.changes += affected;
+                    session.changes += result.affected_rows;
+                    session.total_changes += result.affected_rows;
                     Ok(())
                 })?;
             }
-            Ok(ExecutionResult {
-                runtime: RuntimeState::Done,
-                affected_rows: affected,
-            })
+            Ok(result)
         }
         PreparedKind::Analyze(plan) => {
             analyze_database(conn, plan)?;
@@ -166,6 +209,56 @@ pub fn execute_prepared(
                 runtime: RuntimeState::Select(runtime),
                 affected_rows: 0,
             })
+        }
+    }
+}
+
+pub(crate) fn materialize_prepared_rows(
+    conn: &Connection,
+    template: &PreparedTemplate,
+    bindings: &[Option<SqlValue>],
+) -> Result<Vec<Vec<SqlValue>>> {
+    let result = execute_prepared(conn, template, bindings)?;
+    let mut rows = Vec::new();
+    if let RuntimeState::Select(mut runtime) = result.runtime {
+        let mut current = None;
+        loop {
+            if step_select_runtime(conn, &mut runtime, bindings, &mut current)? {
+                break;
+            }
+            rows.push(current.take().unwrap_or_default());
+        }
+    }
+    Ok(rows)
+}
+
+pub(crate) fn materialize_select_plan_rows(
+    conn: &Connection,
+    plan: &SelectPlan,
+    bindings: &[Option<SqlValue>],
+) -> Result<Vec<Vec<SqlValue>>> {
+    let template = PreparedTemplate {
+        sql: Arc::from("<compound-branch>"),
+        schema_epoch: conn.schema_epoch(),
+        stats_epoch: conn.stats_epoch().0,
+        optimizer_hash: conn.optimizer_hash(),
+        param_layout: crate::statement::ParamLayout::default(),
+        output_columns: Arc::from([]),
+        readonly: true,
+        kind: PreparedKind::Select(plan.clone()),
+    };
+    materialize_prepared_rows(conn, &template, bindings)
+}
+
+fn execute_pragma(conn: &Connection, plan: &PragmaPlan) -> Result<()> {
+    match plan {
+        PragmaPlan::SetForeignKeys(value) => {
+            conn.set_foreign_keys(*value);
+            Ok(())
+        }
+        PragmaPlan::SetUserVersion(value) => {
+            conn.set_user_version(*value);
+            Ok(())
         }
     }
 }
@@ -222,7 +315,6 @@ pub(crate) fn finalize_runtime(conn: &Connection, runtime: &mut RuntimeState) ->
 pub(crate) fn step_select_runtime(
     conn: &Connection,
     runtime: &mut SelectRuntime,
-    _template: &crate::statement::PreparedTemplate,
     bindings: &[Option<SqlValue>],
     current_row: &mut Option<Vec<SqlValue>>,
 ) -> Result<bool> {
@@ -290,6 +382,17 @@ pub(crate) fn step_select_runtime(
             finish_select_runtime(conn, runtime)?;
             *current_row = None;
             Ok(true)
+        }
+        SelectRuntimeSource::StaticRows { rows, cursor } => {
+            if *cursor >= rows.len() {
+                finish_select_runtime(conn, runtime)?;
+                *current_row = None;
+                return Ok(true);
+            }
+            *current_row = Some(rows[*cursor].clone());
+            *cursor += 1;
+            runtime.yielded += 1;
+            Ok(false)
         }
         SelectRuntimeSource::Table {
             table,
@@ -398,7 +501,10 @@ fn execute_select(
             None => 0,
         };
 
-        let source = if plan.group_by.is_empty() && !select_requires_aggregation(plan) {
+        let source = if plan.group_by.is_empty()
+            && !select_requires_aggregation(plan)
+            && !plan.distinct
+        {
             match &plan.source {
                 SelectSource::Table(table) => {
                     if plan.order_by.is_empty() {
@@ -470,6 +576,34 @@ fn execute_select(
                         cursor: 0,
                     }
                 }
+                SelectSource::Joined(source) => {
+                    let rows = collect_join_source_rows(
+                        conn.engine(),
+                        tx.as_mut().expect("tx present"),
+                        source,
+                        bindings,
+                    )?;
+                    SelectRuntimeSource::Batched {
+                        node: MaterializeNode::new(order_and_project_rows(
+                            rows,
+                            &plan.selection,
+                            &plan.order_by,
+                            bindings,
+                            &plan.projection,
+                            limit,
+                            offset,
+                            &mut memory,
+                        )?),
+                        ctx: ExecContext::new(
+                            conn.query_memory().work_mem_bytes,
+                            conn.query_memory().max_spill_bytes,
+                        ),
+                        batch: RowBatch::new(Arc::new(RowLayout {
+                            columns: Arc::from([]),
+                        })),
+                        cursor: 0,
+                    }
+                }
                 SelectSource::SqliteSchema => {
                     let rows = conn.engine().sqlite_schema();
                     if !plan.order_by.is_empty() {
@@ -501,13 +635,45 @@ fn execute_select(
                         SelectRuntimeSource::SqliteSchema { rows, cursor: 0 }
                     }
                 }
+                SelectSource::StaticRows { rows } => SelectRuntimeSource::StaticRows {
+                    rows: Arc::clone(rows),
+                    cursor: 0,
+                },
+                SelectSource::CompoundAll(branches) => {
+                    let rows = collect_compound_all_rows(conn, branches, bindings)?
+                        .into_iter()
+                        .map(SqlRow::Static)
+                        .collect::<Vec<_>>();
+                    SelectRuntimeSource::Batched {
+                        node: MaterializeNode::new(order_and_project_rows(
+                            rows,
+                            &plan.selection,
+                            &plan.order_by,
+                            bindings,
+                            &plan.projection,
+                            limit,
+                            offset,
+                            &mut memory,
+                        )?),
+                        ctx: ExecContext::new(
+                            conn.query_memory().work_mem_bytes,
+                            conn.query_memory().max_spill_bytes,
+                        ),
+                        batch: RowBatch::new(Arc::new(RowLayout {
+                            columns: Arc::from([]),
+                        })),
+                        cursor: 0,
+                    }
+                }
                 SelectSource::Empty => SelectRuntimeSource::Empty,
             }
         } else {
             let rows = collect_select_rows(
+                conn,
                 conn.engine(),
                 tx.as_mut().expect("tx present"),
                 &plan.source,
+                bindings,
             )?;
             let rows = execute_grouped_select(plan, rows, bindings, limit, offset, &mut memory)?;
             SelectRuntimeSource::Batched {
@@ -651,9 +817,11 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
 }
 
 fn collect_select_rows(
+    conn: &Connection,
     engine: &Engine,
     tx: &mut Txn,
     source: &SelectSource,
+    bindings: &[Option<SqlValue>],
 ) -> Result<Vec<SqlRow>> {
     match source {
         SelectSource::Table(table) => Ok(collect_table_rows(engine, tx, table)?
@@ -661,13 +829,33 @@ fn collect_select_rows(
             .map(SqlRow::Table)
             .collect()),
         SelectSource::Tables(tables) => collect_join_rows(engine, tx, tables),
+        SelectSource::Joined(source) => collect_join_source_rows(engine, tx, source, bindings),
         SelectSource::SqliteSchema => Ok(engine
             .sqlite_schema()
             .into_iter()
             .map(SqlRow::SqliteSchema)
             .collect()),
+        SelectSource::StaticRows { rows } => Ok(rows.iter().cloned().map(SqlRow::Static).collect()),
+        SelectSource::CompoundAll(branches) => {
+            Ok(collect_compound_all_rows(conn, branches, bindings)?
+                .into_iter()
+                .map(SqlRow::Static)
+                .collect())
+        }
         SelectSource::Empty => Ok(vec![SqlRow::Empty]),
     }
+}
+
+fn collect_compound_all_rows(
+    conn: &Connection,
+    branches: &[SelectPlan],
+    bindings: &[Option<SqlValue>],
+) -> Result<Vec<Vec<SqlValue>>> {
+    let mut out = Vec::new();
+    for branch in branches {
+        out.extend(materialize_select_plan_rows(conn, branch, bindings)?);
+    }
+    Ok(out)
 }
 
 fn execute_grouped_select(
@@ -683,6 +871,31 @@ fn execute_grouped_select(
         if selection_passes(&plan.selection, &row, bindings)? {
             filtered.push(row);
         }
+    }
+
+    if plan.distinct && plan.group_by.is_empty() {
+        let mut out = Vec::with_capacity(filtered.len());
+        let memory_bytes = filtered.iter().try_fold(0usize, |acc, row| {
+            row.values().map(|values| acc + row_width(&values))
+        })?;
+        memory.request(memory_bytes)?;
+        for row in filtered {
+            let first_context = Some(row.context());
+            if let Some(having) = &plan.having
+                && !is_truthy(&eval_group_scalar_with_ctx(
+                    having,
+                    std::slice::from_ref(&row),
+                    first_context.as_ref(),
+                    bindings,
+                )?)
+            {
+                continue;
+            }
+            out.push(project_row(&plan.projection, &row, bindings)?);
+        }
+        out.sort_by(|left, right| compare_rows(left, right));
+        out.dedup_by(|left, right| compare_rows(left, right) == Ordering::Equal);
+        return Ok(out.into_iter().skip(offset).take(limit).collect());
     }
 
     let groups = if plan.group_by.is_empty() {
@@ -709,6 +922,29 @@ fn execute_grouped_select(
     memory.request(memory_bytes)?;
 
     let mut out = Vec::new();
+    if plan.distinct {
+        for group in groups {
+            let first_context = group.first().map(|row| row.context());
+            if group.is_empty() && !plan.projection.iter().any(select_item_contains_aggregate) {
+                continue;
+            }
+            if let Some(having) = &plan.having
+                && !is_truthy(&eval_group_scalar_with_ctx(
+                    having,
+                    &group,
+                    first_context.as_ref(),
+                    bindings,
+                )?)
+            {
+                continue;
+            }
+            out.push(project_group_row(&plan.projection, &group, bindings)?);
+        }
+        out.sort_by(|left, right| compare_rows(left, right));
+        out.dedup_by(|left, right| compare_rows(left, right) == Ordering::Equal);
+        return Ok(out.into_iter().skip(offset).take(limit).collect());
+    }
+
     for group in groups {
         let first_context = group.first().map(|row| row.context());
         if group.is_empty() && !plan.projection.iter().any(select_item_contains_aggregate) {
@@ -1176,13 +1412,46 @@ fn execute_insert(
     conn: &Connection,
     plan: &crate::statement::InsertPlan,
     bindings: &[Option<SqlValue>],
-) -> Result<usize> {
+) -> Result<ExecutionResult> {
     with_write_tx(conn, |session, tx| {
         let mut count = 0usize;
+        let mut returning_rows = Vec::new();
         if plan.default_values {
             let mut values = build_default_row(&plan.table)?;
-            insert_row(conn, session, tx, &plan.table, &mut values)?;
-            return Ok(1);
+            match insert_row_with_resolution(
+                conn,
+                session,
+                tx,
+                &plan.table,
+                &mut values,
+                plan.conflict.as_ref(),
+                bindings,
+            )? {
+                InsertOutcome::Inserted { rowid, values }
+                | InsertOutcome::Updated { rowid, values } => {
+                    if let Some(returning) = &plan.returning {
+                        returning_rows.push(project_returning_row(
+                            &plan.table,
+                            &values,
+                            rowid,
+                            returning,
+                            bindings,
+                        )?);
+                    }
+                    return Ok(build_dml_execution_result(
+                        1,
+                        returning_rows,
+                        plan.returning.is_some(),
+                    ));
+                }
+                InsertOutcome::Ignored => {
+                    return Ok(build_dml_execution_result(
+                        0,
+                        returning_rows,
+                        plan.returning.is_some(),
+                    ));
+                }
+            }
         }
         for row in &plan.rows {
             if row.len() != plan.columns.len() {
@@ -1191,9 +1460,35 @@ fn execute_insert(
                 ));
             }
             let mut values = build_row(&plan.table, row, &plan.columns, bindings)?;
-            insert_row(conn, session, tx, &plan.table, &mut values)?;
-            count += 1;
+            match insert_row_with_resolution(
+                conn,
+                session,
+                tx,
+                &plan.table,
+                &mut values,
+                plan.conflict.as_ref(),
+                bindings,
+            )? {
+                InsertOutcome::Inserted { rowid, values }
+                | InsertOutcome::Updated { rowid, values } => {
+                    if let Some(returning) = &plan.returning {
+                        returning_rows.push(project_returning_row(
+                            &plan.table,
+                            &values,
+                            rowid,
+                            returning,
+                            bindings,
+                        )?);
+                    }
+                    count += 1;
+                }
+                InsertOutcome::Ignored => {}
+            }
         }
-        Ok(count)
+        Ok(build_dml_execution_result(
+            count,
+            returning_rows,
+            plan.returning.is_some(),
+        ))
     })
 }

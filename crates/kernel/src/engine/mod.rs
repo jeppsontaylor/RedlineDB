@@ -5,12 +5,14 @@ pub mod tx;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::catalog::{
-    CatalogManager, CatalogStore, SchemaEpoch, SqliteSchemaRow, apply_create_index,
-    apply_create_table, apply_drop_index, apply_drop_table, bootstrap_schema, lookup_table,
+    CatalogManager, CatalogStore, SchemaEpoch, SqliteSchemaRow, apply_alter_table,
+    apply_create_index, apply_create_table, apply_drop_index, apply_drop_table, bootstrap_schema,
+    lookup_table,
 };
-use crate::engine::lock::RowLockManager;
+use crate::engine::lock::{RowKey, RowLockManager};
 use crate::engine::page_heap::{PageBackedHeap, VacuumStats};
 use crate::format::{Csn, DEFAULT_PAGE_SIZE, Lsn, Page, RelId, RowId, TxId};
 use crate::storage::{
@@ -22,6 +24,11 @@ use crate::wal::{
     WalConfig, WalCoordinator, WalPayload, WalReader, WalRecord, WalRecordKind, WalScanReport,
 };
 use crate::{Error, Result};
+
+const BEGIN_LOCK_KEY: RowKey = RowKey {
+    rel_id: RelId::ZERO,
+    row_id: RowId::ZERO,
+};
 
 pub use tx::{ConcurrentTxStatus, TxStatusStats, Txn};
 
@@ -87,6 +94,7 @@ pub struct EngineConfig {
     pub rel_id: RelId,
     pub wal: WalConfig,
     pub lock_shards: usize,
+    pub busy_timeout: Duration,
     pub heap_lanes: usize,
     pub page_size: usize,
     pub buffer_pool_pages: usize,
@@ -102,6 +110,7 @@ impl Default for EngineConfig {
             rel_id: RelId(1),
             wal: WalConfig::default(),
             lock_shards: (parallelism * 4).max(16),
+            busy_timeout: Duration::from_millis(250),
             heap_lanes: parallelism.max(4),
             page_size: DEFAULT_PAGE_SIZE,
             buffer_pool_pages: 1024,
@@ -143,12 +152,12 @@ impl Engine {
         let tx_status_store = TxStatusStore::new(path.as_ref())?;
         let checkpoint = control.load_latest()?;
         let catalog_store = CatalogStore::new(path.as_ref());
-        let loaded_catalog = catalog_store.load()?;
+        let loaded_catalog = catalog_store.load().ok().flatten();
         let initial_catalog = loaded_catalog
             .clone()
             .unwrap_or_else(|| bootstrap_schema(RelId(10_000)));
         if loaded_catalog.is_none() {
-            catalog_store.save(&initial_catalog)?;
+            catalog_store.save_atomic(&initial_catalog)?;
         }
         let buffer = Arc::clone(&buffer);
         Ok(Arc::new(Self {
@@ -164,7 +173,7 @@ impl Engine {
             )?,
             catalog: CatalogManager::new(initial_catalog),
             catalog_store,
-            locks: RowLockManager::new(config.lock_shards),
+            locks: RowLockManager::new(config.lock_shards, config.busy_timeout),
             wal,
             control,
             tx_status_store,
@@ -200,27 +209,47 @@ impl Engine {
         let mut reader = WalReader::new(&wal_dir, config.wal.clone());
         let scan_report = reader.scan_report()?;
         let txs = ConcurrentTxStatus::new();
-        std::fs::create_dir_all(path.as_ref())?;
-        let control = ControlStore::new(path.as_ref())?;
-        let tx_status_store = TxStatusStore::new(path.as_ref())?;
-        let checkpoint = control.load_latest()?;
+        std::fs::create_dir_all(path.as_ref())
+            .map_err(|_| Error::CorruptPage("create engine directory failed"))?;
+        let control = ControlStore::new(path.as_ref())
+            .map_err(|_| Error::CorruptPage("create control store failed"))?;
+        let tx_status_store = TxStatusStore::new(path.as_ref())
+            .map_err(|_| Error::CorruptPage("create tx status store failed"))?;
+        let checkpoint = control
+            .load_latest()
+            .map_err(|_| Error::CorruptPage("load control file failed"))?;
         let page_path = path.as_ref().join(&config.data_file_name);
-        let page_file = if checkpoint.is_some() {
-            Arc::new(PageFile::open(page_path, config.page_size)?)
+        let page_file = if checkpoint.is_some() || page_path.exists() {
+            Arc::new(
+                PageFile::open(page_path, config.page_size)
+                    .map_err(|_| Error::CorruptPage("open recovered page file failed"))?,
+            )
         } else {
-            Arc::new(PageFile::create(page_path, config.page_size)?)
+            Arc::new(
+                PageFile::create(page_path, config.page_size)
+                    .map_err(|_| Error::CorruptPage("create recovered page file failed"))?,
+            )
         };
-        let buffer = Arc::new(BufferPool::new(page_file, config.buffer_pool_pages)?);
-        let wal = Arc::new(WalCoordinator::open(wal_dir, config.wal.clone())?);
+        let buffer = Arc::new(
+            BufferPool::new(page_file, config.buffer_pool_pages)
+                .map_err(|_| Error::CorruptPage("create buffer pool failed"))?,
+        );
+        let wal = Arc::new(
+            WalCoordinator::open(wal_dir, config.wal.clone())
+                .map_err(|_| Error::CorruptWal("open wal coordinator failed"))?,
+        );
         let heap = PageBackedHeap::new_with_wal(
             config.rel_id,
             config.heap_lanes,
             Arc::clone(&buffer),
             Some(Arc::clone(&wal)),
-        )?;
+        )
+        .map_err(|_| Error::CorruptPage("create heap failed"))?;
         let catalog_store = CatalogStore::new(path.as_ref());
         let initial_catalog = catalog_store
-            .load()?
+            .load()
+            .ok()
+            .flatten()
             .unwrap_or_else(|| bootstrap_schema(RelId(10_000)));
         let replay_from_lsn = if let Some(checkpoint) = checkpoint {
             let tx_status = tx_status_store.load(checkpoint.generation)?;
@@ -228,6 +257,20 @@ impl Engine {
                 return Err(Error::CorruptPage(
                     "tx status checkpoint generation mismatch",
                 ));
+            }
+            match target {
+                RecoveryTarget::Latest => {}
+                RecoveryTarget::Lsn(limit) if limit < checkpoint.checkpoint_lsn => {
+                    return Err(Error::CorruptWal(
+                        "requested recovery target is older than checkpoint base",
+                    ));
+                }
+                RecoveryTarget::Csn(limit) if limit < tx_status.published_csn => {
+                    return Err(Error::CorruptWal(
+                        "requested recovery target is older than checkpoint base",
+                    ));
+                }
+                RecoveryTarget::Lsn(_) | RecoveryTarget::Csn(_) => {}
             }
             for (tx_id, csn) in tx_status.entries {
                 txs.publish_recovered_commit(tx_id, csn);
@@ -242,10 +285,11 @@ impl Engine {
             Lsn::ZERO
         };
         let metrics = recover_heap(&scan_report.records, replay_from_lsn, target, &txs, &heap)?;
+        let recovered_catalog = recover_catalog_snapshot(&scan_report.records, target)?;
         let page_count = heap.page_count()?;
         heap.load_row_directory_from_pages(page_count)?;
         heap.load_reusable_pages_from_pages(page_count)?;
-        let catalog = CatalogManager::new(initial_catalog);
+        let catalog = CatalogManager::new(recovered_catalog.unwrap_or(initial_catalog));
         let engine = Arc::new(Self {
             config: config.clone(),
             rel_id: config.rel_id,
@@ -254,7 +298,7 @@ impl Engine {
             heap,
             catalog,
             catalog_store,
-            locks: RowLockManager::new(config.lock_shards),
+            locks: RowLockManager::new(config.lock_shards, config.busy_timeout),
             wal,
             control,
             tx_status_store,
@@ -270,6 +314,10 @@ impl Engine {
         &self.config
     }
 
+    pub fn set_busy_timeout(&self, timeout: Duration) {
+        self.locks.set_timeout(timeout);
+    }
+
     pub fn begin(&self, isolation: Isolation) -> Result<Txn> {
         if isolation == Isolation::Serializable {
             return Err(Error::UnsupportedIsolation);
@@ -277,11 +325,34 @@ impl Engine {
         Ok(self.txs.begin_txn(isolation))
     }
 
+    pub fn reserve_begin_lock(&self, tx: &mut Txn) -> Result<()> {
+        if tx.has_row_lock(BEGIN_LOCK_KEY) {
+            return Ok(());
+        }
+        self.locks
+            .lock(BEGIN_LOCK_KEY.rel_id, BEGIN_LOCK_KEY.row_id, tx.id())?;
+        tx.push_row_lock(BEGIN_LOCK_KEY);
+        Ok(())
+    }
+
     pub fn get(&self, tx: &mut Txn, row_id: RowId) -> Result<Option<Vec<u8>>> {
         tx.ensure_open()?;
         self.refresh_read_committed(tx);
         let snapshot = tx.snapshot().clone();
         self.heap.get(&self.txs, &snapshot, Some(tx.id()), row_id)
+    }
+
+    pub fn get_for_relation(
+        &self,
+        tx: &mut Txn,
+        rel_id: RelId,
+        row_id: RowId,
+    ) -> Result<Option<Vec<u8>>> {
+        tx.ensure_open()?;
+        self.refresh_read_committed(tx);
+        let snapshot = tx.snapshot().clone();
+        self.heap
+            .get_for_relation(&self.txs, &snapshot, Some(tx.id()), rel_id, row_id)
     }
 
     pub fn insert(&self, tx: &mut Txn, payload: Vec<u8>) -> Result<RowId> {
@@ -368,48 +439,51 @@ impl Engine {
     pub fn commit(&self, mut tx: Txn) -> Result<Csn> {
         tx.ensure_open()?;
         let pending_schema = tx.pending_schema_snapshot();
+        if let Some(snapshot) = pending_schema.as_deref() {
+            let snapshot_bytes = crate::catalog::encode_snapshot(snapshot)?;
+            self.wal.append(
+                WalRecordKind::Logical,
+                tx.id(),
+                WalPayload::CatalogSnapshot {
+                    tx_id: tx.id(),
+                    schema_epoch: snapshot.meta.schema_epoch.0,
+                    snapshot: snapshot_bytes,
+                }
+                .encode()?,
+            )?;
+        }
 
-        let commit_result = match self
+        let (csn, append) = match self
             .wal
             .append_commit(tx.id(), || self.txs.reserve_commit_csn())
         {
-            Ok((csn, append)) => match self.wal.flush_until(append.end_lsn) {
-                Ok(_) => {
-                    self.txs.publish_commit(tx.id(), csn);
-                    Ok(csn)
-                }
-                Err(err) => {
-                    self.txs.cancel_reserved_csn(csn);
-                    Err(err)
-                }
-            },
-            Err(err) => Err(err),
-        };
-
-        match commit_result {
-            Ok(csn) => {
-                let schema_result = if let Some(snapshot) = pending_schema {
-                    match self.catalog_store.save(&snapshot) {
-                        Ok(()) => {
-                            self.catalog.publish(snapshot);
-                            Ok(())
-                        }
-                        Err(err) => Err(err),
-                    }
-                } else {
-                    Ok(())
-                };
-                self.release_locks(&mut tx);
-                tx.close();
-                schema_result.map(|_| csn)
-            }
+            Ok(value) => value,
             Err(err) => {
                 self.txs.abort(tx.id());
                 self.release_locks(&mut tx);
                 tx.close();
-                Err(err)
+                return Err(err);
             }
+        };
+
+        if let Err(err) = self.wal.flush_until(append.end_lsn) {
+            self.txs.cancel_reserved_csn(csn);
+            self.txs.abort(tx.id());
+            self.release_locks(&mut tx);
+            tx.close();
+            return Err(err);
         }
+
+        self.txs.publish_commit(tx.id(), csn);
+
+        if let Some(snapshot) = pending_schema {
+            let _ = self.catalog_store.save_atomic(&snapshot);
+            self.catalog.publish(snapshot);
+        }
+
+        self.release_locks(&mut tx);
+        tx.close();
+        Ok(csn)
     }
 
     pub fn rollback(&self, mut tx: Txn) -> Result<()> {
@@ -509,6 +583,14 @@ impl Engine {
         Ok(())
     }
 
+    pub fn alter_table(&self, tx: &mut Txn, spec: crate::catalog::AlterTableSpec) -> Result<()> {
+        tx.ensure_open()?;
+        let _ddl = self.catalog.lock_ddl();
+        let next = apply_alter_table((*self.catalog_snapshot_for_tx(tx)).clone(), spec)?;
+        tx.set_pending_schema_snapshot(Arc::new(next));
+        Ok(())
+    }
+
     pub fn oldest_active_snapshot_csn(&self) -> Csn {
         self.txs.oldest_active_snapshot_csn()
     }
@@ -536,6 +618,10 @@ impl Engine {
 
     pub fn relation_rowids(&self, rel_id: RelId) -> Result<Vec<RowId>> {
         self.heap.relation_rowids(rel_id)
+    }
+
+    pub fn relation_entries(&self, rel_id: RelId) -> Result<Vec<(RowId, crate::format::TuplePtr)>> {
+        self.heap.relation_entries(rel_id)
     }
 
     pub fn buffer_pool_stats(&self) -> BufferPoolStats {
@@ -578,6 +664,8 @@ impl Engine {
             published_csn: self.txs.published_csn(),
             entries: self.txs.committed_states(),
         })?;
+        self.catalog_store
+            .save_atomic(self.catalog.current().as_ref())?;
         let next = self
             .control
             .write_next(*checkpoint, durable_lsn, page_count)?;
@@ -610,27 +698,32 @@ impl Engine {
     }
 
     fn lock_row(&self, tx: &mut Txn, row_id: RowId) -> Result<()> {
-        if tx.has_row_lock(row_id) {
+        let key = RowKey {
+            rel_id: self.rel_id,
+            row_id,
+        };
+        if tx.has_row_lock(key) {
             return Ok(());
         }
         self.locks.lock(self.rel_id, row_id, tx.id())?;
-        tx.push_row_lock(row_id);
+        tx.push_row_lock(key);
         Ok(())
     }
 
     fn lock_row_in_rel(&self, tx: &mut Txn, rel_id: RelId, row_id: RowId) -> Result<()> {
-        if tx.has_row_lock(row_id) {
+        let key = RowKey { rel_id, row_id };
+        if tx.has_row_lock(key) {
             return Ok(());
         }
         self.locks.lock(rel_id, row_id, tx.id())?;
-        tx.push_row_lock(row_id);
+        tx.push_row_lock(key);
         Ok(())
     }
 
     fn release_locks(&self, tx: &mut Txn) {
         let tx_id = tx.id();
-        for row_id in tx.drain_row_locks() {
-            self.locks.unlock(self.rel_id, row_id, tx_id);
+        for key in tx.drain_row_locks() {
+            self.locks.unlock(key.rel_id, key.row_id, tx_id);
         }
     }
 }
@@ -713,12 +806,50 @@ fn recover_heap(
             | WalPayload::BackupBegin { .. }
             | WalPayload::BackupEnd { .. }
             | WalPayload::TimelineFork { .. }
-            | WalPayload::LogicalTxn { .. } => {}
+            | WalPayload::LogicalTxn { .. }
+            | WalPayload::CatalogSnapshot { .. } => {}
             WalPayload::Commit { .. } => unreachable!("commit records are skipped above"),
         }
     }
 
     Ok(metrics)
+}
+
+fn recover_catalog_snapshot(
+    records: &[WalRecord],
+    target: RecoveryTarget,
+) -> Result<Option<Arc<crate::catalog::SchemaSnapshot>>> {
+    let mut committed = std::collections::HashSet::new();
+    for record in records {
+        if record.kind == WalRecordKind::Commit
+            && let WalPayload::Commit { tx_id, csn } = WalPayload::decode(&record.payload)?
+            && commit_visible(record.lsn, csn, target)
+        {
+            committed.insert(tx_id);
+        }
+    }
+
+    let mut latest: Option<(Lsn, Arc<crate::catalog::SchemaSnapshot>)> = None;
+    for record in records {
+        if record.kind != WalRecordKind::Logical || !committed.contains(&record.tx_id) {
+            continue;
+        }
+        let WalPayload::CatalogSnapshot {
+            tx_id: _,
+            schema_epoch: _,
+            snapshot,
+        } = WalPayload::decode(&record.payload)?
+        else {
+            continue;
+        };
+        let snapshot = Arc::new(crate::catalog::decode_snapshot(&snapshot)?);
+        match &latest {
+            Some((lsn, _)) if *lsn >= record.lsn => {}
+            _ => latest = Some((record.lsn, snapshot)),
+        }
+    }
+
+    Ok(latest.map(|(_, snapshot)| snapshot))
 }
 
 fn commit_visible(record_lsn: Lsn, csn: Csn, target: RecoveryTarget) -> bool {
