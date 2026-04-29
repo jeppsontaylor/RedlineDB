@@ -7,6 +7,10 @@
 //! All kernels assume the input slices have equal, non-zero length; the public
 //! entry points in `super` already enforce that contract.
 
+/// Alias matching the name used by the HNSW lane (V2). The canonical type is
+/// [`super::VectorMetric`].
+pub type Metric = super::VectorMetric;
+
 /// Squared L2 distance: `Σ (a_i - b_i)^2`.
 ///
 /// We intentionally do **not** take the square root: top-K ordering is

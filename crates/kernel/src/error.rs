@@ -80,6 +80,15 @@ pub enum Error {
 
     #[error("invalid json path: {0}")]
     InvalidJsonPath(&'static str),
+
+    #[error("vector error: {0}")]
+    Vector(String),
+}
+
+impl From<crate::vector::VectorError> for Error {
+    fn from(err: crate::vector::VectorError) -> Self {
+        Error::Vector(err.to_string())
+    }
 }
 
 impl PartialEq for Error {
@@ -128,6 +137,7 @@ impl PartialEq for Error {
             (Self::InvalidRecord(left), Self::InvalidRecord(right)) => left == right,
             (Self::InvalidJsonb(left), Self::InvalidJsonb(right)) => left == right,
             (Self::InvalidJsonPath(left), Self::InvalidJsonPath(right)) => left == right,
+            (Self::Vector(left), Self::Vector(right)) => left == right,
             _ => false,
         }
     }

@@ -29,6 +29,7 @@ pub mod codec;
 pub mod diskann;
 pub mod distance;
 pub mod flat;
+pub mod hnsw;
 pub mod simd;
 
 use std::sync::Arc;
@@ -87,6 +88,25 @@ impl VectorMetric {
             VectorMetric::Cosine => cosine_distance(a, b),
             VectorMetric::InnerProduct => inner_product(a, b),
         })
+    }
+
+    /// Stable on-disk discriminant (used by V2 HNSW persistence).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            VectorMetric::L2 => 0,
+            VectorMetric::Cosine => 1,
+            VectorMetric::InnerProduct => 2,
+        }
+    }
+
+    /// Inverse of [`as_u8`]; returns `None` for an unknown discriminant.
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(VectorMetric::L2),
+            1 => Some(VectorMetric::Cosine),
+            2 => Some(VectorMetric::InnerProduct),
+            _ => None,
+        }
     }
 }
 

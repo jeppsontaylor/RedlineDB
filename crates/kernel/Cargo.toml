@@ -19,5 +19,10 @@ proptest = "1.5"
 tempfile = "3.23"
 
 [features]
-default = []
+default = ["vector_v1_unmerged"]
 failpoints = ["dep:fail"]
+# Lane V2 ships a minimal scalar distance shim while Lane V1's
+# real `vector::distance` module is in flight. Fusion deletes this
+# feature flag and the gated items in `crates/kernel/src/vector/distance.rs`
+# in one pass, leaving Lane V1's SIMD-aware kernels in place.
+vector_v1_unmerged = []
