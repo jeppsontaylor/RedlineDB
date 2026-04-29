@@ -1157,3 +1157,255 @@ mod lane_b {
         assert_index_missing_key(&conn, "t_a_uq", &[OwnedValue::Integer(2)]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Lane C: SQL Index Reads And Planner.
+//
+// Lane C wires SELECT to consume the kernel B-tree indexes that Lane B
+// keeps in sync with DML. These tests assert two invariants:
+//   1. EXPLAIN names the physical access path the executor actually
+//      takes (`IndexPointLookup`, `IndexRangeScan`, or `TableScan`),
+//      and only advertises an index path when one is consumable.
+//   2. Index-driven SELECT results match what a TableScan would have
+//      produced, end-to-end across the heap and the index.
+// Covering indexes and multi-index AND/OR remain disabled until later
+// waves; the last two tests assert that fact.
+// ---------------------------------------------------------------------------
+
+mod lane_c {
+    use super::*;
+
+    /// Run `EXPLAIN QUERY PLAN <sql>` and concatenate the detail
+    /// column for every plan row. The detail format is
+    /// `SEARCH TABLE <name> USING INDEX <idx>: <Probe>` for index
+    /// paths and `SCAN TABLE <name>` for full scans, so substring
+    /// matching is reliable.
+    fn explain_text(conn: &std::sync::Arc<redlinedb_sql::Connection>, sql: &str) -> String {
+        let prepared = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut stmt = conn.prepare(&prepared).expect("prepare explain");
+        let mut out = String::new();
+        while let Step::Row = stmt.step().expect("step explain") {
+            // Column 3 is the textual detail (id, parent, notused,
+            // detail) — see `planner::explain_rows`.
+            out.push_str(stmt.column_text(3).expect("detail"));
+            out.push('\n');
+        }
+        out
+    }
+
+    fn collect_select_ints(
+        conn: &std::sync::Arc<redlinedb_sql::Connection>,
+        sql: &str,
+    ) -> Vec<i64> {
+        let mut stmt = conn.prepare(sql).expect("prepare select");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step select") {
+            rows.push(stmt.column_i64(0).expect("col"));
+        }
+        rows
+    }
+
+    #[test]
+    fn select_by_pk_uses_index_point_lookup() {
+        let (_dir, conn) = open_database();
+        // Use a non-rowid PK (TEXT PRIMARY KEY) so the planner's
+        // rowid-PK fast path doesn't intercept this query — we want
+        // the row to come through the physical B-tree, not through
+        // RowIdGet.
+        conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER)")
+            .expect("create");
+        conn.execute("INSERT INTO t VALUES ('a', 1)")
+            .expect("insert a");
+        conn.execute("INSERT INTO t VALUES ('b', 2)")
+            .expect("insert b");
+
+        let plan = explain_text(&conn, "SELECT v FROM t WHERE k = 'a'");
+        assert!(
+            plan.contains("USING INDEX") && plan.contains("PointLookup"),
+            "expected IndexPointLookup, got plan:\n{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN TABLE t"),
+            "did not expect a full SCAN TABLE under an index path:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn select_indexed_range_uses_index_range_scan() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_a_idx ON t(a)")
+            .expect("create index");
+        for v in 1..=5 {
+            conn.execute(&format!("INSERT INTO t VALUES ({v}, 'v{v}')"))
+                .expect("insert");
+        }
+
+        let plan = explain_text(&conn, "SELECT b FROM t WHERE a BETWEEN 2 AND 4");
+        assert!(
+            plan.contains("USING INDEX t_a_idx") && plan.contains("RangeScan"),
+            "expected IndexRangeScan on t_a_idx, got plan:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn unsupported_predicate_falls_back_to_table_scan() {
+        let (_dir, conn) = open_database();
+        // Index is on `a`; the predicate constrains only `b`, which
+        // is the non-leading and indeed unindexed column. The
+        // planner must not advertise an index path.
+        conn.execute("CREATE TABLE t(a INTEGER, b INTEGER)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_a_idx ON t(a)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (1, 100)")
+            .expect("insert");
+        conn.execute("INSERT INTO t VALUES (2, 200)")
+            .expect("insert");
+
+        let plan = explain_text(&conn, "SELECT a FROM t WHERE b = 100");
+        assert!(
+            plan.contains("SCAN TABLE t"),
+            "expected TableScan (no leading-column predicate), got plan:\n{plan}"
+        );
+        assert!(
+            !plan.contains("USING INDEX"),
+            "must not advertise an index path here:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn index_point_lookup_returns_correct_rows() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER)")
+            .expect("create");
+        for (k, v) in [("a", 1i64), ("b", 2), ("c", 3)] {
+            conn.execute(&format!("INSERT INTO t VALUES ('{k}', {v})"))
+                .expect("insert");
+        }
+        // Index path: WHERE k = 'b' (this is the planner-advertised
+        // IndexPointLookup case).
+        let via_index = collect_select_ints(&conn, "SELECT v FROM t WHERE k = 'b'");
+        // Reference: table scan with a residual filter (we re-issue
+        // the same query; the planner would still pick the index,
+        // but the result must equal the logical answer regardless).
+        assert_eq!(via_index, vec![2]);
+        // Confirm a miss returns an empty set (the index returns no
+        // rows; no fallback to a heap scan happens silently).
+        let miss = collect_select_ints(&conn, "SELECT v FROM t WHERE k = 'zzz'");
+        assert!(
+            miss.is_empty(),
+            "missing key must yield no rows, got {miss:?}"
+        );
+    }
+
+    #[test]
+    fn index_range_scan_returns_correct_rows() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_a_idx ON t(a)")
+            .expect("create index");
+        for v in 1..=5 {
+            conn.execute(&format!("INSERT INTO t VALUES ({v}, 'v{v}')"))
+                .expect("insert");
+        }
+        // BETWEEN 2 AND 4 -> indexed range scan
+        let mut stmt = conn
+            .prepare("SELECT a FROM t WHERE a BETWEEN 2 AND 4 ORDER BY a")
+            .expect("prepare");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push(stmt.column_i64(0).expect("a"));
+        }
+        assert_eq!(rows, vec![2, 3, 4]);
+
+        // Open-ended range: a > 3
+        let mut stmt = conn
+            .prepare("SELECT a FROM t WHERE a > 3 ORDER BY a")
+            .expect("prepare");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push(stmt.column_i64(0).expect("a"));
+        }
+        assert_eq!(rows, vec![4, 5]);
+    }
+
+    #[test]
+    fn planner_does_not_advertise_covering_index() {
+        // Even when every projected column is a leading key of the
+        // index (a true covering candidate), Lane C must NOT emit
+        // `CoveringIndexScan` — that optimization stays disabled
+        // until a later wave wires the executor for it. The
+        // physical plan should still pick an index path
+        // (IndexRangeScan), but render WITHOUT "COVERING".
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b INTEGER)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_a_idx ON t(a)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (1, 10)")
+            .expect("insert");
+        conn.execute("INSERT INTO t VALUES (2, 20)")
+            .expect("insert");
+
+        // SELECT a FROM t WHERE a = 1 — `a` is the only projected
+        // column AND the leading key, so this is a textbook covering
+        // candidate. Assert that the plan reports the regular index
+        // path (PointLookup), NOT a "COVERING INDEX" line.
+        let plan = explain_text(&conn, "SELECT a FROM t WHERE a = 1");
+        assert!(
+            !plan.contains("COVERING INDEX"),
+            "covering-index optimization must stay off:\n{plan}"
+        );
+        assert!(
+            plan.contains("USING INDEX") && plan.contains("PointLookup"),
+            "expected a regular IndexPointLookup, got plan:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn planner_does_not_advertise_multi_index_and_or() {
+        // Two single-column indexes plus a predicate that touches
+        // BOTH (`a = 1 OR b = 10`). A multi-index OR planner could
+        // theoretically union the two probe sets, but Lane C keeps
+        // that optimization disabled. The plan must therefore fall
+        // back to a TableScan rather than emitting `MULTI-INDEX
+        // SCAN`.
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b INTEGER)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_a_idx ON t(a)")
+            .expect("create index");
+        conn.execute("CREATE INDEX t_b_idx ON t(b)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (1, 10)")
+            .expect("insert");
+        conn.execute("INSERT INTO t VALUES (2, 20)")
+            .expect("insert");
+
+        let plan_or = explain_text(&conn, "SELECT a FROM t WHERE a = 1 OR b = 20");
+        assert!(
+            !plan_or.contains("MULTI-INDEX"),
+            "multi-index OR must stay off:\n{plan_or}"
+        );
+        // We accept either TableScan or — if a single-index path is
+        // somehow extracted from one side of the OR — the plain
+        // index path. What we MUST NOT see is a multi-index union.
+        // (Today the planner walks only top-level AND chains, so an
+        // OR pins us to TableScan; this assertion preserves that.)
+        assert!(
+            plan_or.contains("SCAN TABLE t"),
+            "expected fallback to TableScan for OR, got plan:\n{plan_or}"
+        );
+
+        // Same for AND-of-two-indexes: only the leading conjunct
+        // gets used. We never emit MULTI-INDEX AND.
+        let plan_and = explain_text(&conn, "SELECT a FROM t WHERE a = 1 AND b = 10");
+        assert!(
+            !plan_and.contains("MULTI-INDEX"),
+            "multi-index AND must stay off:\n{plan_and}"
+        );
+    }
+}
