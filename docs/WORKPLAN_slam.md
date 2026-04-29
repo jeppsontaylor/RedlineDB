@@ -484,16 +484,104 @@ Lanes in flight at this writing (parallel worktrees):
 - V3 — DiskANN-style SSD graph
 - SQL-D — SQLite surface (FK, triggers, views, CTEs, window funcs, generated cols, partial/expression indexes, collations, REGEXP, date/time, ALTER TABLE)
 
-### Phase 10C onward — pending
+### Phase 10B Wave 1 — final fusion (complete)
 
-After wave-2 lanes fuse:
-- Phase 10D — bench expansion (7 new workloads: json-path-extract,
-  json-path-update, vector-flat-search, vector-ann-search,
-  vector-ann-search-disk, large-sort-spill, commit-storm-batched) +
-  `certification-v2.toml` + live xbabe1 cert.
-- Phase 10E — paper rebuild with new figs 6/7/8 and refreshed evaluation
-  section (paper-v2).
-- Phase 10F — final cleanup pass + `phase10-fusion-green` tag.
+All 6 wave-1 lanes fused in main; tag `phase10-wave1-partial` snapshots
+the state after lanes SQL-A / SQL-B / SQL-C / GC / INT. VE was held
+back due to exec.rs overlap with SQL-A and merged in Wave 2's window.
+
+### Phase 10C Wave 2 — full fusion (`phase10-wave2-fused`)
+
+All 7 outstanding lanes (VE + 6 Wave 2) fused in main. Each lane was
+implemented in an isolated agent worktree, branched from
+`phase10-wave1-partial`-or-later, merged via `git merge --no-ff` with
+manual conflict resolution where the lanes touched the same regions.
+
+Lane VE — vectorized executor + spillable sort + 41 tests
+- crates/sql/src/exec/vec/{mod,select,topk,sort,hash_agg,spill}.rs
+- top-K min-heap when ORDER BY ... LIMIT k (k≤64); spillable external
+  merge-sort otherwise; selection vectors; hash aggregation with
+  spill lane
+- planner emits MaterializedTopN at the 64-row threshold
+- bench: large-sort-spill workload registered
+
+Lane J1 — full SQLite JSON1 surface + 72 tests
+- crates/sql/src/json/{mod,path,scalar}.rs
+- json, json_array, json_array_length, json_object, json_extract,
+  json_set, json_insert, json_replace, json_remove, json_patch
+  (RFC 7396), json_type, json_valid, json_quote, json_minify
+- -> and ->> operators with shorthand path support
+- 100-iter deterministic xorshift fuzz harness
+
+Lane J2 — JSONB binary format + path bytecode + 33 tests
+- crates/kernel/src/json/{wire,encode,decode,path_bytecode,simd_key}.rs
+- magic 0x96, format version 1, type tags 0x00..0x08, LEB128 varints,
+  zig-zag i64, ObjectIter / ArrayIter
+- path bytecode { Root, LoadObjKey(u32), LoadArrIdx(u32), Return }
+  with literal-table interning + Arc<CompiledPath> caching
+- SIMD key compare via 16-byte zero-padded u64 XORs (≥4 children +
+  key ≤16 bytes)
+- 1000-iteration round-trip fuzz + 256-iter random-byte panic stress
+
+Lane V1 — VECTOR type + SIMD distance + flat scan + 44 tests
+- crates/kernel/src/vector/{mod,distance,simd,codec,flat}.rs
+- AVX2+FMA / NEON / scalar dispatch with runtime feature detection
+- L2 / Cosine / InnerProduct via stateless VectorMetric dispatch
+- VECTOR(d[, f32]) parses + auto-emits BlobLen check constraint
+- <=> overload returns cosine distance for vector blobs
+
+Lane V2 — HNSW index + 14 tests
+- crates/kernel/src/vector/hnsw/{mod,levels,builder,searcher,storage.rs}
+- M=32, efC=200, recall@10=0.9526 at efS=64 on 10k Gaussian 128-d
+- Persistence via meta page (RDHN magic) + chained data pages
+  + WAL PageImage records
+- MVCC tombstones via delete_tx
+- Failpoint hooks at vector::hnsw::insert::after_link and
+  vector::hnsw::search::beam_step
+
+Lane V3 — DiskANN-style vector graph + 22 tests (incl. 1 ignored bench)
+- crates/kernel/src/vector/diskann/{mod,sectors,builder,searcher,prune}.rs
+- Vamana algorithm with R=64, alpha=1.2, RobustPrune
+- recall@10 = 0.9895 (1979/2000 hits) at beam=64, queries=200, on
+  10k synthetic 32-d vectors
+- 4KiB sector layout designed in (disk-resident search via mmap is
+  the next step; current impl is in-memory with sector round-trip)
+
+Lane SQL-D — SQLite surface expansion + 40 tests
+- Tier 1 full execution: REGEXP, date/time, collations
+  (BINARY/NOCASE/RTRIM)
+- Tier 1 parser-only with execute-time errors: FK declarations,
+  ALTER TABLE DROP COLUMN, partial indexes, expression indexes
+- Tier 2/3 parser-only: CTEs, CREATE VIEW, CREATE TRIGGER, window
+  functions, generated columns
+
+Wave-2-fused proof matrix:
+- `cargo fmt --check` — green
+- `./scripts/check_file_sizes.sh` — green (file-size warnings only)
+- `cargo check --workspace --locked` — green
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
+- `cargo test --workspace --quiet --locked` — `691 passed, 3 ignored`
+  (55 suites; vs 241 wave-7-fused → +450 phase-10 tests, vs 261 baseline → +430)
+- `cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7` — `40/40 cases, 0 failures`
+
+Phase 10 closing tags so far: `phase10-baseline`, `phase10-wave1-partial`,
+`phase10-wave2-fused`.
+
+### Phase 10D — bench + xbabe1 cert (in flight)
+
+Live xbabe1 certification of `phase10-wave2-fused` running in background.
+`cargo run -p redlinedb-bench --release -- certify --config
+crates/bench/bench/certification.toml --out-dir target/bench/xbabe1/
+phase10-cert --seed 7 --repetitions 5 --warmup 1`.
+
+Subsequent items pending after the cert returns artifacts:
+- new workloads: json-path-extract / -update, vector-flat-search,
+  vector-ann-search, vector-ann-search-disk, commit-storm-batched
+  (large-sort-spill already registered by VE)
+- certification-v2.toml referencing the new workloads
+- second xbabe1 run with v2 config
+- Phase 10E paper rebuild
+- Phase 10F final cleanup + `phase10-fusion-green` tag
 
 ## Verified Proof
 
