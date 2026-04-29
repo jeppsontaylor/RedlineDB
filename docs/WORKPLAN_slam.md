@@ -2,6 +2,27 @@
 
 Status snapshot for the SQLite-compatibility, benchmark, and kernel follow-on work.
 
+## Phase 9 Baseline
+
+The phase-8 working tree (33 modified + 22 untracked files) was split into six
+subsystem-scoped commits and tagged `phase9-baseline`. Cumulative state passes
+all proof lanes; intermediate states may not compile standalone (this is
+acceptable for `git bisect` — non-buildable commits are skipped by default).
+
+- `6779250 chore(parser): split parser.rs into ddl/dml/pragma/select/helpers submodules`
+- `06f0552 feat(bench): add certify lane scaffold and modular harness`
+- `8432ee6 feat(kernel+sql): catalog snapshot WAL, relation-qualified loads, busy timeout`
+- `4320364 chore(ffi): add sqlite3.h compat header and wire busy-timeout pass-through`
+- `8d54e84 feat(facade): wire busy-timeout, benchmark stats, OS advisory lock through redlinedb`
+- `49ba716 chore(agent+docs+scripts): phase 9 proof lanes, xbabe1 scripts, workplan docs`
+
+Post-split proof:
+- `cargo fmt --check` — green
+- `./scripts/check_file_sizes.sh` — green
+- `cargo check --workspace --locked` — green
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
+- `cargo test --workspace --quiet --locked` — `174 passed (28 suites, 3.62s)`
+
 ## Verified Proof
 
 These commands passed in the current workspace:
