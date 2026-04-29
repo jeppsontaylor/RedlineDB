@@ -33,6 +33,37 @@ const BEGIN_LOCK_KEY: RowKey = RowKey {
     row_id: RowId::ZERO,
 };
 
+#[cfg(feature = "failpoints")]
+std::thread_local! {
+    /// Lane KH P0 #3: per-thread switch for the
+    /// `engine::commit::before_publish` failpoint. The fail-crate
+    /// registry is process-wide, so without this guard the closure
+    /// would inject the fault on every commit in every parallel test.
+    /// Tests call [`arm_commit_failure_for_thread`] before issuing
+    /// their commit and clear it afterwards.
+    static COMMIT_FAILURE_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm or disarm the thread-local commit-failure injection used by the
+/// `engine::commit::before_publish` failpoint closure. Available only
+/// when the kernel is built with `failpoints` so production builds pay
+/// nothing for it.
+#[cfg(feature = "failpoints")]
+pub fn arm_commit_failure_for_thread(armed: bool) {
+    COMMIT_FAILURE_ARMED.with(|c| c.set(armed));
+}
+
+#[cfg(feature = "failpoints")]
+fn commit_failure_armed_for_thread() -> bool {
+    COMMIT_FAILURE_ARMED.with(|c| c.get())
+}
+
+#[cfg(not(feature = "failpoints"))]
+#[allow(dead_code)]
+fn commit_failure_armed_for_thread() -> bool {
+    false
+}
+
 pub use tx::{ConcurrentTxStatus, TxStatusStats, Txn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -493,11 +524,44 @@ impl Engine {
             return Err(err);
         }
 
-        // Lane E failpoint: THE critical hook - WAL fsync has acked but the
-        // CSN has not been published yet. Crashing here lets harnesses prove
-        // recovery republishes the committed CSN watermark from the WAL even
-        // though no in-memory observer ever saw the commit.
-        crate::fail_point!("engine::commit::before_publish");
+        // Lane E failpoint: THE critical hook - WAL fsync has acked but
+        // the CSN has not been published yet. Crashing here lets
+        // harnesses prove recovery republishes the committed CSN
+        // watermark from the WAL even though no in-memory observer
+        // ever saw the commit. Lane KH P0 #3 extends this with the
+        // closure form so the SQL-side commit-failure rollback test
+        // can configure `return(arg)` to make commit return Err
+        // without panicking — required to drive the index-undo repair
+        // path the SQL layer now installs. The fail crate registry is
+        // process-wide, so to keep parallel tests in the same binary
+        // unaffected the closure gates the actual injection on a
+        // thread-local flag that only the arming test sets; on every
+        // other thread the closure performs the success path verbatim
+        // and returns `Ok(csn)`.
+        let pending_schema_for_closure = pending_schema.clone();
+        crate::fail_point!("engine::commit::before_publish", |arg: Option<String>| {
+            if !commit_failure_armed_for_thread() {
+                // Not the arming thread; behave as if the failpoint
+                // were disarmed by completing the success path the
+                // body just below would take.
+                self.txs.publish_commit(tx.id(), csn);
+                if let Some(snapshot) = pending_schema_for_closure {
+                    let _ = self.catalog_store.save_atomic(&snapshot);
+                    self.catalog.publish(snapshot);
+                }
+                self.release_locks(&mut tx);
+                tx.close();
+                return Ok(csn);
+            }
+            // Arming thread: simulate a post-flush failure.
+            self.txs.cancel_reserved_csn(csn);
+            self.txs.abort(tx.id());
+            self.release_locks(&mut tx);
+            tx.close();
+            let detail =
+                arg.unwrap_or_else(|| "engine::commit::before_publish injected fault".to_string());
+            Err(Error::Io(std::io::Error::other(detail)))
+        });
         self.txs.publish_commit(tx.id(), csn);
 
         if let Some(snapshot) = pending_schema {

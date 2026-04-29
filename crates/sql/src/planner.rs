@@ -406,6 +406,7 @@ fn build_table_scan_plan(
         .ok()
         .flatten();
     let access = choose_access_path(
+        conn,
         table,
         projection,
         selection,
@@ -968,6 +969,7 @@ fn wrap_limit(input: PhysicalPlan, plan: &SelectPlan) -> PhysicalPlan {
 // shrinking the contract.
 #[allow(clippy::too_many_arguments)]
 fn choose_access_path(
+    conn: &Connection,
     table: &Arc<TableDef>,
     _projection: &[SelectItem],
     selection: &Option<Expr>,
@@ -990,7 +992,7 @@ fn choose_access_path(
         return AccessPath::RowIdGet { rowid };
     }
     if let Some(matched) =
-        crate::exec::index_access::try_match_index_access(table, selection, bindings)
+        crate::exec::index_access::try_match_index_access(conn.engine(), table, selection, bindings)
     {
         return match matched.kind {
             crate::exec::index_access::IndexProbeKind::PointLookup => {

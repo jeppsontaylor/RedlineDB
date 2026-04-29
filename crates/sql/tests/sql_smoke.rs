@@ -1384,12 +1384,16 @@ mod lane_c {
     #[test]
     fn select_by_pk_uses_index_point_lookup() {
         let (_dir, conn) = open_database();
-        // Use a non-rowid PK (TEXT PRIMARY KEY) so the planner's
-        // rowid-PK fast path doesn't intercept this query — we want
-        // the row to come through the physical B-tree, not through
-        // RowIdGet.
-        conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER)")
+        // CREATE TABLE PRIMARY KEY indexes are autoindexes that the
+        // catalog records without a `meta_page_id` (no physical pages
+        // are allocated until CREATE INDEX runs). Lane KH P1 #5 made
+        // the planner skip indexes without a live handle, so we issue
+        // CREATE INDEX explicitly here to exercise the point-lookup
+        // path through a real B-tree.
+        conn.execute("CREATE TABLE t(k TEXT, v INTEGER)")
             .expect("create");
+        conn.execute("CREATE INDEX t_k_idx ON t(k)")
+            .expect("create index");
         conn.execute("INSERT INTO t VALUES ('a', 1)")
             .expect("insert a");
         conn.execute("INSERT INTO t VALUES ('b', 2)")
@@ -1663,4 +1667,128 @@ mod lane_c {
         }
         assert_eq!(rows, vec!["y".to_owned()]);
     }
+}
+
+// ----- Lane KH (Wave 7) regressions -----
+
+/// P1 #5: the planner must skip indexes whose catalog entry has no
+/// `meta_page_id` even when the engine could otherwise satisfy the
+/// predicate. CREATE TABLE PRIMARY KEY autoindexes are exactly this
+/// case — they live in the snapshot but no physical B-tree is
+/// allocated until CREATE INDEX runs. Before the fix, EXPLAIN
+/// reported `IndexPointLookup` while the executor silently fell back
+/// to a TableScan.
+#[test]
+fn planner_does_not_advertise_index_without_handle() {
+    let (_dir, conn) = open_database();
+    // CREATE TABLE PRIMARY KEY records an autoindex with
+    // `meta_page_id=None` and never registers an engine handle for it.
+    // (CREATE INDEX is the only path that allocates the physical
+    // pages.) The planner must observe that absence and pick TableScan.
+    conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER)")
+        .expect("create");
+    conn.execute("INSERT INTO t VALUES ('a', 1)")
+        .expect("insert a");
+    conn.execute("INSERT INTO t VALUES ('b', 2)")
+        .expect("insert b");
+
+    let prepared = "EXPLAIN QUERY PLAN SELECT v FROM t WHERE k = 'a'";
+    let mut stmt = conn.prepare(prepared).expect("prepare explain");
+    let mut detail = String::new();
+    while let Step::Row = stmt.step().expect("step explain") {
+        detail.push_str(stmt.column_text(3).expect("detail"));
+        detail.push('\n');
+    }
+    assert!(
+        detail.contains("SCAN TABLE t"),
+        "expected TableScan, got plan:\n{detail}"
+    );
+    assert!(
+        !detail.contains("USING INDEX"),
+        "must not advertise an index without a live handle:\n{detail}"
+    );
+
+    // Sanity: the executor must still satisfy the predicate via the
+    // fallback path so end-user behavior matches the EXPLAIN output.
+    let mut stmt = conn
+        .prepare("SELECT v FROM t WHERE k = 'a'")
+        .expect("prepare select");
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("v"), 1);
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+}
+
+/// P0 #3: when `engine.commit` fails after the SQL layer has already
+/// mutated physical index pages, the SQL-side `index_undo` log must
+/// be replayed against a fresh tx. Otherwise an INSERT that raced a
+/// commit-failure would leave a unique-key entry visible on the
+/// index even though the heap row was rolled back, which breaks the
+/// next INSERT of the same key.
+#[cfg(feature = "failpoints")]
+#[test]
+fn commit_failure_replays_index_undo() {
+    use redlinedb_kernel::engine::arm_commit_failure_for_thread;
+    use redlinedb_kernel::failpoints;
+    use std::sync::Mutex;
+
+    // The fail-crate registry is process-wide, so we serialize all
+    // tests that touch the `engine::commit::before_publish`
+    // configuration through one mutex. The closure inside the
+    // failpoint additionally checks a thread-local flag (armed below)
+    // so that other tests running on parallel threads keep
+    // committing normally even while our action is in the registry.
+    static GUARD: Mutex<()> = Mutex::new(());
+    let _serial = GUARD.lock().unwrap_or_else(|p| p.into_inner());
+
+    failpoints::cfg(
+        "engine::commit::before_publish",
+        "return(commit-failure-replays-index-undo)",
+    )
+    .expect("configure commit failpoint");
+
+    let (_dir, conn) = open_database();
+    conn.execute("CREATE TABLE t(k INTEGER, v TEXT)")
+        .expect("create");
+    conn.execute("CREATE UNIQUE INDEX t_k_idx ON t(k)")
+        .expect("create unique index");
+
+    // Arm AFTER DDL so the index is already physically allocated; we
+    // want the *INSERT* commit to fail, not the DDL. The thread-local
+    // flag scopes the failpoint to this test's thread; other parallel
+    // tests' commits see the closure but skip the injection.
+    arm_commit_failure_for_thread(true);
+
+    let err = conn
+        .execute("INSERT INTO t VALUES (1, 'first')")
+        .expect_err("commit must fail");
+    assert!(
+        format!("{err:?}").contains("commit-failure-replays-index-undo"),
+        "unexpected error from injected commit failure: {err:?}"
+    );
+
+    // Disarm before the next commit so the repair path can run.
+    arm_commit_failure_for_thread(false);
+    failpoints::cfg("engine::commit::before_publish", "off").expect("disable commit failpoint");
+
+    conn.execute("INSERT INTO t VALUES (1, 'second')")
+        .expect("re-insert after rollback");
+    let mut stmt = conn
+        .prepare("SELECT v FROM t WHERE k = 1")
+        .expect("prepare");
+    let mut rows = Vec::new();
+    while let Step::Row = stmt.step().expect("step") {
+        rows.push(stmt.column_text(0).expect("v").to_owned());
+    }
+    assert_eq!(
+        rows,
+        vec!["second".to_owned()],
+        "rolled-back INSERT must not leave an orphan row visible"
+    );
+
+    // Total row count must match: only the second insert survived.
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM t")
+        .expect("prepare count");
+    assert_eq!(stmt.step().expect("step count"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("count"), 1);
 }

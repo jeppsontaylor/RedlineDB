@@ -367,12 +367,28 @@ impl Connection {
             .tx
             .take()
             .ok_or(Error::TransactionState("no active transaction"))?;
-        let result = self.db.engine.commit(tx);
-        session.index_undo.clear();
-        session.kernel_unique_guards.clear();
-        session.unique_guards.clear();
-        result?;
-        Ok(())
+        // Wave 7 P0 #3: a failure inside `engine.commit` (e.g. WAL fsync error
+        // or a failpoint-injected fault) leaves SQL-side index page mutations
+        // visible — `insert_tx`/`delete_mark_tx` already flipped durable bytes
+        // on the leaf page, and the kernel rollback that runs inside
+        // `commit` does not undo physical index mutations. Until the commit
+        // result is in hand we must NOT clear `index_undo`; on `Err` we run
+        // the inverse against a fresh tx so the heap and the physical
+        // indexes stay consistent.
+        match self.db.engine.commit(tx) {
+            Ok(_) => {
+                session.index_undo.clear();
+                session.kernel_unique_guards.clear();
+                session.unique_guards.clear();
+                Ok(())
+            }
+            Err(err) => {
+                crate::exec::replay_index_undo_after_commit_failure(&self.db.engine, &mut session);
+                session.kernel_unique_guards.clear();
+                session.unique_guards.clear();
+                Err(err.into())
+            }
+        }
     }
 
     pub fn rollback(&self) -> Result<()> {
