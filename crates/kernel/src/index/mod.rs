@@ -670,6 +670,24 @@ impl BtreeIndex {
             .clone()
     }
 
+    /// Returns the meta-page id for this B-tree. Lane A persists this in the
+    /// catalog snapshot so recovery can reopen the index handle.
+    pub fn meta_page_id(&self) -> PageId {
+        self.inner.meta_page_id
+    }
+
+    /// Log WAL `PageImage` records for the meta and root pages of a freshly
+    /// created index so recovery can reconstruct the B-tree even if the
+    /// engine drops before a checkpoint flushes the buffer pool. Caller must
+    /// supply a real (non-zero) `TxId` whose commit LSN covers these images.
+    pub fn record_initial_page_images(&self, tx_id: crate::format::TxId) -> Result<()> {
+        let meta_id = self.inner.meta_page_id;
+        let root_id = self.meta()?.root_page_id;
+        self.record_page_image(meta_id, tx_id)?;
+        self.record_page_image(root_id, tx_id)?;
+        Ok(())
+    }
+
     fn split_leaf_and_insert(
         &self,
         ancestors: &[PageId],
