@@ -19,4 +19,4 @@ ssh "${REMOTE}" "cd '${REMOTE_DIR}' && docker build -f crates/bench/docker/Docke
 REDLINEDB_BENCH_IMAGE_DIGEST="$(ssh "${REMOTE}" "docker inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}{{.Id}}{{end}}' '${IMAGE}'")"
 export REDLINEDB_BENCH_IMAGE_DIGEST
 
-ssh "${REMOTE}" "cd '${REMOTE_DIR}' && docker run --rm -u \$(id -u):\$(id -g) -e CARGO_TARGET_DIR=/work/target -e REDLINEDB_BENCH_IMAGE_DIGEST='${REDLINEDB_BENCH_IMAGE_DIGEST}' -v '${REMOTE_DIR}':/work -w /work '${IMAGE}' bash -lc $(printf '%q' "${REMOTE_COMMAND}")"
+ssh "${REMOTE}" "cd '${REMOTE_DIR}' && docker run --rm -u \$(id -u):\$(id -g) -e CARGO_TARGET_DIR=/work/target -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e REDLINEDB_BENCH_IMAGE_DIGEST='${REDLINEDB_BENCH_IMAGE_DIGEST}' -v '${REMOTE_DIR}':/work -w /work '${IMAGE}' bash -c $(printf '%q' "${REMOTE_COMMAND}")"
