@@ -74,6 +74,17 @@ commands = [
   "./scripts/bench/xbabe1_fetch.sh certification",
 ]
 
+# Wave 6 Lane B: strace-instrumented certification. Runs the full
+# certification matrix on the xbabe1 Docker host with `--with-strace`
+# so each per-engine bench child is wrapped in `strace -c` and the
+# manifest captures aggregate syscall counts. Linux-only by design.
+[phase9-xbabe1-certify-with-strace]
+commands = [
+  "./scripts/bench/xbabe1_sync.sh",
+  "./scripts/bench/xbabe1_run.sh rtk cargo run -p redlinedb-bench -- certify --config crates/bench/bench/certification.toml --out-dir target/bench/xbabe1/certify-strace --seed 7 --repetitions 5 --warmup 1 --with-strace",
+  "./scripts/bench/xbabe1_fetch.sh certify-strace",
+]
+
 [security]
 commands = [
   "rtk cargo audit",
