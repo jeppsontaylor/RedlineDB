@@ -31,12 +31,13 @@ use crate::statement::{
 };
 use crate::value::{SqlValue, canonicalize, compare_values, is_truthy};
 
-mod expr;
+pub(crate) mod expr;
 use expr::*;
 pub(crate) mod index_access;
 pub(crate) mod index_dml;
 mod tail;
 use tail::*;
+pub(crate) mod vec;
 
 thread_local! {
     static CURRENT_CONNECTION: Cell<*const Connection> = const { Cell::new(std::ptr::null()) };
@@ -885,19 +886,98 @@ fn order_and_project_rows(
             filtered.push(row);
         }
     }
-    let memory_bytes = filtered.iter().try_fold(0usize, |acc, row| {
-        row.values().map(|values| acc + row_width(&values))
-    })?;
-    memory.request(memory_bytes)?;
-    filtered.sort_by(|left, right| {
-        compare_row_ordering(left, right, order_by, bindings).unwrap_or(Ordering::Equal)
-    });
 
-    let mut out = Vec::new();
-    for row in filtered.into_iter().skip(offset).take(limit) {
-        out.push(project_row(projection, &row, bindings)?);
+    // Lane VE top-K fast path: ORDER BY ... LIMIT k where k is small wants
+    // a fixed-size heap, not a full sort. The threshold matches
+    // `vec::TOPK_LIMIT_THRESHOLD`.
+    let total_take = limit.saturating_add(offset);
+    if !order_by.is_empty()
+        && total_take > 0
+        && total_take <= vec::TOPK_LIMIT_THRESHOLD
+        && limit < usize::MAX
+    {
+        let directions = directions_from_order_by(order_by);
+        let mut heap = vec::TopKHeap::new(total_take, directions);
+        for row in &filtered {
+            let keys = order_by
+                .iter()
+                .map(|expr| eval_scalar(&expr.expr, &row.context(), bindings))
+                .collect::<Result<Vec<_>>>()?;
+            let projected = project_row(projection, row, bindings)?;
+            heap.push(keys, projected)?;
+        }
+        let sorted = heap.into_sorted_rows();
+        return Ok(sorted.into_iter().skip(offset).take(limit).collect());
     }
-    Ok(out)
+
+    if order_by.is_empty() {
+        let memory_bytes = filtered.iter().try_fold(0usize, |acc, row| {
+            row.values().map(|values| acc + row_width(&values))
+        })?;
+        memory.request(memory_bytes)?;
+        let mut out = Vec::new();
+        for row in filtered.into_iter().skip(offset).take(limit) {
+            out.push(project_row(projection, &row, bindings)?);
+        }
+        return Ok(out);
+    }
+
+    // Spillable sort path: project first so the sort buffer stores only the
+    // emitted columns. Memory accounting happens inside `SpillSort` via the
+    // configured budget.
+    let directions = directions_from_order_by(order_by);
+    let mut projected_with_keys: Vec<(Vec<SqlValue>, Vec<SqlValue>)> =
+        Vec::with_capacity(filtered.len());
+    for row in &filtered {
+        let keys = order_by
+            .iter()
+            .map(|expr| eval_scalar(&expr.expr, &row.context(), bindings))
+            .collect::<Result<Vec<_>>>()?;
+        let projected = project_row(projection, row, bindings)?;
+        projected_with_keys.push((keys, projected));
+    }
+    let work_mem = memory.work_mem_bytes;
+    let max_spill = memory.max_spill_bytes;
+    let order_len = order_by.len();
+    let mut sorter = vec::SpillSort::new(
+        directions,
+        work_mem,
+        max_spill,
+        move |row: &[SqlValue]| -> Result<Vec<SqlValue>> {
+            // Keys are stored as the first `order_len` cells in the SpillSort
+            // input rows; downstream we strip them.
+            Ok(row[..order_len].to_vec())
+        },
+    );
+    for (keys, projected) in projected_with_keys {
+        let mut combined = Vec::with_capacity(keys.len() + projected.len());
+        combined.extend(keys);
+        combined.extend(projected);
+        sorter.push(combined)?;
+    }
+    let spilled = sorter.total_spilled_bytes();
+    if spilled > 0 {
+        // Surface the spill to the broker so `peak_memory_bytes` /
+        // `spill_bytes` telemetry stays accurate.
+        memory.request(spilled as usize)?;
+    }
+    let sorted = sorter.finish()?;
+    Ok(sorted
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|row| row[order_len..].to_vec())
+        .collect())
+}
+
+fn directions_from_order_by(order_by: &[OrderByExpr]) -> Vec<vec::SortDirection> {
+    order_by
+        .iter()
+        .map(|order| match order.options.asc {
+            Some(false) => vec::SortDirection::Desc,
+            _ => vec::SortDirection::Asc,
+        })
+        .collect()
 }
 
 fn select_requires_aggregation(plan: &crate::statement::SelectPlan) -> bool {
@@ -1049,16 +1129,25 @@ fn execute_grouped_select(
     let groups = if plan.group_by.is_empty() {
         vec![filtered]
     } else {
-        let mut groups: Vec<(Vec<SqlValue>, Vec<SqlRow>)> = Vec::new();
+        // Lane VE hash-aggregation: replace the O(n^2) linear-find group
+        // build with an encoded-key HashMap. Insertion order is preserved
+        // via a parallel `Vec<usize>` so EXPLAIN-stable orderings remain
+        // unchanged (callers that need ORDER BY apply their own sort).
+        use std::collections::HashMap;
+        let mut index_by_key: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut groups: Vec<Vec<SqlRow>> = Vec::new();
         for row in filtered {
             let key = eval_group_key(&plan.group_by, &row, bindings)?;
-            if let Some((_, rows)) = groups.iter_mut().find(|(existing, _)| *existing == key) {
-                rows.push(row);
-            } else {
-                groups.push((key, vec![row]));
+            let key_bytes = vec::hash_agg::encode_group_key_bytes(&key)?;
+            match index_by_key.get(&key_bytes) {
+                Some(&idx) => groups[idx].push(row),
+                None => {
+                    index_by_key.insert(key_bytes, groups.len());
+                    groups.push(vec![row]);
+                }
             }
         }
-        groups.into_iter().map(|(_, rows)| rows).collect()
+        groups
     };
 
     let memory_bytes = groups.iter().try_fold(0usize, |acc, group| {
