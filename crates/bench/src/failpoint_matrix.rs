@@ -183,8 +183,20 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
     // succeeds when the `failpoints` feature was enabled at compile
     // time, which we guarantee via the bench's direct dep on
     // `redlinedb-kernel = { features = ["failpoints"] }`.
+    //
+    // The action string is forwarded VERBATIM to `fail::cfg`. The only
+    // transformation we apply is prepending the `K*` count when
+    // `kill_after_n_hits > 1` so the failpoint fires the K-th time
+    // rather than immediately. Previous revisions silently rewrote
+    // `return` and `abort` to `panic`, which made the
+    // `wal-fsync-skipped` case test panic-mid-fsync rather than
+    // skipped-fsync semantics. See `apply_kill_count`.
     redlinedb_kernel::failpoints::init();
-    let action = translate_action(&args.action, args.kill_after_n_hits);
+    let action = apply_kill_count(&args.action, args.kill_after_n_hits);
+    eprintln!(
+        "failpoint-child: arming failpoint={} action={} (raw={})",
+        args.failpoint, action, args.action
+    );
     redlinedb_kernel::failpoints::cfg(&args.failpoint, &action)
         .map_err(|err| anyhow::anyhow!("arm failpoint {}: {}", args.failpoint, err))?;
 
@@ -207,14 +219,9 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
     )?;
     conn.execute("CREATE INDEX IF NOT EXISTS kv_tenant_idx ON kv(tenant)", ())?;
 
-    // Open the ack log in append mode. Each successful commit
-    // contractually fsyncs the WAL; only after the commit returns
-    // do we append the row's key. The flush() ensures the OS sees
-    // the write before we proceed to the next row.
-    let mut ack = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&args.ack_log)?;
+    // Open the ack log with the documented durability contract: see
+    // `open_ack_log` for fsync details.
+    let mut ack = open_ack_log(&args.ack_log)?;
 
     // Every 16 rows the child also calls `Database::checkpoint()` so
     // failpoints that gate the checkpoint path (`engine::checkpoint`,
@@ -250,8 +257,7 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
             // a meaningful ack count up to this point.
             return Ok(());
         }
-        writeln!(ack, "{key}")?;
-        ack.flush()?;
+        ack_row(&mut ack, key)?;
 
         if key > 0 && key.is_multiple_of(CHECKPOINT_EVERY_ROWS) && db.checkpoint().is_err() {
             // The checkpoint failpoint fires here; treat error as
@@ -397,32 +403,86 @@ fn engine_name(engine: EngineKind) -> &'static str {
     }
 }
 
-fn translate_action(raw: &str, kill_after_n_hits: u64) -> String {
+/// Open the ack log used by the failpoint-matrix child to record
+/// contractually-durable rows.
+///
+/// Durability semantics:
+///
+/// - The file is opened with `create=true, append=true`. Append mode
+///   gives us atomic per-line semantics on POSIX so concurrent writers
+///   would not interleave (the matrix runner is single-threaded but
+///   this matches the recovery-matrix child's ack-log convention).
+/// - We `sync_all()` the file handle once after opening so the inode
+///   metadata (size = 0, length zero) is on disk before the first
+///   write. This matters when the workload crashes before the first
+///   commit: without the initial fsync the directory entry might not
+///   exist on disk and `read_ack_count` would return zero even when
+///   the on-disk WAL contains acked rows.
+/// - We `sync_all()` the parent directory so the directory entry that
+///   names the ack log is itself durable. macOS HFS+/APFS and Linux
+///   ext4 both require this for the file to survive a crash that
+///   happens between `creat()` and the first fsync.
+///
+/// The returned [`File`] handle MUST be passed to [`ack_row`] for each
+/// subsequent commit. Reopening the file per-write would defeat the
+/// fsync contract and cost an extra `open(2)` per row.
+pub fn open_ack_log(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open ack log {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("initial sync of ack log {}", path.display()))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(dir) = File::open(parent)
+    {
+        // Best-effort directory fsync: not all filesystems support it
+        // (e.g. tmpfs on some kernels returns EINVAL) so we ignore the
+        // result. Real on-disk filesystems used by the matrix harness
+        // do support it.
+        let _ = dir.sync_all();
+    }
+    Ok(file)
+}
+
+/// Append `{key}\n` to the ack log and fsync the file.
+///
+/// This is the per-row gate-oracle write. Every entry that returns
+/// `Ok(())` is contractually durable: a subsequent process crash MUST
+/// leave the line on disk for `read_ack_count` to discover. If the
+/// engine then fails to recover the row, that constitutes a
+/// lost-acked-commit and the strict gate fails.
+///
+/// `flush()` would only drain Rust's `BufWriter`; we use `sync_all()`
+/// to issue a real fsync(2) that flushes the OS page cache. The
+/// failpoint matrix's correctness depends on this distinction.
+pub fn ack_row(file: &mut File, key: usize) -> Result<()> {
+    writeln!(file, "{key}").with_context(|| format!("write ack row {key}"))?;
+    file.sync_all()
+        .with_context(|| format!("sync ack row {key}"))?;
+    Ok(())
+}
+
+fn apply_kill_count(raw: &str, kill_after_n_hits: u64) -> String {
     // The `fail` crate accepts `K*action` to fire `K` times before
-    // disarming. We only pass the count when > 1 so the common
+    // disarming. We only prepend the count when > 1 so the common
     // single-shot case stays readable in logs.
-    let suffix = match raw.trim() {
-        // `abort` and `panic` both translate to a Rust panic that kills
-        // the process under typical bench-runner conditions. The runner
-        // does not link `panic = "abort"`, but a panicking thread that
-        // holds locks tends to abort the process via the unwind guard
-        // in the WAL writer thread; either way the parent observes the
-        // child terminate.
-        "panic" | "abort" => "panic".to_string(),
-        // `return` makes the failpoint short-circuit the function with
-        // the type's default. Most kernel hot paths return `Result<_>`
-        // so `Default::default()` evaluates to `Ok(_)` only when the
-        // inner type has a sensible default — for now we map `return`
-        // to `panic` to keep the semantics consistent across cases.
-        "return" => "panic".to_string(),
-        // Forward verbatim; the fail crate accepts `K%`, `sleep(N)`,
-        // `pause`, `print`, etc.
-        other => other.to_string(),
-    };
+    //
+    // Action strings are NOT rewritten here. The `fail` crate honours
+    // `panic`, `return(value)`, `off`, `print(msg)`, `pause`,
+    // `sleep(N)`, and `yield` directly. In particular `return` makes
+    // the failpoint short-circuit the function, which the kernel's
+    // `wal::flush` hook accepts via its closure form (returns
+    // `Ok(written_lsn)` without fsync). Translating `return` to
+    // `panic` here would silently change a "skipped fsync" test into
+    // a "panic mid-fsync" test, which is the wrong semantics.
+    let action = raw.trim();
     if kill_after_n_hits <= 1 {
-        suffix
+        action.to_string()
     } else {
-        format!("{kill_after_n_hits}*{suffix}")
+        format!("{kill_after_n_hits}*{action}")
     }
 }
 
@@ -439,16 +499,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn translate_action_maps_keywords_to_panic() {
-        assert_eq!(translate_action("panic", 1), "panic");
-        assert_eq!(translate_action("abort", 1), "panic");
-        assert_eq!(translate_action("return", 1), "panic");
-        assert_eq!(translate_action("panic", 5), "5*panic");
+    fn apply_kill_count_passes_actions_verbatim() {
+        // Every action keyword the `fail` crate accepts must round-trip
+        // unchanged at single-hit count.
+        assert_eq!(apply_kill_count("panic", 1), "panic");
+        assert_eq!(apply_kill_count("abort", 1), "abort");
+        assert_eq!(apply_kill_count("return", 1), "return");
+        assert_eq!(apply_kill_count("off", 1), "off");
+        assert_eq!(apply_kill_count("pause", 1), "pause");
+        assert_eq!(apply_kill_count("yield", 1), "yield");
+        assert_eq!(apply_kill_count("sleep(10)", 1), "sleep(10)");
+        assert_eq!(apply_kill_count("print(hello)", 1), "print(hello)");
+        assert_eq!(apply_kill_count("return(7)", 1), "return(7)");
     }
 
     #[test]
-    fn translate_action_passes_through_unknown_directives() {
-        assert_eq!(translate_action("sleep(10)", 1), "sleep(10)");
-        assert_eq!(translate_action("50%panic", 1), "50%panic");
+    fn apply_kill_count_prepends_multiplier_when_count_exceeds_one() {
+        assert_eq!(apply_kill_count("panic", 5), "5*panic");
+        assert_eq!(apply_kill_count("return", 25), "25*return");
+        // 50%action probability strings are also forwarded verbatim
+        // when count==1; they compose with the `K*` prefix when count>1
+        // (the `fail` crate parses both layered).
+        assert_eq!(apply_kill_count("50%panic", 1), "50%panic");
+        assert_eq!(apply_kill_count("50%panic", 3), "3*50%panic");
+    }
+
+    #[test]
+    fn apply_kill_count_trims_whitespace() {
+        assert_eq!(apply_kill_count("  panic  ", 1), "panic");
+        assert_eq!(apply_kill_count("\treturn\n", 2), "2*return");
     }
 }
