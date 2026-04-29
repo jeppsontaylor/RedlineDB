@@ -413,11 +413,20 @@ fn eval_binary(
         BinaryOperator::LtEq => {
             compare_binary(left_value, right_value, |o| o != Ordering::Greater)?
         }
-        BinaryOperator::StringConcat => SqlValue::Text(Arc::from(format!(
-            "{}{}",
-            value_to_string(&left_value),
-            value_to_string(&right_value)
-        ))),
+        BinaryOperator::StringConcat => {
+            // SQLite: NULL || anything = NULL (NULL propagates through ||).
+            // Previously this coerced NULL via `value_to_string` to empty
+            // string, yielding `'x'` instead of NULL for `NULL || 'x'`.
+            if matches!(left_value, SqlValue::Null) || matches!(right_value, SqlValue::Null) {
+                SqlValue::Null
+            } else {
+                SqlValue::Text(Arc::from(format!(
+                    "{}{}",
+                    value_to_string(&left_value),
+                    value_to_string(&right_value)
+                )))
+            }
+        }
         other => {
             return Err(Error::UnsupportedSql(format!(
                 "unsupported binary op {other:?}"

@@ -145,4 +145,22 @@ mod phase10_sqla_correctness {
         assert_int(&run_scalar("SELECT 5 NOT IN (1, 2, 3)"), 1);
         assert_int(&run_scalar("SELECT 1 NOT IN (1, 2, 3)"), 0);
     }
+
+    // --- Bug 3: NULL || 'x' propagates NULL ---------------------------------
+
+    #[test]
+    fn null_concat_left_returns_null() {
+        assert_null(&run_scalar("SELECT NULL || 'x'"));
+    }
+
+    #[test]
+    fn null_concat_right_returns_null() {
+        assert_null(&run_scalar("SELECT 'a' || NULL"));
+    }
+
+    #[test]
+    fn concat_normal_strings() {
+        // Regression: non-NULL concat still works.
+        assert_text(&run_scalar("SELECT 'a' || 'b'"), "ab");
+    }
 }
