@@ -74,7 +74,10 @@ fn strftime_year_only() {
 fn strftime_full_format() {
     let (_dir, conn) = open();
     assert_eq!(
-        first_text(&conn, "SELECT strftime('%Y-%m-%d %H:%M:%S', '2024-01-15 09:08:07')"),
+        first_text(
+            &conn,
+            "SELECT strftime('%Y-%m-%d %H:%M:%S', '2024-01-15 09:08:07')"
+        ),
         "2024-01-15 09:08:07"
     );
 }

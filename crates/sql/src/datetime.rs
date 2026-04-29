@@ -51,7 +51,11 @@ impl DateTime {
         let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
         let mp = (5 * doy + 2) / 153;
         let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-        let month = if mp < 10 { (mp + 3) as u32 } else { (mp - 9) as u32 };
+        let month = if mp < 10 {
+            (mp + 3) as u32
+        } else {
+            (mp - 9) as u32
+        };
         let year = (y + if month <= 2 { 1 } else { 0 }) as i32;
         Self {
             year,
@@ -65,6 +69,7 @@ impl DateTime {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_unix(&self) -> i64 {
         let y = self.year as i64 - if self.month <= 2 { 1 } else { 0 };
         let era = y.div_euclid(400);
@@ -107,11 +112,7 @@ impl DateTime {
     }
 
     pub fn format_datetime(&self) -> String {
-        format!(
-            "{} {}",
-            self.format_date(),
-            self.format_time(),
-        )
+        format!("{} {}", self.format_date(), self.format_time(),)
     }
 }
 
@@ -352,11 +353,7 @@ pub fn strftime(format: &str, dt: &DateTime) -> String {
                 b's' => out.push_str(&dt.to_unix().to_string()),
                 b'w' => out.push_str(&day_of_week(dt).to_string()),
                 b'%' => out.push('%'),
-                b'f' => out.push_str(&format!(
-                    "{:02}.{:03}",
-                    dt.second,
-                    dt.micro / 1000
-                )),
+                b'f' => out.push_str(&format!("{:02}.{:03}", dt.second, dt.micro / 1000)),
                 b'J' => out.push_str(&format!("{:.6}", dt.julian_day())),
                 other => {
                     out.push('%');
@@ -386,13 +383,9 @@ fn day_of_week(dt: &DateTime) -> u32 {
     } else {
         dt.month
     };
-    let y = if dt.month < 3 {
-        dt.year - 1
-    } else {
-        dt.year
-    };
-    let k = (y % 100) as i32;
-    let j = (y / 100) as i32;
+    let y = if dt.month < 3 { dt.year - 1 } else { dt.year };
+    let k = y % 100;
+    let j = y / 100;
     let h = (dt.day as i32 + (13 * (m as i32 + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
     ((h + 6) % 7) as u32
 }

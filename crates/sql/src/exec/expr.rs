@@ -442,11 +442,7 @@ fn eval_binary(
 
 /// Lane SQL-D: SQLite-style `value REGEXP pattern`. NULL on either side
 /// propagates; an invalid pattern errors out.
-pub(crate) fn regexp_result(
-    value: SqlValue,
-    pattern: SqlValue,
-    negated: bool,
-) -> Result<SqlValue> {
+pub(crate) fn regexp_result(value: SqlValue, pattern: SqlValue, negated: bool) -> Result<SqlValue> {
     if matches!(value, SqlValue::Null) || matches!(pattern, SqlValue::Null) {
         return Ok(SqlValue::Null);
     }
@@ -860,6 +856,15 @@ fn eval_function(
     row: &RowContext<'_>,
     bindings: &[Option<SqlValue>],
 ) -> Result<SqlValue> {
+    if func.over.is_some() {
+        // Lane SQL-D phase 10 Tier-3: window functions parse but no runtime
+        // pipeline yet. Surface a structured error so the planner work can
+        // pick this up cleanly later.
+        return Err(Error::UnsupportedSql(format!(
+            "window functions are parsed-only; execution not yet implemented: {}",
+            func.name
+        )));
+    }
     let mut values = Vec::new();
     if let FunctionArguments::List(list) = &func.args {
         for arg in &list.args {

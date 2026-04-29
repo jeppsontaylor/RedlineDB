@@ -26,19 +26,13 @@ fn binary_default_distinguishes_case() {
 #[test]
 fn nocase_collation_in_comparison() {
     let (_dir, conn) = open();
-    assert_eq!(
-        first_i64(&conn, "SELECT 'abc' COLLATE NOCASE = 'ABC'"),
-        1
-    );
+    assert_eq!(first_i64(&conn, "SELECT 'abc' COLLATE NOCASE = 'ABC'"), 1);
 }
 
 #[test]
 fn rtrim_collation_strips_trailing_spaces() {
     let (_dir, conn) = open();
-    assert_eq!(
-        first_i64(&conn, "SELECT 'abc   ' COLLATE RTRIM = 'abc'"),
-        1
-    );
+    assert_eq!(first_i64(&conn, "SELECT 'abc   ' COLLATE RTRIM = 'abc'"), 1);
 }
 
 #[test]

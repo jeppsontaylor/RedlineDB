@@ -163,6 +163,12 @@ fn bind_statement(
         SqlStatement::ExplainTable { .. } => Err(Error::UnsupportedSql(
             "EXPLAIN TABLE is not supported".to_owned(),
         )),
+        SqlStatement::CreateView(_) => Err(Error::UnsupportedSql(
+            "CREATE VIEW is parsed-only; execution not yet implemented".to_owned(),
+        )),
+        SqlStatement::CreateTrigger(_) => Err(Error::UnsupportedSql(
+            "CREATE TRIGGER is parsed-only; execution not yet implemented".to_owned(),
+        )),
         other => Err(Error::UnsupportedSql(format!(
             "statement not supported yet: {other:?}"
         ))),
