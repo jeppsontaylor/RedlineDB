@@ -26,6 +26,17 @@ pub struct EngineSnapshot {
     pub data_bytes: u64,
     pub wal_bytes: u64,
     pub engine_stats: serde_json::Value,
+    /// Lane BH P1 #7: durability syscall counters surfaced by the
+    /// engine (currently only Redline populates these from the
+    /// kernel's WAL coordinator). Left `None` for engines that
+    /// can't report them so the JSON omits the keys instead of
+    /// emitting bogus zeros.
+    #[serde(default)]
+    pub fsyncs_issued: Option<u64>,
+    #[serde(default)]
+    pub fdatasyncs_issued: Option<u64>,
+    #[serde(default)]
+    pub pwrites_issued: Option<u64>,
 }
 
 pub trait BenchEngine: Send + Sync {

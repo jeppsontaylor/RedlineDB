@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -13,6 +14,29 @@ use crate::engine::SqliteEngine;
 use crate::process_metrics::ProcessMetrics;
 use crate::report::{self, RunRecord};
 use crate::strace_capture;
+
+/// Lane BH P0 #1: cores reserved for the OS / parent harness when
+/// the parallel certify scheduler decides how many children to
+/// spawn concurrently. Empirically xbabe1's 128-core box loses too
+/// much accuracy when the scheduler allocates the entire machine
+/// to children, leaving no headroom for the parent's own bookkeeping
+/// and OS jitter.
+pub const RESERVED_CORES: usize = 4;
+
+/// Decide how many threads we may concurrently dispatch to children.
+///
+/// Returns at least 1 even on tiny boxes so the scheduler always
+/// makes forward progress.
+pub fn available_cores() -> usize {
+    num_cpus::get().saturating_sub(RESERVED_CORES).max(1)
+}
+
+/// Polling interval for the parallel scheduler's `try_wait` loop.
+///
+/// Small enough that finished children are reaped promptly; large
+/// enough that the busy loop does not noticeably steal CPU from
+/// running children.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Serialize)]
 pub struct CertificationReport {
@@ -44,6 +68,17 @@ pub struct CertificationManifest {
     pub strace_syscall_counts: Option<BTreeMap<String, u64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_metrics_per_run: Option<Vec<ProcessMetrics>>,
+    /// Lane BH P0 #1: number of warmup rounds executed per
+    /// `(engine, workload, durability, threads)` combo before the
+    /// measured rounds began. Warmup records are discarded but the
+    /// count is preserved so reviewers can confirm the harness
+    /// honored `--warmup`.
+    pub warmup_runs_per_combo: usize,
+    /// Lane BH P0 #1: number of measured rounds executed per
+    /// combo. Equals `--repetitions` (clamped to at least 1) and
+    /// matches the count of `RunRecord` entries written for that
+    /// combo.
+    pub measured_runs_per_combo: usize,
 }
 
 pub fn run(config: &CompareConfig, args: &CertifyArgs) -> Result<CertificationReport> {
@@ -58,24 +93,29 @@ pub fn run(config: &CompareConfig, args: &CertifyArgs) -> Result<CertificationRe
 
     let with_strace = args.strace_enabled();
 
+    // Lane BH P0 #1: build the full job queue *before* dispatching so the
+    // parallel scheduler can bin-pack mixed-thread jobs onto the
+    // available cores. Warmup jobs (records discarded) come first per
+    // combo, then the measured rounds. Scheduling is FIFO with a
+    // greedy-fit twist — see `dispatch_parallel`.
+    let warmup = args.warmup;
+    let measured = args.repetitions.max(1);
+    let jobs = build_job_queue(config, args, warmup, measured)?;
+
+    let outcomes = dispatch_parallel(jobs, &raw_dir, with_strace, available_cores())?;
+
     let mut runs = Vec::new();
     let mut strace_child_paths: Vec<PathBuf> = Vec::new();
-    for rep in 0..args.repetitions.max(1) {
-        for &engine in &config.engines {
-            for &workload in &config.workloads {
-                for &durability in &config.durabilities {
-                    for &threads in &config.threads {
-                        let seed = args.seed.wrapping_add(rep as u64);
-                        let spec =
-                            config.run_spec(&engine, &workload, &durability, threads, seed)?;
-                        let outcome = run_child(&spec, &raw_dir, rep, with_strace)?;
-                        runs.push(outcome.record);
-                        if let Some(path) = outcome.strace_path {
-                            strace_child_paths.push(path);
-                        }
-                    }
-                }
-            }
+    for outcome in outcomes {
+        // Warmup outcomes are discarded — they exist only to prime
+        // caches/disks and the scheduler so the measured rounds
+        // start from a steady state.
+        if outcome.is_warmup {
+            continue;
+        }
+        runs.push(outcome.record);
+        if let Some(path) = outcome.strace_path {
+            strace_child_paths.push(path);
         }
     }
 
@@ -122,11 +162,364 @@ pub fn run(config: &CompareConfig, args: &CertifyArgs) -> Result<CertificationRe
         strace_reason: strace.reason,
         strace_syscall_counts: strace.syscall_counts,
         process_metrics_per_run,
+        warmup_runs_per_combo: warmup,
+        measured_runs_per_combo: measured,
     };
     let manifest_path = args.out_dir.join("manifest.json");
     report::write_json(Some(&manifest_path), &manifest)?;
 
     Ok(CertificationReport { runs, manifest })
+}
+
+/// A scheduled benchmark child the parallel scheduler will dispatch.
+///
+/// `is_warmup == true` means the resulting `RunRecord` is discarded
+/// after the child exits; we still need to allocate a slot in the
+/// scheduler so cache/disk priming actually happens.
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub spec: RunSpec,
+    pub rep_idx: usize,
+    pub is_warmup: bool,
+}
+
+/// Lane BH P0 #1: thin scheduler wrapper used by tests.
+///
+/// Takes a custom child-spawner closure so the unit test can
+/// stand-in `sleep 1`-style fakes for the real bench child while
+/// still exercising the bin-packing logic, polling, and reaping.
+/// The scheduler returns `(reaped_count, max_in_flight_threads,
+/// elapsed)` rather than `RunRecord`s — the test cares only about
+/// throughput and parallelism, not record content.
+pub fn dispatch_parallel_with_spawner<S>(
+    jobs: Vec<Job>,
+    available: usize,
+    mut spawner: S,
+) -> Result<SchedulerStats>
+where
+    S: FnMut(&Job) -> std::io::Result<Child>,
+{
+    let started = Instant::now();
+    let mut queue: std::collections::VecDeque<(usize, Job)> =
+        jobs.into_iter().enumerate().collect();
+    let mut in_flight: Vec<(Child, usize)> = Vec::new();
+    let mut reaped = 0_usize;
+    let mut max_in_flight_threads = 0_usize;
+
+    while !queue.is_empty() || !in_flight.is_empty() {
+        loop {
+            if queue.is_empty() {
+                break;
+            }
+            let in_flight_threads: usize = in_flight.iter().map(|(_, t)| *t).sum();
+            let free = available.saturating_sub(in_flight_threads);
+            let next_threads = queue.front().map(|(_, job)| job.spec.threads).unwrap_or(0);
+            let fits = next_threads <= free || (in_flight.is_empty() && next_threads > available);
+            if !fits {
+                break;
+            }
+            let (_, job) = queue.pop_front().expect("non-empty");
+            let child = spawner(&job)?;
+            in_flight.push((child, job.spec.threads));
+        }
+
+        // Track peak in-flight after dispatch.
+        let in_flight_threads: usize = in_flight.iter().map(|(_, t)| *t).sum();
+        if in_flight_threads > max_in_flight_threads {
+            max_in_flight_threads = in_flight_threads;
+        }
+
+        let mut idx = 0;
+        let mut reaped_any = false;
+        while idx < in_flight.len() {
+            match in_flight[idx].0.try_wait()? {
+                Some(_status) => {
+                    let _ = in_flight.remove(idx);
+                    reaped += 1;
+                    reaped_any = true;
+                }
+                None => idx += 1,
+            }
+        }
+
+        if !reaped_any && !in_flight.is_empty() {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    Ok(SchedulerStats {
+        reaped,
+        max_in_flight_threads,
+        elapsed: started.elapsed(),
+    })
+}
+
+/// Lightweight summary returned by [`dispatch_parallel_with_spawner`].
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerStats {
+    /// Total number of children that reached `Ok(_)` exit status.
+    pub reaped: usize,
+    /// Peak sum of `threads` across all simultaneously in-flight
+    /// children. Compared against `available` to confirm the
+    /// scheduler is actually parallelizing.
+    pub max_in_flight_threads: usize,
+    /// Wall-clock time from the first dispatch to the last reap.
+    pub elapsed: Duration,
+}
+
+/// Build the full set of jobs implied by `(config, args)`.
+///
+/// Warmup jobs come first per combo so dispatch sees them at the
+/// front of the queue; the dispatcher otherwise treats them
+/// identically to measured jobs. The `seed` value baked into each
+/// spec is `args.seed + rep_idx` (with warmup repetitions counted
+/// in the same wraparound) so reruns are deterministic.
+pub fn build_job_queue(
+    config: &CompareConfig,
+    args: &CertifyArgs,
+    warmup: usize,
+    measured: usize,
+) -> Result<Vec<Job>> {
+    let mut jobs = Vec::new();
+    for &engine in &config.engines {
+        for &workload in &config.workloads {
+            for &durability in &config.durabilities {
+                for &threads in &config.threads {
+                    // Warmup rounds: prime caches, disks, and the
+                    // OS page cache. Records are discarded.
+                    for w in 0..warmup {
+                        let seed = args.seed.wrapping_add(w as u64);
+                        let spec =
+                            config.run_spec(&engine, &workload, &durability, threads, seed)?;
+                        jobs.push(Job {
+                            spec,
+                            rep_idx: w,
+                            is_warmup: true,
+                        });
+                    }
+                    // Measured rounds.
+                    for rep in 0..measured {
+                        let seed = args.seed.wrapping_add((warmup + rep) as u64);
+                        let spec =
+                            config.run_spec(&engine, &workload, &durability, threads, seed)?;
+                        jobs.push(Job {
+                            spec,
+                            rep_idx: rep,
+                            is_warmup: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(jobs)
+}
+
+/// In-flight child slot tracked by the scheduler.
+struct InFlight {
+    child: Child,
+    threads_used: usize,
+    job: Job,
+    out_path: PathBuf,
+    run_dir: PathBuf,
+    strace_path: Option<PathBuf>,
+    wrap_with_strace: bool,
+    /// Index in the original job queue, used to preserve a stable
+    /// output order across reruns even when the scheduler
+    /// completes children out of dispatch order.
+    queue_index: usize,
+}
+
+/// The aggregated outcome of a finalized child plus warmup flag.
+#[derive(Debug)]
+pub struct ScheduledOutcome {
+    pub record: RunRecord,
+    pub strace_path: Option<PathBuf>,
+    pub is_warmup: bool,
+    pub queue_index: usize,
+}
+
+/// Lane BH P0 #1: bin-packing parallel scheduler.
+///
+/// Reserves [`RESERVED_CORES`] for the OS/parent harness, then
+/// greedily fits jobs onto the remaining cores by their `threads`
+/// count. Behavior:
+///   - 128-thread runs occupy the box alone.
+///   - Mixed sizes pack greedily: a 64-thread job runs alongside
+///     8× 8-thread jobs at 124 threads in flight (≤ 124 available).
+///   - Jobs that require more than the total available core budget
+///     still run, alone, with no stalling — the scheduler relaxes
+///     its bin-pack guard for the head-of-queue when that job
+///     individually exceeds `available`.
+///
+/// Output preserves dispatch order via `queue_index`: outcomes are
+/// sorted by their original job position so the resulting JSONL /
+/// CSV is byte-stable across reruns.
+pub fn dispatch_parallel(
+    jobs: Vec<Job>,
+    raw_dir: &Path,
+    with_strace: bool,
+    available: usize,
+) -> Result<Vec<ScheduledOutcome>> {
+    let mut queue: std::collections::VecDeque<(usize, Job)> =
+        jobs.into_iter().enumerate().collect();
+    let mut in_flight: Vec<InFlight> = Vec::new();
+    let mut outcomes: Vec<ScheduledOutcome> = Vec::new();
+
+    while !queue.is_empty() || !in_flight.is_empty() {
+        // Dispatch as many head-of-queue jobs as fit.
+        loop {
+            if queue.is_empty() {
+                break;
+            }
+            let in_flight_threads: usize = in_flight.iter().map(|s| s.threads_used).sum();
+            let free = available.saturating_sub(in_flight_threads);
+            let next_threads = queue.front().map(|(_, job)| job.spec.threads).unwrap_or(0);
+            // Allow a head-of-queue job whose thread count exceeds
+            // the entire core budget to run alone (no stalling)
+            // when no other children are in flight.
+            let fits = next_threads <= free || (in_flight.is_empty() && next_threads > available);
+            if !fits {
+                break;
+            }
+            let (queue_index, job) = queue.pop_front().expect("non-empty");
+            let slot = spawn_child(&job, raw_dir, with_strace, queue_index)?;
+            in_flight.push(slot);
+        }
+
+        // Reap finished children. If nothing finished this iteration,
+        // sleep briefly so we don't busy-spin while waiting.
+        let mut idx = 0;
+        let mut reaped_any = false;
+        while idx < in_flight.len() {
+            let try_status = in_flight[idx]
+                .child
+                .try_wait()
+                .with_context(|| "wal certify scheduler poll".to_owned())?;
+            match try_status {
+                Some(_status) => {
+                    let slot = in_flight.remove(idx);
+                    let outcome = finalize_child(slot)?;
+                    outcomes.push(outcome);
+                    reaped_any = true;
+                }
+                None => idx += 1,
+            }
+        }
+
+        if !reaped_any && !in_flight.is_empty() {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    // Stable order by queue_index so output matches dispatch order.
+    outcomes.sort_by_key(|o| o.queue_index);
+    Ok(outcomes)
+}
+
+/// Spawn a single child for `job` and return the in-flight slot.
+fn spawn_child(
+    job: &Job,
+    raw_dir: &Path,
+    with_strace: bool,
+    queue_index: usize,
+) -> Result<InFlight> {
+    let exe = std::env::current_exe().context("resolve bench executable")?;
+    let warmup_tag = if job.is_warmup { "w" } else { "r" };
+    let run_dir = raw_dir.join(format!(
+        "{:?}-{}-{}-t{}-{}{}",
+        job.spec.engine,
+        job.spec.workload.as_str(),
+        job.spec.durability.as_str(),
+        job.spec.threads,
+        warmup_tag,
+        job.rep_idx
+    ));
+    fs::create_dir_all(&run_dir)?;
+    let out_path = run_dir.join("record.json");
+
+    let strace_path = run_dir.join("strace.txt");
+    let wrap_with_strace = with_strace && cfg!(target_os = "linux") && which_strace();
+
+    let mut command = if wrap_with_strace {
+        let mut c = Command::new("strace");
+        c.arg("-c").arg("-o").arg(&strace_path).arg("--").arg(&exe);
+        c
+    } else {
+        Command::new(&exe)
+    };
+    let stdout_path = run_dir.join("stdout.log");
+    let stderr_path = run_dir.join("stderr.log");
+    let stdout_file = fs::File::create(&stdout_path)
+        .with_context(|| format!("create child stdout log {}", stdout_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("create child stderr log {}", stderr_path.display()))?;
+    let child = command
+        .arg("run")
+        .arg("--engine")
+        .arg(engine_arg(job.spec.engine))
+        .arg("--workload")
+        .arg(job.spec.workload.as_str())
+        .arg("--durability")
+        .arg(job.spec.durability.as_str())
+        .arg("--threads")
+        .arg(job.spec.threads.to_string())
+        .arg("--rows")
+        .arg(job.spec.rows.to_string())
+        .arg("--seconds")
+        .arg(job.spec.duration.as_secs().to_string())
+        .arg("--cache-mib")
+        .arg((job.spec.cache_bytes / (1024 * 1024)).max(1).to_string())
+        .arg("--seed")
+        .arg(job.spec.seed.to_string())
+        .arg("--out")
+        .arg(&out_path)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .with_context(|| format!("spawn certification child for {:?}", job.spec.engine))?;
+
+    Ok(InFlight {
+        child,
+        threads_used: job.spec.threads,
+        job: job.clone(),
+        out_path,
+        run_dir,
+        strace_path: Some(strace_path),
+        wrap_with_strace,
+        queue_index,
+    })
+}
+
+/// Wait for an exited slot's child and parse the resulting record.
+fn finalize_child(mut slot: InFlight) -> Result<ScheduledOutcome> {
+    // Note: try_wait already returned Some(_) before reaching here,
+    // so wait() returns immediately.
+    let status = slot
+        .child
+        .wait()
+        .with_context(|| format!("await child for {:?}", slot.job.spec.engine))?;
+    if !status.success() {
+        bail!(
+            "certification child failed for {:?}: {} (run dir: {})",
+            slot.job.spec.engine,
+            status,
+            slot.run_dir.display()
+        );
+    }
+    let raw = fs::read_to_string(&slot.out_path)
+        .with_context(|| format!("read run record {}", slot.out_path.display()))?;
+    let record: RunRecord = serde_json::from_str(&raw)?;
+    let strace_path = match (slot.wrap_with_strace, slot.strace_path.take()) {
+        (true, Some(p)) if p.exists() => Some(p),
+        _ => None,
+    };
+    Ok(ScheduledOutcome {
+        record,
+        strace_path,
+        is_warmup: slot.job.is_warmup,
+        queue_index: slot.queue_index,
+    })
 }
 
 fn collect_pragmas(
@@ -292,94 +685,6 @@ fn strace_summary(
     })
 }
 
-/// What `run_child` returns: the parsed per-run record plus an optional
-/// path to the strace summary captured for that run (only populated on
-/// Linux when `--with-strace` is in effect and `strace` is on `PATH`).
-pub(crate) struct ChildOutcome {
-    pub record: RunRecord,
-    pub strace_path: Option<PathBuf>,
-}
-
-fn run_child(
-    spec: &crate::config::RunSpec,
-    raw_dir: &Path,
-    rep: usize,
-    with_strace: bool,
-) -> Result<ChildOutcome> {
-    let exe = std::env::current_exe().context("resolve bench executable")?;
-    let run_dir = raw_dir.join(format!(
-        "{:?}-{}-{}-t{}-r{}",
-        spec.engine,
-        spec.workload.as_str(),
-        spec.durability.as_str(),
-        spec.threads,
-        rep
-    ));
-    fs::create_dir_all(&run_dir)?;
-    let out_path = run_dir.join("record.json");
-
-    // Decide whether to wrap the child in `strace -c`. We only do this on
-    // Linux when the caller asked for it AND the `strace` binary is
-    // actually installed; otherwise we fall through to a normal invocation
-    // and the parent surfaces a `strace_reason` in the manifest.
-    let strace_path = run_dir.join("strace.txt");
-    let wrap_with_strace = with_strace && cfg!(target_os = "linux") && which_strace();
-
-    let mut command = if wrap_with_strace {
-        let mut c = Command::new("strace");
-        c.arg("-c").arg("-o").arg(&strace_path).arg("--").arg(&exe);
-        c
-    } else {
-        Command::new(&exe)
-    };
-
-    let output = command
-        .arg("run")
-        .arg("--engine")
-        .arg(engine_arg(spec.engine))
-        .arg("--workload")
-        .arg(spec.workload.as_str())
-        .arg("--durability")
-        .arg(spec.durability.as_str())
-        .arg("--threads")
-        .arg(spec.threads.to_string())
-        .arg("--rows")
-        .arg(spec.rows.to_string())
-        .arg("--seconds")
-        .arg(spec.duration.as_secs().to_string())
-        .arg("--cache-mib")
-        .arg((spec.cache_bytes / (1024 * 1024)).max(1).to_string())
-        .arg("--seed")
-        .arg(spec.seed.to_string())
-        .arg("--out")
-        .arg(&out_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("spawn certification child for {:?}", spec.engine))?;
-    fs::write(run_dir.join("stdout.log"), &output.stdout)?;
-    fs::write(run_dir.join("stderr.log"), &output.stderr)?;
-    if !output.status.success() {
-        bail!(
-            "certification child failed for {:?}: {}",
-            spec.engine,
-            output.status
-        );
-    }
-    let raw = fs::read_to_string(&out_path)
-        .with_context(|| format!("read run record {}", out_path.display()))?;
-    let record: RunRecord = serde_json::from_str(&raw)?;
-    let strace_path = if wrap_with_strace && strace_path.exists() {
-        Some(strace_path)
-    } else {
-        None
-    };
-    Ok(ChildOutcome {
-        record,
-        strace_path,
-    })
-}
-
 #[cfg(target_os = "linux")]
 fn which_strace() -> bool {
     Command::new("which")
@@ -402,16 +707,30 @@ fn write_runs_jsonl(path: &Path, runs: &[RunRecord]) -> Result<()> {
     Ok(())
 }
 
+/// Lane BH: test-only re-export of [`write_summary_csv`]. The
+/// internal writer is module-private; tests in
+/// `crates/bench/tests/` use this thin wrapper to keep the
+/// production surface unchanged.
+pub fn write_summary_csv_for_test(path: &Path, runs: &[RunRecord]) -> Result<()> {
+    write_summary_csv(path, runs)
+}
+
 fn write_summary_csv(path: &Path, runs: &[RunRecord]) -> Result<()> {
     let mut out = fs::File::create(path)?;
+    // Lane BH P1 #7: pre-Lane-BH summary.csv only carried `p99_us`
+    // and `p999_us`; reviewers asked for the full tail so dashboards
+    // can plot p50/p95/max alongside the existing percentiles.
+    // Column order: existing identity columns first, then ops/error
+    // counts, throughput, the latency block in ascending percentile
+    // order, then capacity counters at the tail.
     writeln!(
         out,
-        "engine,workload,durability,threads,ops,failures,busy_errors,locked_errors,timeout_errors,throughput_ops_per_sec,p99_us,p999_us,data_bytes,wal_bytes"
+        "engine,workload,durability,threads,ops,failures,busy_errors,locked_errors,timeout_errors,throughput_ops_per_sec,p50_us,p95_us,p99_us,p999_us,max_us,data_bytes,wal_bytes"
     )?;
     for run in runs {
         writeln!(
             out,
-            "{:?},{},{},{},{},{},{},{},{},{:.2},{},{},{},{}",
+            "{:?},{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{},{},{}",
             run.engine,
             run.workload.as_str(),
             run.durability.as_str(),
@@ -422,8 +741,11 @@ fn write_summary_csv(path: &Path, runs: &[RunRecord]) -> Result<()> {
             run.metrics.locked_errors,
             run.metrics.timeout_errors,
             run.metrics.throughput_ops_per_sec,
+            run.metrics.latency.p50_us,
+            run.metrics.latency.p95_us,
             run.metrics.latency.p99_us,
             run.metrics.latency.p999_us,
+            run.metrics.latency.max_us,
             run.data_bytes,
             run.wal_bytes,
         )?;

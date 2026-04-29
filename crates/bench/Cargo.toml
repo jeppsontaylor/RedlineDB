@@ -11,6 +11,10 @@ clap = { version = "4", features = ["derive"] }
 crossbeam-utils = "0.8"
 hdrhistogram = "7"
 libc = "0.2"
+# Lane BH P0 #1: parallel certify scheduler bin-packs jobs by their
+# thread count against `num_cpus::get()`; reserve a few cores for
+# the OS/parent and saturate the rest like `make -jN`.
+num_cpus = "1"
 rand = "0.9"
 rand_chacha = "0.9"
 redlinedb = { path = "../redlinedb" }
@@ -24,6 +28,10 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 toml = "0.8"
+# Lane BH P1 #7: recursive walk of `.redline` directories so the
+# `data_bytes` telemetry sums catalog snapshots, page files,
+# control files, and the wal segment fan-out (not just one file).
+walkdir = "2"
 
 [dev-dependencies]
 # Lane F6: integration tests in `tests/failpoint_matrix.rs` drive

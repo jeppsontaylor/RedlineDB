@@ -24,6 +24,7 @@ use crate::storage::{
 use crate::txn::Isolation;
 use crate::wal::{
     WalConfig, WalCoordinator, WalPayload, WalReader, WalRecord, WalRecordKind, WalScanReport,
+    WalSyncCountersSnapshot,
 };
 use crate::{Error, Result};
 
@@ -50,6 +51,11 @@ pub struct StorageStatsSnapshot {
     pub wal_written_lsn: Lsn,
     pub wal_durable_lsn: Lsn,
     pub vacuum_horizon_csn: Csn,
+    /// Lane BH P1 #7: durability syscall counters bumped by the
+    /// WAL writer thread. Surface them through `Database::stats`
+    /// so the bench harness can record per-run fsync/pwrite tallies
+    /// without reaching into kernel internals.
+    pub wal_sync_counters: WalSyncCountersSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -729,6 +735,7 @@ impl Engine {
             wal_written_lsn: self.wal.written_lsn()?,
             wal_durable_lsn: self.wal.durable_lsn()?,
             vacuum_horizon_csn: self.oldest_active_snapshot_csn(),
+            wal_sync_counters: self.wal.sync_counters_snapshot(),
         })
     }
 
