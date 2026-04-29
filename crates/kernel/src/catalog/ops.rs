@@ -577,6 +577,16 @@ pub fn apply_alter_table(
                 default_expr: default_const_expr(column.default_value.as_ref()),
             });
         }
+        AlterTableOperationSpec::DropColumn { .. } => {
+            // Lane SQL-D phase 10: ALTER TABLE ... DROP COLUMN reaches the
+            // catalog only via parser-only paths today. The SQL crate is
+            // expected to reject before it gets here; if the operation is
+            // ever applied we surface an UnsupportedDdl rather than corrupt
+            // the schema by silently dropping data we cannot rewrite.
+            return Err(Error::UnsupportedDdl(
+                "ALTER TABLE DROP COLUMN is parsed-only; execution not yet implemented",
+            ));
+        }
     }
 
     snapshot.tables[table_index] = Arc::new(table);
