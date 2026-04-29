@@ -104,6 +104,21 @@ fn group_commit_telemetry_observes_real_batching_under_concurrency() {
     }
 
     let snap = coordinator.sync_counters_snapshot();
+    // Lane GC: print the observed numbers under --nocapture so the
+    // paper's fig8 scaffolding can reference real numbers.
+    eprintln!(
+        "[lane-gc telemetry] threads={} group_commits={} records={} bytes={} \
+         buckets={:?} p50={} p95={} p99={} max={}",
+        threads,
+        snap.group_commits_issued,
+        snap.group_commit_batch_record_count_sum,
+        snap.group_commit_batch_bytes_sum,
+        snap.group_commit_batch_buckets,
+        snap.batch_record_count_percentile(0.50),
+        snap.batch_record_count_percentile(0.95),
+        snap.batch_record_count_percentile(0.99),
+        snap.batch_record_count_max(),
+    );
     assert!(snap.group_commits_issued > 0);
     assert_eq!(
         snap.group_commit_batch_record_count_sum, threads as u64,
