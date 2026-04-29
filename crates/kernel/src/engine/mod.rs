@@ -4,7 +4,7 @@ pub mod page_heap;
 pub mod tx;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,8 +15,11 @@ use crate::catalog::{
 };
 use crate::engine::lock::{RowKey, RowLockManager};
 use crate::engine::page_heap::{PageBackedHeap, VacuumStats};
-use crate::format::{Csn, DEFAULT_PAGE_SIZE, Lsn, Page, RelId, RowId, TxId};
-use crate::index::{BtreeIndex, IndexDescriptor, IndexId as PhysicalIndexId, IndexUniqueness};
+use crate::engine::tx::PendingIndexHandle;
+use crate::format::{Csn, DEFAULT_PAGE_SIZE, Lsn, Page, PageId, RelId, RowId, TxId};
+use crate::index::{
+    BtreeIndex, INDEX_VERSION, IndexDescriptor, IndexId as PhysicalIndexId, IndexUniqueness,
+};
 use crate::storage::{
     BufferPool, BufferPoolStats, ControlFile, ControlStore, DEFAULT_CHECKPOINT_BATCH_PAGES,
     PageFile, TxStatusCheckpoint, TxStatusStore,
@@ -177,6 +180,8 @@ impl Default for EngineConfig {
 #[derive(Debug)]
 pub struct Engine {
     config: EngineConfig,
+    data_path: PathBuf,
+    wal_dir: PathBuf,
     rel_id: RelId,
     txs: ConcurrentTxStatus,
     buffer: Arc<BufferPool>,
@@ -198,15 +203,11 @@ pub struct Engine {
 impl Engine {
     pub fn create(path: impl AsRef<Path>, config: EngineConfig) -> Result<Arc<Self>> {
         std::fs::create_dir_all(path.as_ref())?;
-        let page_file = Arc::new(PageFile::create(
-            path.as_ref().join(&config.data_file_name),
-            config.page_size,
-        )?);
+        let data_path = path.as_ref().join(&config.data_file_name);
+        let wal_dir = path.as_ref().join("wal");
+        let page_file = Arc::new(PageFile::create(&data_path, config.page_size)?);
         let buffer = Arc::new(BufferPool::new(page_file, config.buffer_pool_pages)?);
-        let wal = Arc::new(WalCoordinator::create(
-            path.as_ref().join("wal"),
-            config.wal.clone(),
-        )?);
+        let wal = Arc::new(WalCoordinator::create(&wal_dir, config.wal.clone())?);
         let control = ControlStore::new(path.as_ref())?;
         let tx_status_store = TxStatusStore::new(path.as_ref())?;
         let checkpoint = control.load_latest()?;
@@ -221,6 +222,8 @@ impl Engine {
         let buffer = Arc::clone(&buffer);
         Ok(Arc::new(Self {
             config: config.clone(),
+            data_path,
+            wal_dir,
             rel_id: config.rel_id,
             txs: ConcurrentTxStatus::new(),
             buffer: Arc::clone(&buffer),
@@ -281,12 +284,12 @@ impl Engine {
         let page_path = path.as_ref().join(&config.data_file_name);
         let page_file = if checkpoint.is_some() || page_path.exists() {
             Arc::new(
-                PageFile::open(page_path, config.page_size)
+                PageFile::open(&page_path, config.page_size)
                     .map_err(|_| Error::CorruptPage("open recovered page file failed"))?,
             )
         } else {
             Arc::new(
-                PageFile::create(page_path, config.page_size)
+                PageFile::create(&page_path, config.page_size)
                     .map_err(|_| Error::CorruptPage("create recovered page file failed"))?,
             )
         };
@@ -295,7 +298,7 @@ impl Engine {
                 .map_err(|_| Error::CorruptPage("create buffer pool failed"))?,
         );
         let wal = Arc::new(
-            WalCoordinator::open(wal_dir, config.wal.clone())
+            WalCoordinator::open(&wal_dir, config.wal.clone())
                 .map_err(|_| Error::CorruptWal("open wal coordinator failed"))?,
         );
         let heap = PageBackedHeap::new_with_wal(
@@ -354,6 +357,8 @@ impl Engine {
         let catalog = CatalogManager::new(recovered_catalog.unwrap_or(initial_catalog));
         let engine = Arc::new(Self {
             config: config.clone(),
+            data_path: page_path,
+            wal_dir,
             rel_id: config.rel_id,
             txs,
             buffer: Arc::clone(&buffer),
@@ -563,12 +568,12 @@ impl Engine {
             }
             let _detail =
                 arg.unwrap_or_else(|| "engine::commit::before_publish injected fault".to_string());
-            return Ok(self.finish_commit(
+            Ok(self.finish_commit(
                 &mut tx,
                 csn,
                 _pending_schema_for_closure.clone(),
                 CommitOutcome::MaybeCommitted,
-            ));
+            ))
         });
         Ok(self.finish_commit(&mut tx, csn, pending_schema, CommitOutcome::Committed(csn)))
     }
@@ -584,6 +589,20 @@ impl Engine {
         if let Some(snapshot) = pending_schema {
             let _ = self.catalog_store.save_atomic(&snapshot);
             self.catalog.publish(snapshot);
+        }
+        if !tx.pending_index_handles().is_empty()
+            && let Ok(mut handles) = self.index_handles.lock()
+        {
+            for action in tx.pending_index_handles() {
+                match action {
+                    PendingIndexHandle::Install(index_id, handle) => {
+                        handles.insert(*index_id, Arc::clone(handle));
+                    }
+                    PendingIndexHandle::Remove(index_id) => {
+                        handles.remove(index_id);
+                    }
+                }
+            }
         }
         self.release_locks(tx);
         tx.close();
@@ -606,6 +625,15 @@ impl Engine {
         self.txs.stats()
     }
 
+    pub fn tx_status(&self) -> &ConcurrentTxStatus {
+        &self.txs
+    }
+
+    #[doc(hidden)]
+    pub fn buffer_pool_for_tests(&self) -> &BufferPool {
+        &self.buffer
+    }
+
     pub fn schema_epoch(&self) -> SchemaEpoch {
         self.catalog.version()
     }
@@ -620,6 +648,54 @@ impl Engine {
         } else {
             Err(Error::SchemaChanged)
         }
+    }
+
+    pub fn integrity_check(&self) -> Result<Vec<String>> {
+        let snapshot = self.catalog.current();
+        let mut errors = Vec::new();
+        match PageFile::open(&self.data_path, self.config.page_size) {
+            Ok(page_file) => match page_file.page_count() {
+                Ok(page_count) => {
+                    for page_no in 1..=page_count {
+                        if let Err(err) = page_file.read_page(PageId(page_no)) {
+                            errors.push(format!("page {page_no}: {err}"));
+                        }
+                    }
+                }
+                Err(err) => errors.push(format!("page file count: {err}")),
+            },
+            Err(err) => errors.push(format!("page file open: {err}")),
+        }
+        for index in &snapshot.indexes {
+            if snapshot.table_by_id(index.table_id).is_none() {
+                errors.push(format!(
+                    "catalog index {} references missing table",
+                    index.name
+                ));
+            }
+        }
+        let mut wal_reader = WalReader::new(&self.wal_dir, self.config.wal.clone());
+        if let Err(err) = wal_reader.scan_report() {
+            errors.push(format!("wal prefix scan: {err}"));
+        }
+        let handles = self
+            .index_handles
+            .lock()
+            .map_err(|_| Error::CorruptPage("engine index handles mutex poisoned"))?;
+        for index in &snapshot.indexes {
+            if index.meta_page_id.is_none() {
+                continue;
+            }
+            let Some(handle) = handles.get(&index.index_id) else {
+                errors.push(format!("index {} has no open handle", index.name));
+                continue;
+            };
+            let report = handle.validate()?;
+            for error in report.errors {
+                errors.push(format!("index {}: {error}", index.name));
+            }
+        }
+        Ok(errors)
     }
 
     pub fn sqlite_schema(&self) -> Vec<SqliteSchemaRow> {
@@ -711,14 +787,13 @@ impl Engine {
             .ok_or(Error::ObjectNotFound)?;
         self.backfill_index(tx, &btree, &table, &final_index)?;
 
-        // Step 5: install the handle, set pending snapshot.
-        {
-            let mut handles = self
-                .index_handles
-                .lock()
-                .map_err(|_| Error::CorruptPage("engine index handles mutex poisoned"))?;
-            handles.insert(final_index.index_id, Arc::new(btree));
-        }
+        // Step 5: install the handle only if the surrounding DDL transaction
+        // commits. Rollback must not expose a handle for a catalog entry that
+        // never became visible.
+        tx.push_pending_index_handle(PendingIndexHandle::Install(
+            final_index.index_id,
+            Arc::new(btree),
+        ));
         tx.set_pending_schema_snapshot(Arc::clone(&with_meta));
         Ok(final_index)
     }
@@ -742,11 +817,7 @@ impl Engine {
         // reclamation through PageBackedHeap once it supports BtreeMeta and
         // BtreeLeaf reusability.
         if let Some(index_id) = removed_id {
-            let mut handles = self
-                .index_handles
-                .lock()
-                .map_err(|_| Error::CorruptPage("engine index handles mutex poisoned"))?;
-            handles.remove(&index_id);
+            tx.push_pending_index_handle(PendingIndexHandle::Remove(index_id));
         }
         Ok(())
     }
@@ -917,10 +988,8 @@ impl Engine {
     /// SQL exec layer cannot use them yet.
     fn rehydrate_index_handles(self: &Arc<Self>) -> Result<()> {
         let snapshot = self.catalog.current();
-        let mut handles = self
-            .index_handles
-            .lock()
-            .map_err(|_| Error::CorruptPage("engine index handles mutex poisoned"))?;
+        let mut rebuilt = Vec::new();
+        let mut opened = Vec::new();
         for index in &snapshot.indexes {
             let Some(meta_page_id) = index.meta_page_id else {
                 // Pre-Lane-A index without physical pages; nothing to reopen.
@@ -935,13 +1004,73 @@ impl Engine {
                     IndexUniqueness::NonUnique
                 },
             );
-            let btree = BtreeIndex::open_with_wal(
+            let version = BtreeIndex::format_version(&self.buffer, meta_page_id)?;
+            if version == INDEX_VERSION {
+                let btree = BtreeIndex::open_with_wal(
+                    Arc::clone(&self.buffer),
+                    meta_page_id,
+                    descriptor,
+                    Some(Arc::clone(&self.wal)),
+                )?;
+                opened.push((index.index_id, Arc::new(btree)));
+            } else if version == 1 {
+                let table = snapshot
+                    .table_by_id(index.table_id)
+                    .ok_or(Error::CatalogCorrupt("index table missing during rebuild"))?;
+                rebuilt.push((index.as_ref().clone(), table));
+            } else {
+                return Err(Error::UnsupportedVersion(version));
+            }
+        }
+        let mut next_snapshot = (*snapshot).clone();
+        let mut rebuild_tx = if rebuilt.is_empty() {
+            None
+        } else {
+            Some(self.begin(Isolation::Snapshot)?)
+        };
+        for (index, table) in rebuilt {
+            let descriptor = IndexDescriptor::new(
+                PhysicalIndexId(index.index_id.0),
+                index.relation_id,
+                if index.unique {
+                    IndexUniqueness::Unique
+                } else {
+                    IndexUniqueness::NonUnique
+                },
+            );
+            let btree = BtreeIndex::create_with_wal(
                 Arc::clone(&self.buffer),
-                meta_page_id,
                 descriptor,
                 Some(Arc::clone(&self.wal)),
             )?;
-            handles.insert(index.index_id, Arc::new(btree));
+            let tx = rebuild_tx
+                .as_mut()
+                .ok_or(Error::CorruptPage("missing index rebuild transaction"))?;
+            btree.record_initial_page_images(tx.id())?;
+            self.backfill_index(tx, &btree, &table, &index)?;
+            next_snapshot =
+                apply_set_index_meta_page_id(next_snapshot, index.index_id, btree.meta_page_id())?;
+            opened.push((index.index_id, Arc::new(btree)));
+        }
+        if let Some(mut tx) = rebuild_tx {
+            let next_snapshot = Arc::new(next_snapshot);
+            tx.set_pending_schema_snapshot(next_snapshot);
+            match self.commit(tx)? {
+                CommitOutcome::Committed(_) => {}
+                CommitOutcome::MaybeCommitted => {
+                    return Err(Error::CorruptWal("index rebuild maybe committed"));
+                }
+                CommitOutcome::RolledBack => {
+                    return Err(Error::CorruptWal("index rebuild rolled back"));
+                }
+            }
+        }
+        let mut handles = self
+            .index_handles
+            .lock()
+            .map_err(|_| Error::CorruptPage("engine index handles mutex poisoned"))?;
+        for (index_id, btree) in opened {
+            handles.insert(index_id, btree);
         }
         Ok(())
     }
@@ -1006,7 +1135,10 @@ impl Engine {
             if index.unique && !contains_null {
                 let owner = tx.id().0;
                 let _guard = btree.lock_unique_key(owner, &bytes)?;
-                if !btree.point_lookup(&bytes)?.is_empty() {
+                if !btree
+                    .point_lookup_visible(&self.txs, tx.snapshot(), Some(tx.id()), &bytes)?
+                    .is_empty()
+                {
                     return Err(Error::WriteConflict);
                 }
             }

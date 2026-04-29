@@ -335,6 +335,50 @@ fn pragma_introspection_and_state_round_trips_work() {
 }
 
 #[test]
+fn explicit_null_does_not_receive_column_default() {
+    let (_dir, conn) = open_database();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT DEFAULT 'fallback')")
+        .expect("create table");
+
+    conn.execute("INSERT INTO t(id, v) VALUES (1, NULL)")
+        .expect("insert explicit null");
+    conn.execute("INSERT INTO t(id) VALUES (2)")
+        .expect("insert omitted default");
+
+    let mut stmt = conn
+        .prepare("SELECT id, v FROM t ORDER BY id")
+        .expect("select");
+    assert_eq!(stmt.step().expect("row 1"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("id 1"), 1);
+    assert!(matches!(
+        stmt.column_value(1).expect("explicit null"),
+        redlinedb_sql::SqlValue::Null
+    ));
+    assert_eq!(stmt.step().expect("row 2"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("id 2"), 2);
+    assert_eq!(stmt.column_text(1).expect("default"), "fallback");
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+}
+
+#[test]
+fn pragma_user_version_survives_reopen() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("user-version.db");
+    {
+        let db = Database::create(&path, DbOptions::default()).expect("create database");
+        let conn = db.connect();
+        conn.execute("PRAGMA user_version = 42")
+            .expect("set user_version");
+    }
+    let db = Database::open(&path, DbOptions::default()).expect("open database");
+    let conn = db.connect();
+    let mut stmt = conn.prepare("PRAGMA user_version").expect("user_version");
+    assert_eq!(stmt.step().expect("step"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("value"), 42);
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+}
+
+#[test]
 fn execute_participates_in_explicit_transactions() {
     let (_dir, conn) = open_database();
 
@@ -408,6 +452,90 @@ fn sqlite_core_functions_cover_round_hex_quote_random_and_glob() {
     let _ = stmt.column_i64(6).expect("random");
     assert_eq!(stmt.column_i64(7).expect("glob true"), 1);
     assert_eq!(stmt.column_i64(8).expect("glob false"), 0);
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+}
+
+#[test]
+fn sqlite_null_and_zero_arithmetic_semantics_match_core_behavior() {
+    let (_dir, conn) = open_database();
+    let mut stmt = conn
+        .prepare("SELECT 1 / 0, 5 % 0, 'a' || NULL, NULL || 'b'")
+        .expect("prepare arithmetic");
+    assert_eq!(stmt.step().expect("row"), Step::Row);
+    for idx in 0..4 {
+        assert!(matches!(
+            stmt.column_value(idx).expect("value"),
+            redlinedb_sql::SqlValue::Null
+        ));
+    }
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+}
+
+#[test]
+fn json_text_functions_are_sqlite_compatible_for_core_paths() {
+    let (_dir, conn) = open_database();
+    let mut stmt = conn
+        .prepare(
+            "SELECT \
+             json_valid('{\"a\":[1,2],\"b\":true}'), \
+             json_extract('{\"a\":[1,2],\"b\":true}', '$.a[1]'), \
+             json_type('{\"a\":[1,2],\"b\":true}', '$.b'), \
+             json_array(1, 'two', NULL), \
+             json_object('k', 7), \
+             json_quote('x')",
+        )
+        .expect("prepare json");
+    assert_eq!(stmt.step().expect("row"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("valid"), 1);
+    assert_eq!(stmt.column_i64(1).expect("extract"), 2);
+    assert_eq!(stmt.column_text(2).expect("type"), "boolean");
+    assert_eq!(stmt.column_text(3).expect("array"), "[1,\"two\",null]");
+    assert_eq!(stmt.column_text(4).expect("object"), "{\"k\":7}");
+    assert_eq!(stmt.column_text(5).expect("quote"), "\"x\"");
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+}
+
+#[test]
+fn vector_blob_functions_encode_and_compare_vectors() {
+    let (_dir, conn) = open_database();
+    let mut stmt = conn
+        .prepare(
+            "SELECT \
+             vector_dims(vector(1.0, 2.0, 3.0)), \
+             vector_distance_l2(vector(1, 2), vector(4, 6)), \
+             vector_distance_cosine(vector_from_json('[1,0]'), vector(0,1))",
+        )
+        .expect("prepare vector");
+    assert_eq!(stmt.step().expect("row"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("dims"), 3);
+    assert_eq!(stmt.column_f64(1).expect("l2"), 5.0);
+    assert!((stmt.column_f64(2).expect("cosine") - 1.0).abs() < 0.000001);
+    assert_eq!(stmt.step().expect("done"), Step::Done);
+}
+
+#[test]
+fn insert_select_populates_target_rows() {
+    let (_dir, conn) = open_database();
+    conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, v TEXT)")
+        .expect("create src");
+    conn.execute("CREATE TABLE dst(id INTEGER PRIMARY KEY, v TEXT DEFAULT 'd')")
+        .expect("create dst");
+    conn.execute("INSERT INTO src VALUES (1, 'one'), (2, 'two')")
+        .expect("insert src");
+    assert_eq!(
+        conn.execute("INSERT INTO dst(id, v) SELECT id + 10, upper(v) FROM src ORDER BY id")
+            .expect("insert select"),
+        2
+    );
+    let mut stmt = conn
+        .prepare("SELECT id, v FROM dst ORDER BY id")
+        .expect("select dst");
+    assert_eq!(stmt.step().expect("row 1"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("id"), 11);
+    assert_eq!(stmt.column_text(1).expect("v"), "ONE");
+    assert_eq!(stmt.step().expect("row 2"), Step::Row);
+    assert_eq!(stmt.column_i64(0).expect("id"), 12);
+    assert_eq!(stmt.column_text(1).expect("v"), "TWO");
     assert_eq!(stmt.step().expect("done"), Step::Done);
 }
 
@@ -945,6 +1073,7 @@ mod lane_b {
     use redlinedb_kernel::catalog::{
         EncodedIndexKey, IndexDef, IndexKeySource, OwnedValue, SortDir, encode_index_key,
     };
+    use redlinedb_kernel::txn::Isolation;
 
     /// Build the same encoded index key bytes that the SQL exec layer
     /// produces, so the test can probe the physical B-tree directly.
@@ -988,7 +1117,14 @@ mod lane_b {
             .engine_for_tests()
             .index_handle(index.index_id)
             .unwrap_or_else(|| panic!("no physical handle for index `{index_name}`"));
-        let rows = handle.point_lookup(&bytes).expect("point_lookup");
+        let engine = conn.engine_for_tests();
+        let tx = engine
+            .begin(Isolation::Snapshot)
+            .expect("begin visible probe");
+        let rows = handle
+            .point_lookup_visible(engine.tx_status(), tx.snapshot(), Some(tx.id()), &bytes)
+            .expect("point_lookup_visible");
+        engine.rollback(tx).expect("rollback visible probe");
         assert!(
             !rows.is_empty(),
             "expected index `{index_name}` to contain key for {values:?}"
@@ -1006,7 +1142,14 @@ mod lane_b {
             .engine_for_tests()
             .index_handle(index.index_id)
             .unwrap_or_else(|| panic!("no physical handle for index `{index_name}`"));
-        let rows = handle.point_lookup(&bytes).expect("point_lookup");
+        let engine = conn.engine_for_tests();
+        let tx = engine
+            .begin(Isolation::Snapshot)
+            .expect("begin visible probe");
+        let rows = handle
+            .point_lookup_visible(engine.tx_status(), tx.snapshot(), Some(tx.id()), &bytes)
+            .expect("point_lookup_visible");
+        engine.rollback(tx).expect("rollback visible probe");
         assert!(
             rows.is_empty(),
             "expected index `{index_name}` to NOT contain key for {values:?}, got {rows:?}"

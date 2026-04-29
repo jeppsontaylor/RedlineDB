@@ -10,7 +10,7 @@ use redlinedb_kernel::catalog::{
     OwnedValue, RecordRef, RecordScratch, RowValueSource, SqliteSchemaRow, StatsEpoch,
     StatsSnapshot, TableDef, TableStats, ValueRef, apply_affinity, encode_record, eval_expr,
 };
-use redlinedb_kernel::engine::{Engine, Txn};
+use redlinedb_kernel::engine::{CommitOutcome, Engine, Txn};
 use redlinedb_kernel::format::RowId;
 use redlinedb_kernel::txn::Isolation;
 use sqlparser::ast::{
@@ -258,10 +258,7 @@ fn execute_pragma(conn: &Connection, plan: &PragmaPlan) -> Result<()> {
             conn.set_foreign_keys(*value);
             Ok(())
         }
-        PragmaPlan::SetUserVersion(value) => {
-            conn.set_user_version(*value);
-            Ok(())
-        }
+        PragmaPlan::SetUserVersion(value) => conn.set_user_version(*value),
     }
 }
 
@@ -287,38 +284,29 @@ fn with_write_tx<T>(
             let mut tx = conn.engine().begin(Isolation::Snapshot)?;
             let result = f(session, &mut tx);
             match result {
-                Ok(value) => {
-                    // Wave 7 P0 #3: do NOT clear `index_undo` until the
-                    // engine commit reports success. SQL DML has already
-                    // mutated physical index pages via `insert_tx`/
-                    // `delete_mark_tx`; if the WAL fsync (or a
-                    // failpoint-injected fault) makes commit fail, we still
-                    // need the inverse log to repair the leaf pages.
-                    match conn.engine().commit(tx) {
-                        Ok(_) => {
-                            session.index_undo.clear();
-                            session.kernel_unique_guards.clear();
-                            session.unique_guards.clear();
-                            Ok(value)
-                        }
-                        Err(err) => {
-                            replay_index_undo_after_commit_failure(conn.engine(), session);
-                            session.kernel_unique_guards.clear();
-                            session.unique_guards.clear();
-                            Err(err.into())
-                        }
+                Ok(value) => match conn.engine().commit(tx) {
+                    Ok(CommitOutcome::Committed(_)) => {
+                        session.kernel_unique_guards.clear();
+                        session.unique_guards.clear();
+                        Ok(value)
                     }
-                }
+                    Ok(CommitOutcome::MaybeCommitted) => {
+                        session.kernel_unique_guards.clear();
+                        session.unique_guards.clear();
+                        Err(Error::CommitMaybeCommitted)
+                    }
+                    Ok(CommitOutcome::RolledBack) => {
+                        session.kernel_unique_guards.clear();
+                        session.unique_guards.clear();
+                        Err(Error::TransactionState("transaction rolled back"))
+                    }
+                    Err(err) => {
+                        session.kernel_unique_guards.clear();
+                        session.unique_guards.clear();
+                        Err(err.into())
+                    }
+                },
                 Err(err) => {
-                    // SQL DML mutates physical index pages immediately
-                    // (insert_tx / delete_mark_tx are not MVCC-aware), so
-                    // the kernel rollback alone leaves stale entries
-                    // visible. Replay the inverse of every recorded index
-                    // op against the still-live tx BEFORE we ask the
-                    // engine to abort it; that lets the inverses ride the
-                    // same WAL records and the in-memory page state ends
-                    // at the inverse's view (no entry visible).
-                    replay_index_undo(conn.engine(), session, &mut tx);
                     let _ = conn.engine().rollback(tx);
                     session.kernel_unique_guards.clear();
                     session.unique_guards.clear();
@@ -327,55 +315,6 @@ fn with_write_tx<T>(
             }
         }
     })
-}
-
-/// Drain `session.index_undo` and replay each op's inverse against the live
-/// `tx`. Errors from the inverse path are best-effort: if undelete_mark or
-/// the inverse delete-mark fails we fall through to the normal rollback —
-/// the caller's transaction is already on the error path. Each replayed op
-/// is dropped from the log regardless of outcome.
-pub(crate) fn replay_index_undo(
-    engine: &redlinedb_kernel::engine::Engine,
-    session: &mut SessionState,
-    tx: &mut Txn,
-) {
-    let ops = std::mem::take(&mut session.index_undo);
-    for op in ops.into_iter().rev() {
-        // Replay inverses in reverse order: a tx that did insert(A) then
-        // delete_mark(A) must un-delete_mark(A) first, then delete-mark(A).
-        let _ = op.replay_inverse(engine, tx);
-    }
-}
-
-/// Wave 7 P0 #3: run after `engine.commit` returns `Err`. The original tx
-/// has already been consumed and aborted by the kernel, but SQL-side
-/// `insert_tx`/`delete_mark_tx` calls still left mutated bytes on the leaf
-/// pages. We open a fresh tx, replay the inverses against it, and commit
-/// that repair tx so the index pages are durably restored to a state
-/// consistent with the heap (which the kernel rollback already undid). On
-/// any error during the repair we still drain the log — leaving stale
-/// inverses queued for a later commit would silently corrupt indexes.
-pub(crate) fn replay_index_undo_after_commit_failure(
-    engine: &redlinedb_kernel::engine::Engine,
-    session: &mut SessionState,
-) {
-    let ops = std::mem::take(&mut session.index_undo);
-    if ops.is_empty() {
-        return;
-    }
-    let Ok(repair_tx) = engine.begin(Isolation::Snapshot) else {
-        return;
-    };
-    for op in ops.iter().rev() {
-        // Replay inverses in reverse order: a tx that did insert(A) then
-        // delete_mark(A) must un-delete_mark(A) first, then delete-mark(A).
-        let _ = op.replay_inverse(engine, &repair_tx);
-    }
-    // Best-effort: if the repair commit fails we cannot do better here.
-    // The caller is already on the error path and will surface the
-    // original failure; in-memory leaf bytes are still in the intended
-    // inverse state.
-    let _ = engine.commit(repair_tx);
 }
 
 pub(crate) fn finalize_runtime(conn: &Connection, runtime: &mut RuntimeState) -> Result<()> {
@@ -1200,10 +1139,12 @@ fn eval_group_scalar_with_ctx(
                 BinaryOperator::Multiply => {
                     arithmetic(left_value, right_value, |a, b| a * b, |a, b| a * b)?
                 }
+                BinaryOperator::Divide if numeric_value(&right_value)? == 0.0 => SqlValue::Null,
                 BinaryOperator::Divide => {
                     arithmetic(left_value, right_value, |a, b| a / b, |a, b| a / b)?
                 }
                 BinaryOperator::Modulo => match (&left_value, &right_value) {
+                    (_, SqlValue::Integer(0)) => SqlValue::Null,
                     (SqlValue::Integer(a), SqlValue::Integer(b)) => SqlValue::Integer(a % b),
                     _ => return Err(Error::DatatypeMismatch),
                 },
@@ -1224,6 +1165,12 @@ fn eval_group_scalar_with_ctx(
                 }
                 BinaryOperator::LtEq => {
                     compare_binary(left_value, right_value, |o| o != Ordering::Greater)?
+                }
+                BinaryOperator::StringConcat
+                    if matches!(left_value, SqlValue::Null)
+                        || matches!(right_value, SqlValue::Null) =>
+                {
+                    SqlValue::Null
                 }
                 BinaryOperator::StringConcat => SqlValue::Text(Arc::from(format!(
                     "{}{}",
@@ -1561,6 +1508,11 @@ fn execute_insert(
     plan: &crate::statement::InsertPlan,
     bindings: &[Option<SqlValue>],
 ) -> Result<ExecutionResult> {
+    let source_rows = plan
+        .source_select
+        .as_ref()
+        .map(|source_select| materialize_select_plan_rows(conn, source_select, bindings))
+        .transpose()?;
     with_write_tx(conn, |session, tx| {
         let mut count = 0usize;
         let mut returning_rows = Vec::new();
@@ -1600,6 +1552,45 @@ fn execute_insert(
                     ));
                 }
             }
+        }
+        if let Some(source_rows) = &source_rows {
+            for row in source_rows {
+                if row.len() != plan.columns.len() {
+                    return Err(Error::Bind(
+                        "INSERT SELECT row arity does not match column list".to_owned(),
+                    ));
+                }
+                let mut values = build_row_from_values(&plan.table, row, &plan.columns)?;
+                match insert_row_with_resolution(
+                    conn,
+                    session,
+                    tx,
+                    &plan.table,
+                    &mut values,
+                    plan.conflict.as_ref(),
+                    bindings,
+                )? {
+                    InsertOutcome::Inserted { rowid, values }
+                    | InsertOutcome::Updated { rowid, values } => {
+                        if let Some(returning) = &plan.returning {
+                            returning_rows.push(project_returning_row(
+                                &plan.table,
+                                &values,
+                                rowid,
+                                returning,
+                                bindings,
+                            )?);
+                        }
+                        count += 1;
+                    }
+                    InsertOutcome::Ignored => {}
+                }
+            }
+            return Ok(build_dml_execution_result(
+                count,
+                returning_rows,
+                plan.returning.is_some(),
+            ));
         }
         for row in &plan.rows {
             if row.len() != plan.columns.len() {

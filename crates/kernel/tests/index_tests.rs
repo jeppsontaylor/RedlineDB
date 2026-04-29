@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
+use redlinedb_kernel::engine::ConcurrentTxStatus;
 use redlinedb_kernel::format::TxId;
 use redlinedb_kernel::format::{DEFAULT_PAGE_SIZE, Lsn, Page, PageId, PageKind, RelId, TuplePtr};
 use redlinedb_kernel::index::{BtreeIndex, IndexDescriptor, IndexId, IndexRowRef, IndexUniqueness};
@@ -143,7 +144,7 @@ fn index_recursive_split_propagates_beyond_root() {
 fn index_recovery_replays_page_images_with_torn_tail() {
     let source = TempDir::new().unwrap();
     let source_page_file =
-        Arc::new(PageFile::create(source.path().join("source.redline"), 384).unwrap());
+        Arc::new(PageFile::create(source.path().join("source.redline"), 512).unwrap());
     let source_buffer = Arc::new(BufferPool::new(Arc::clone(&source_page_file), 64).unwrap());
     let source_index = BtreeIndex::create(
         Arc::clone(&source_buffer),
@@ -202,7 +203,7 @@ fn index_recovery_replays_page_images_with_torn_tail() {
 
     let recovered = TempDir::new().unwrap();
     let recovered_page_file =
-        Arc::new(PageFile::create(recovered.path().join("recovered.redline"), 384).unwrap());
+        Arc::new(PageFile::create(recovered.path().join("recovered.redline"), 512).unwrap());
     let recovered_buffer = Arc::new(BufferPool::new(Arc::clone(&recovered_page_file), 64).unwrap());
     let recovered_index = BtreeIndex::create(
         Arc::clone(&recovered_buffer),
@@ -420,6 +421,145 @@ fn index_delete_mark_and_compact_leaf() {
 }
 
 #[test]
+fn index_mvcc_visibility_tracks_create_and_delete_transactions() {
+    let temp = TempDir::new().unwrap();
+    let page_file = Arc::new(PageFile::create(temp.path().join("data.redline"), 512).unwrap());
+    let buffer = Arc::new(BufferPool::new(Arc::clone(&page_file), 64).unwrap());
+    let index = BtreeIndex::create(
+        Arc::clone(&buffer),
+        IndexDescriptor::new(IndexId(80), RelId(1), IndexUniqueness::NonUnique),
+    )
+    .unwrap();
+    let txs = ConcurrentTxStatus::new();
+    let row = IndexRowRef::with_row_id(
+        redlinedb_kernel::format::RowId(1),
+        TuplePtr::new_with_generation(
+            PageId(200),
+            1,
+            redlinedb_kernel::format::PageGeneration::ONE,
+        ),
+    );
+
+    let insert_tx = txs.begin();
+    index.insert_tx(insert_tx, b"k001", row).unwrap();
+    let other_snapshot = txs.snapshot();
+    assert!(
+        index
+            .point_lookup_visible(&txs, &other_snapshot, None, b"k001")
+            .unwrap()
+            .is_empty(),
+        "uncommitted insert must be invisible to other transactions"
+    );
+    assert_eq!(
+        index
+            .point_lookup_visible(&txs, &other_snapshot, Some(insert_tx), b"k001")
+            .unwrap(),
+        vec![row],
+        "own insert must be visible"
+    );
+
+    let csn = txs.reserve_csn();
+    txs.publish_commit(insert_tx, csn);
+    let committed_snapshot = txs.snapshot();
+    assert_eq!(
+        index
+            .point_lookup_visible(&txs, &committed_snapshot, None, b"k001")
+            .unwrap(),
+        vec![row]
+    );
+
+    let delete_tx = txs.begin();
+    index.delete_mark_tx(delete_tx, b"k001", row).unwrap();
+    let delete_csn = txs.reserve_csn();
+    txs.publish_commit(delete_tx, delete_csn);
+    let after_delete = txs.snapshot();
+    assert!(
+        index
+            .point_lookup_visible(&txs, &after_delete, None, b"k001")
+            .unwrap()
+            .is_empty(),
+        "committed delete must hide entry"
+    );
+    assert_eq!(
+        index
+            .point_lookup_visible(&txs, &committed_snapshot, None, b"k001")
+            .unwrap(),
+        vec![row],
+        "older snapshot must still see the pre-delete entry"
+    );
+}
+
+#[test]
+fn index_mvcc_aborted_insert_and_delete_are_invisible() {
+    let temp = TempDir::new().unwrap();
+    let page_file = Arc::new(PageFile::create(temp.path().join("data.redline"), 512).unwrap());
+    let buffer = Arc::new(BufferPool::new(Arc::clone(&page_file), 64).unwrap());
+    let index = BtreeIndex::create(
+        Arc::clone(&buffer),
+        IndexDescriptor::new(IndexId(81), RelId(1), IndexUniqueness::NonUnique),
+    )
+    .unwrap();
+    let txs = ConcurrentTxStatus::new();
+    let row = IndexRowRef::with_row_id(
+        redlinedb_kernel::format::RowId(2),
+        TuplePtr::new_with_generation(
+            PageId(201),
+            2,
+            redlinedb_kernel::format::PageGeneration::ONE,
+        ),
+    );
+    let aborted_insert = txs.begin();
+    index.insert_tx(aborted_insert, b"k002", row).unwrap();
+    txs.abort(aborted_insert);
+    let snapshot = txs.snapshot();
+    assert!(
+        index
+            .point_lookup_visible(&txs, &snapshot, None, b"k002")
+            .unwrap()
+            .is_empty(),
+        "aborted insert must not be visible"
+    );
+
+    let insert_tx = txs.begin();
+    index.insert_tx(insert_tx, b"k003", row).unwrap();
+    let csn = txs.reserve_csn();
+    txs.publish_commit(insert_tx, csn);
+    let delete_tx = txs.begin();
+    index.delete_mark_tx(delete_tx, b"k003", row).unwrap();
+    txs.abort(delete_tx);
+    let snapshot = txs.snapshot();
+    assert_eq!(
+        index
+            .range_scan_visible(&txs, &snapshot, None, b"k003", b"k004")
+            .unwrap(),
+        vec![row],
+        "aborted delete must leave committed entry visible"
+    );
+
+    let final_delete = txs.begin();
+    index
+        .delete_mark_tx_visible(
+            &txs,
+            &snapshot,
+            Some(final_delete),
+            final_delete,
+            b"k003",
+            row,
+        )
+        .unwrap();
+    let delete_csn = txs.reserve_csn();
+    txs.publish_commit(final_delete, delete_csn);
+    let snapshot = txs.snapshot();
+    assert!(
+        index
+            .point_lookup_visible(&txs, &snapshot, None, b"k003")
+            .unwrap()
+            .is_empty(),
+        "later committed delete must supersede an aborted delete marker"
+    );
+}
+
+#[test]
 fn engine_create_index_allocates_meta_page_and_recovers() {
     use redlinedb_kernel::catalog::{
         ColumnConstraintSpec, ColumnSpec, ConflictAction, CreateIndexSpec, CreateTableSpec, DbName,
@@ -566,6 +706,115 @@ fn engine_create_index_allocates_meta_page_and_recovers() {
     }
 }
 
+#[test]
+fn ddl_index_handles_publish_and_remove_only_on_commit() {
+    use redlinedb_kernel::catalog::{
+        ColumnSpec, CreateIndexSpec, CreateTableSpec, DbName, DropIndexSpec, IndexColumnSpec,
+        IndexOrigin, QualifiedName, SchemaId, SortDir,
+    };
+    use redlinedb_kernel::engine::{Engine, EngineConfig};
+
+    let temp = TempDir::new().unwrap();
+    let config = EngineConfig {
+        rel_id: RelId(1),
+        wal: WalConfig {
+            segment_bytes: 65536,
+            ..WalConfig::default()
+        },
+        commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
+        lock_shards: 32,
+        busy_timeout: Duration::from_millis(250),
+        heap_lanes: 16,
+        page_size: DEFAULT_PAGE_SIZE,
+        buffer_pool_pages: 256,
+        data_file_name: "data.redline".to_owned(),
+    };
+    let engine = Engine::create(temp.path(), config).unwrap();
+    let mut tx = engine
+        .begin(redlinedb_kernel::txn::Isolation::Snapshot)
+        .unwrap();
+    engine
+        .create_table(
+            &mut tx,
+            CreateTableSpec {
+                schema: None,
+                name: DbName::new("t"),
+                columns: vec![ColumnSpec {
+                    name: DbName::new("v"),
+                    declared_type: Some("TEXT".to_owned()),
+                    constraints: Vec::new(),
+                    collation: None,
+                    default_value: None,
+                }],
+                constraints: Vec::new(),
+                if_not_exists: false,
+                strict: false,
+                without_rowid: false,
+                normalized_sql: Some("CREATE TABLE t(v TEXT)".to_owned()),
+            },
+        )
+        .unwrap();
+    engine.commit(tx).unwrap();
+
+    let create_spec = || CreateIndexSpec {
+        schema: None,
+        name: DbName::new("ix_t_v"),
+        table: QualifiedName {
+            schema: DbName::new("main"),
+            name: DbName::new("t"),
+        },
+        unique: false,
+        columns: vec![IndexColumnSpec {
+            name: DbName::new("v"),
+            sort_dir: SortDir::Asc,
+            collation: None,
+        }],
+        origin: IndexOrigin::User,
+        normalized_sql: Some("CREATE INDEX ix_t_v ON t(v)".to_owned()),
+    };
+
+    let mut tx = engine
+        .begin(redlinedb_kernel::txn::Isolation::Snapshot)
+        .unwrap();
+    let rolled_back_index = engine.create_index(&mut tx, create_spec()).unwrap();
+    assert!(engine.index_handle(rolled_back_index.index_id).is_none());
+    engine.rollback(tx).unwrap();
+    assert!(engine.index_handle(rolled_back_index.index_id).is_none());
+    assert!(
+        engine
+            .schema_snapshot()
+            .lookup_index(SchemaId(1), "ix_t_v")
+            .is_none()
+    );
+
+    let mut tx = engine
+        .begin(redlinedb_kernel::txn::Isolation::Snapshot)
+        .unwrap();
+    let committed_index = engine.create_index(&mut tx, create_spec()).unwrap();
+    assert!(engine.index_handle(committed_index.index_id).is_none());
+    engine.commit(tx).unwrap();
+    assert!(engine.index_handle(committed_index.index_id).is_some());
+
+    let mut tx = engine
+        .begin(redlinedb_kernel::txn::Isolation::Snapshot)
+        .unwrap();
+    engine
+        .drop_index(
+            &mut tx,
+            DropIndexSpec {
+                name: QualifiedName {
+                    schema: DbName::new("main"),
+                    name: DbName::new("ix_t_v"),
+                },
+                if_exists: false,
+            },
+        )
+        .unwrap();
+    assert!(engine.index_handle(committed_index.index_id).is_some());
+    engine.rollback(tx).unwrap();
+    assert!(engine.index_handle(committed_index.index_id).is_some());
+}
+
 /// Regression test for the B-tree leaf-split heuristic when many entries
 /// share one logical key. Before the fix, splitting a leaf full of duplicates
 /// would either lose entries (point_lookup walked only one of the resulting
@@ -579,7 +828,7 @@ fn engine_create_index_allocates_meta_page_and_recovers() {
 fn leaf_split_handles_duplicate_keys() {
     let temp = TempDir::new().unwrap();
     let page_file = Arc::new(PageFile::create(temp.path().join("data.redline"), 512).unwrap());
-    let buffer = Arc::new(BufferPool::new(Arc::clone(&page_file), 256).unwrap());
+    let buffer = Arc::new(BufferPool::new(Arc::clone(&page_file), 512).unwrap());
     let index = BtreeIndex::create(
         Arc::clone(&buffer),
         IndexDescriptor::new(IndexId(99), RelId(1), IndexUniqueness::NonUnique),

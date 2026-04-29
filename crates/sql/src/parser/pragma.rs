@@ -99,12 +99,22 @@ pub(crate) fn parse_pragma_template(
                 ]],
             )
         }
-        "integrity_check" => pragma_static_select(
-            sql,
-            schema_epoch,
-            vec![String::from("integrity_check")],
-            vec![vec![SqlValue::Text(Arc::from("ok"))]],
-        ),
+        "integrity_check" => {
+            let rows = conn.integrity_check()?;
+            let rows = if rows.is_empty() {
+                vec![vec![SqlValue::Text(Arc::from("ok"))]]
+            } else {
+                rows.into_iter()
+                    .map(|error| vec![SqlValue::Text(Arc::from(error))])
+                    .collect()
+            };
+            pragma_static_select(
+                sql,
+                schema_epoch,
+                vec![String::from("integrity_check")],
+                rows,
+            )
+        }
         "table_info" => {
             let name = value.ok_or_else(|| {
                 Error::UnsupportedSql("PRAGMA table_info requires a table".to_owned())

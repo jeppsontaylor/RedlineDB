@@ -7,8 +7,6 @@ use redlinedb_kernel::error::Error as KernelError;
 use redlinedb_kernel::format::RowId;
 use redlinedb_kernel::index::UniqueKeyGuard as KernelUniqueKeyGuard;
 
-use crate::exec::index_dml::IndexUndoOp;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BeginMode {
     Deferred,
@@ -31,11 +29,6 @@ pub struct SessionState {
     /// inside the SQL `collect_unique_conflicts` helper reopened the race
     /// (two writers both saw "no duplicate" and both committed).
     pub kernel_unique_guards: Vec<KernelUniqueKeyGuard>,
-    /// Per-tx index-mutation log used to reverse SQL DML index writes when
-    /// the surrounding transaction rolls back. Each successful index probe
-    /// pushes one [`IndexUndoOp`]; on rollback we replay the inverse, on
-    /// commit we just drop the log.
-    pub index_undo: Vec<IndexUndoOp>,
 }
 
 impl SessionState {
@@ -49,7 +42,6 @@ impl SessionState {
         self.last_insert_rowid = None;
         self.unique_guards.clear();
         self.kernel_unique_guards.clear();
-        self.index_undo.clear();
     }
 }
 

@@ -310,6 +310,93 @@ fn record_status(db: *mut rldb, code: c_int) {
     });
 }
 
+fn set_errmsg(errmsg: *mut *mut c_char, message: &str) {
+    if errmsg.is_null() {
+        return;
+    }
+    let c = CString::new(message).unwrap_or_else(|_| CString::new("error").unwrap());
+    unsafe {
+        *errmsg = c.into_raw();
+    }
+}
+
+fn first_statement(input: &str) -> Option<(String, usize)> {
+    let mut start = None;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut iter = input.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        if line_comment {
+            if ch == '\n' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && iter.peek().is_some_and(|(_, next)| *next == '/') {
+                iter.next();
+                block_comment = false;
+            }
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                if iter.peek().is_some_and(|(_, next)| *next == '\'') {
+                    iter.next();
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '"' {
+                if iter.peek().is_some_and(|(_, next)| *next == '"') {
+                    iter.next();
+                } else {
+                    in_double = false;
+                }
+            }
+            continue;
+        }
+        if ch == '-' && iter.peek().is_some_and(|(_, next)| *next == '-') {
+            iter.next();
+            line_comment = true;
+            continue;
+        }
+        if ch == '/' && iter.peek().is_some_and(|(_, next)| *next == '*') {
+            iter.next();
+            block_comment = true;
+            continue;
+        }
+        if start.is_none() {
+            if ch.is_whitespace() || ch == ';' {
+                continue;
+            }
+            start = Some(idx);
+        }
+        match ch {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            ';' => {
+                let start = start?;
+                let statement = input[start..idx].trim();
+                return Some((statement.to_owned(), idx + ch.len_utf8()));
+            }
+            _ => {}
+        }
+    }
+    let start = start?;
+    let statement = input[start..].trim();
+    if statement.is_empty() {
+        None
+    } else {
+        Some((statement.to_owned(), input.len()))
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_open(path: *const c_char, out_db: *mut *mut rldb) -> c_int {
     flatten_code(api(|| {
@@ -350,6 +437,9 @@ pub extern "C" fn rldb_open_v2(
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_close(db: *mut rldb) -> c_int {
     flatten_code(api(|| {
+        if db.is_null() {
+            return Err(RLDB_MISUSE);
+        }
         let db_ref = unsafe { &*db };
         if db_ref.active_statements.load(Ordering::Relaxed) != 0 {
             return Err(RLDB_BUSY);
@@ -378,19 +468,37 @@ pub extern "C" fn rldb_prepare_v2(
         if db.is_null() || sql.is_null() || out_stmt.is_null() {
             return Err(RLDB_MISUSE);
         }
+        unsafe {
+            *out_stmt = ptr::null_mut();
+            if !tail.is_null() {
+                *tail = sql;
+            }
+        }
         let db_ref = unsafe { &*db };
-        let sql_cstr = unsafe { CStr::from_ptr(sql) };
-        let sql_text = if nbytes < 0 {
-            sql_cstr.to_str().map_err(|_| RLDB_MISMATCH)?.to_owned()
+        let (input, input_base_len) = if nbytes < 0 {
+            let cstr = unsafe { CStr::from_ptr(sql) };
+            (
+                cstr.to_str().map_err(|_| RLDB_MISMATCH)?.to_owned(),
+                cstr.to_bytes().len(),
+            )
         } else {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(sql_cstr.as_ptr() as *const u8, nbytes as usize)
-            };
-            std::str::from_utf8(bytes)
-                .map_err(|_| RLDB_MISMATCH)?
-                .to_owned()
+            let raw = unsafe { std::slice::from_raw_parts(sql as *const u8, nbytes as usize) };
+            let visible_len = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+            (
+                std::str::from_utf8(&raw[..visible_len])
+                    .map_err(|_| RLDB_MISMATCH)?
+                    .to_owned(),
+                visible_len,
+            )
         };
-        let sql_len = sql_text.len();
+        let Some((sql_text, consumed)) = first_statement(&input) else {
+            unsafe {
+                if !tail.is_null() {
+                    *tail = sql.wrapping_add(input_base_len);
+                }
+            }
+            return Ok(RLDB_OK);
+        };
         let stmt = sql_result(db_ref.conn.clone().prepare(&sql_text))?;
         let mut boxed = Box::new(rldb_stmt {
             db,
@@ -411,7 +519,7 @@ pub extern "C" fn rldb_prepare_v2(
         unsafe {
             *out_stmt = Box::into_raw(boxed);
             if !tail.is_null() {
-                *tail = sql_cstr.as_ptr().wrapping_add(sql_len);
+                *tail = sql.wrapping_add(consumed);
             }
         }
         Ok(RLDB_OK)
@@ -421,6 +529,9 @@ pub extern "C" fn rldb_prepare_v2(
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_step(stmt: *mut rldb_stmt) -> c_int {
     flatten_code(api(|| {
+        if stmt.is_null() {
+            return Err(RLDB_MISUSE);
+        }
         let stmt = unsafe { &mut *stmt };
         if unsafe { (*stmt.db).interrupted.load(Ordering::Relaxed) } {
             return Err(RLDB_INTERRUPT);
@@ -438,6 +549,9 @@ pub extern "C" fn rldb_step(stmt: *mut rldb_stmt) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_reset(stmt: *mut rldb_stmt) -> c_int {
     flatten_code(api(|| {
+        if stmt.is_null() {
+            return Err(RLDB_MISUSE);
+        }
         let stmt = unsafe { &mut *stmt };
         sql_result(stmt.stmt.reset())?;
         stmt.text_cache.clear();
@@ -464,6 +578,9 @@ pub extern "C" fn rldb_finalize(stmt: *mut rldb_stmt) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_clear_bindings(stmt: *mut rldb_stmt) -> c_int {
     flatten_code(api(|| {
+        if stmt.is_null() {
+            return Err(RLDB_MISUSE);
+        }
         let stmt = unsafe { &mut *stmt };
         stmt.stmt.clear_bindings();
         Ok(RLDB_OK)
@@ -473,6 +590,9 @@ pub extern "C" fn rldb_clear_bindings(stmt: *mut rldb_stmt) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_bind_null(stmt: *mut rldb_stmt, index: c_int) -> c_int {
     flatten_code(api(|| {
+        if stmt.is_null() {
+            return Err(RLDB_MISUSE);
+        }
         let stmt = unsafe { &mut *stmt };
         sql_result(stmt.stmt.bind_null(index as usize))?;
         Ok(RLDB_OK)
@@ -482,6 +602,9 @@ pub extern "C" fn rldb_bind_null(stmt: *mut rldb_stmt, index: c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_bind_int64(stmt: *mut rldb_stmt, index: c_int, value: i64) -> c_int {
     flatten_code(api(|| {
+        if stmt.is_null() {
+            return Err(RLDB_MISUSE);
+        }
         let stmt = unsafe { &mut *stmt };
         sql_result(stmt.stmt.bind_i64(index as usize, value))?;
         Ok(RLDB_OK)
@@ -491,6 +614,9 @@ pub extern "C" fn rldb_bind_int64(stmt: *mut rldb_stmt, index: c_int, value: i64
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_bind_double(stmt: *mut rldb_stmt, index: c_int, value: f64) -> c_int {
     flatten_code(api(|| {
+        if stmt.is_null() {
+            return Err(RLDB_MISUSE);
+        }
         let stmt = unsafe { &mut *stmt };
         sql_result(stmt.stmt.bind_f64(index as usize, value))?;
         Ok(RLDB_OK)
@@ -505,7 +631,7 @@ pub extern "C" fn rldb_bind_text(
     nbytes: c_int,
 ) -> c_int {
     flatten_code(api(|| {
-        if value.is_null() {
+        if stmt.is_null() || value.is_null() {
             return Err(RLDB_MISUSE);
         }
         let stmt = unsafe { &mut *stmt };
@@ -528,7 +654,7 @@ pub extern "C" fn rldb_bind_blob(
     nbytes: c_int,
 ) -> c_int {
     flatten_code(api(|| {
-        if value.is_null() {
+        if stmt.is_null() || value.is_null() || nbytes < 0 {
             return Err(RLDB_MISUSE);
         }
         let stmt = unsafe { &mut *stmt };
@@ -549,7 +675,7 @@ pub extern "C" fn rldb_parameter_count(stmt: *mut rldb_stmt) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_bind_parameter_index(stmt: *mut rldb_stmt, name: *const c_char) -> c_int {
     flatten_code(api(|| {
-        if name.is_null() {
+        if stmt.is_null() || name.is_null() {
             return Err(RLDB_MISUSE);
         }
         let stmt = unsafe { &mut *stmt };
@@ -585,24 +711,24 @@ pub extern "C" fn rldb_column_name(stmt: *mut rldb_stmt, index: c_int) -> *const
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_column_type(stmt: *mut rldb_stmt, index: c_int) -> c_int {
     flatten_code(api(|| {
+        if stmt.is_null() || index < 0 {
+            return Err(RLDB_MISUSE);
+        }
         let stmt = unsafe { &mut *stmt };
-        if stmt.stmt.column_text(index as usize).is_ok() {
-            Ok(RLDB_TEXT)
-        } else if stmt.stmt.column_blob(index as usize).is_ok() {
-            Ok(RLDB_BLOB)
-        } else if stmt.stmt.column_i64(index as usize).is_ok() {
-            Ok(RLDB_INTEGER)
-        } else if stmt.stmt.column_f64(index as usize).is_ok() {
-            Ok(RLDB_REAL)
-        } else {
-            Ok(RLDB_NULL)
+        match stmt.stmt.column_value(index as usize) {
+            Ok(redlinedb_sql::SqlValue::Null) => Ok(RLDB_NULL),
+            Ok(redlinedb_sql::SqlValue::Integer(_)) => Ok(RLDB_INTEGER),
+            Ok(redlinedb_sql::SqlValue::Real(_)) => Ok(RLDB_REAL),
+            Ok(redlinedb_sql::SqlValue::Text(_)) => Ok(RLDB_TEXT),
+            Ok(redlinedb_sql::SqlValue::Blob(_)) => Ok(RLDB_BLOB),
+            Err(_) => Ok(RLDB_NULL),
         }
     }))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_column_int64(stmt: *mut rldb_stmt, index: c_int) -> i64 {
-    if stmt.is_null() {
+    if stmt.is_null() || index < 0 {
         return 0;
     }
     unsafe { (*stmt).stmt.column_i64(index as usize).unwrap_or(0) }
@@ -610,7 +736,7 @@ pub extern "C" fn rldb_column_int64(stmt: *mut rldb_stmt, index: c_int) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_column_double(stmt: *mut rldb_stmt, index: c_int) -> f64 {
-    if stmt.is_null() {
+    if stmt.is_null() || index < 0 {
         return 0.0;
     }
     unsafe { (*stmt).stmt.column_f64(index as usize).unwrap_or(0.0) }
@@ -618,7 +744,7 @@ pub extern "C" fn rldb_column_double(stmt: *mut rldb_stmt, index: c_int) -> f64 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_column_text(stmt: *mut rldb_stmt, index: c_int) -> *const c_uchar {
-    if stmt.is_null() {
+    if stmt.is_null() || index < 0 {
         return ptr::null();
     }
     unsafe {
@@ -632,7 +758,7 @@ pub extern "C" fn rldb_column_text(stmt: *mut rldb_stmt, index: c_int) -> *const
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_column_blob(stmt: *mut rldb_stmt, index: c_int) -> *const c_void {
-    if stmt.is_null() {
+    if stmt.is_null() || index < 0 {
         return ptr::null();
     }
     unsafe {
@@ -646,13 +772,14 @@ pub extern "C" fn rldb_column_blob(stmt: *mut rldb_stmt, index: c_int) -> *const
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_column_bytes(stmt: *mut rldb_stmt, index: c_int) -> c_int {
     flatten_code(api(|| {
+        if stmt.is_null() || index < 0 {
+            return Err(RLDB_MISUSE);
+        }
         let stmt = unsafe { &mut *stmt };
-        if let Ok(text) = stmt.stmt.column_text(index as usize) {
-            Ok(text.len() as c_int)
-        } else if let Ok(blob) = stmt.stmt.column_blob(index as usize) {
-            Ok(blob.len() as c_int)
-        } else {
-            Ok(8)
+        match stmt.stmt.column_value(index as usize) {
+            Ok(redlinedb_sql::SqlValue::Text(text)) => Ok(text.len() as c_int),
+            Ok(redlinedb_sql::SqlValue::Blob(blob)) => Ok(blob.len() as c_int),
+            Ok(_) | Err(_) => Ok(0),
         }
     }))
 }
@@ -665,50 +792,75 @@ pub extern "C" fn rldb_exec(
         extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int,
     >,
     ctx: *mut c_void,
-    _errmsg: *mut *mut c_char,
+    errmsg: *mut *mut c_char,
 ) -> c_int {
     flatten_code(api(|| {
         if db.is_null() || sql.is_null() {
             return Err(RLDB_MISUSE);
         }
+        if !errmsg.is_null() {
+            unsafe {
+                *errmsg = ptr::null_mut();
+            }
+        }
         let db_ref = unsafe { &*db };
         let sql_text = unsafe { CStr::from_ptr(sql) }
             .to_str()
             .map_err(|_| RLDB_MISMATCH)?;
-        let mut stmt = sql_result(db_ref.conn.clone().prepare(sql_text))?;
-        while let Step::Row = sql_result(stmt.step())? {
-            if let Some(callback) = callback {
-                let column_count = stmt.column_count();
-                let mut value_strings: Vec<Option<CString>> = Vec::with_capacity(column_count);
-                let mut name_strings: Vec<CString> = Vec::with_capacity(column_count);
-                for index in 0..column_count {
-                    name_strings
-                        .push(CString::new(stmt.column_name(index)).map_err(|_| RLDB_MISMATCH)?);
-                    value_strings.push(exec_value(&stmt, index)?);
+        let mut offset = 0;
+        while let Some((statement_sql, consumed)) = first_statement(&sql_text[offset..]) {
+            let mut stmt = match db_ref.conn.clone().prepare(&statement_sql) {
+                Ok(stmt) => stmt,
+                Err(err) => {
+                    let code = map_error(err);
+                    set_errmsg(errmsg, status_message(code));
+                    return Err(code);
                 }
-                let mut argv: Vec<*mut c_char> = value_strings
-                    .iter_mut()
-                    .map(|value| {
-                        value
-                            .as_mut()
-                            .map(|s| s.as_ptr() as *mut c_char)
-                            .unwrap_or(ptr::null_mut())
-                    })
-                    .collect();
-                let mut colnames: Vec<*mut c_char> = name_strings
-                    .iter_mut()
-                    .map(|value| value.as_ptr() as *mut c_char)
-                    .collect();
-                let rc = callback(
-                    ctx,
-                    column_count as c_int,
-                    argv.as_mut_ptr(),
-                    colnames.as_mut_ptr(),
-                );
-                if rc != 0 {
-                    return Err(RLDB_ERROR);
+            };
+            while let Step::Row = match stmt.step() {
+                Ok(step) => step,
+                Err(err) => {
+                    let code = map_error(err);
+                    set_errmsg(errmsg, status_message(code));
+                    return Err(code);
+                }
+            } {
+                if let Some(callback) = callback {
+                    let column_count = stmt.column_count();
+                    let mut value_strings: Vec<Option<CString>> = Vec::with_capacity(column_count);
+                    let mut name_strings: Vec<CString> = Vec::with_capacity(column_count);
+                    for index in 0..column_count {
+                        name_strings.push(
+                            CString::new(stmt.column_name(index)).map_err(|_| RLDB_MISMATCH)?,
+                        );
+                        value_strings.push(exec_value(&stmt, index)?);
+                    }
+                    let mut argv: Vec<*mut c_char> = value_strings
+                        .iter_mut()
+                        .map(|value| {
+                            value
+                                .as_mut()
+                                .map(|s| s.as_ptr() as *mut c_char)
+                                .unwrap_or(ptr::null_mut())
+                        })
+                        .collect();
+                    let mut colnames: Vec<*mut c_char> = name_strings
+                        .iter_mut()
+                        .map(|value| value.as_ptr() as *mut c_char)
+                        .collect();
+                    let rc = callback(
+                        ctx,
+                        column_count as c_int,
+                        argv.as_mut_ptr(),
+                        colnames.as_mut_ptr(),
+                    );
+                    if rc != 0 {
+                        set_errmsg(errmsg, "query aborted");
+                        return Err(RLDB_ERROR);
+                    }
                 }
             }
+            offset += consumed;
         }
         Ok(RLDB_OK)
     }))
@@ -771,6 +923,9 @@ pub extern "C" fn rldb_last_insert_rowid(db: *mut rldb) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_checkpoint(db: *mut rldb) -> c_int {
     flatten_code(api(|| {
+        if db.is_null() {
+            return Err(RLDB_MISUSE);
+        }
         let db = unsafe { &*db };
         sql_result(db.db.checkpoint())?;
         Ok(RLDB_OK)
@@ -780,6 +935,9 @@ pub extern "C" fn rldb_checkpoint(db: *mut rldb) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_vacuum(db: *mut rldb) -> c_int {
     flatten_code(api(|| {
+        if db.is_null() {
+            return Err(RLDB_MISUSE);
+        }
         let db = unsafe { &*db };
         sql_result(db.db.vacuum())?;
         Ok(RLDB_OK)
@@ -1322,6 +1480,28 @@ mod tests {
         path
     }
 
+    extern "C" fn count_callback(
+        ctx: *mut c_void,
+        _argc: c_int,
+        _argv: *mut *mut c_char,
+        _colnames: *mut *mut c_char,
+    ) -> c_int {
+        let count = ctx as *mut usize;
+        unsafe {
+            *count += 1;
+        }
+        0
+    }
+
+    extern "C" fn abort_callback(
+        _ctx: *mut c_void,
+        _argc: c_int,
+        _argv: *mut *mut c_char,
+        _colnames: *mut *mut c_char,
+    ) -> c_int {
+        1
+    }
+
     #[test]
     fn sqlite3_open_v2_requires_create_for_missing_path() {
         let path = temp_path("open-v2");
@@ -1401,6 +1581,110 @@ mod tests {
         assert_eq!(sqlite3_busy_timeout(db, 50), RLDB_OK);
         assert_eq!(sqlite3_errcode(db), RLDB_OK);
         assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_prepare_v2_returns_first_statement_and_tail() {
+        let path = temp_path("prepare-tail");
+        fs::create_dir_all(&path).expect("dir");
+        let db_path = path.join("prepare-tail.redline");
+        let c_path = CString::new(db_path.to_str().expect("utf8")).expect("cstring");
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), RLDB_OK);
+
+        let sql = CString::new("SELECT 1; SELECT 2").unwrap();
+        let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+        let mut tail: *const c_char = ptr::null();
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, &mut tail),
+            RLDB_OK
+        );
+        assert!(!stmt.is_null());
+        assert_eq!(
+            unsafe { CStr::from_ptr(sqlite3_sql(stmt)) }
+                .to_str()
+                .expect("sql"),
+            "SELECT 1"
+        );
+        assert_eq!(
+            unsafe { CStr::from_ptr(tail) }.to_str().expect("tail"),
+            " SELECT 2"
+        );
+        assert_eq!(sqlite3_finalize(stmt), RLDB_OK);
+
+        let blank = CString::new(" ;  \n").unwrap();
+        stmt = ptr::null_mut();
+        tail = ptr::null();
+        assert_eq!(
+            sqlite3_prepare_v2(db, blank.as_ptr(), -1, &mut stmt, &mut tail),
+            RLDB_OK
+        );
+        assert!(stmt.is_null());
+        assert_eq!(unsafe { CStr::from_ptr(tail) }.to_bytes(), b"");
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_exec_runs_multiple_statements_and_honors_callback_abort() {
+        let path = temp_path("exec-loop");
+        fs::create_dir_all(&path).expect("dir");
+        let db_path = path.join("exec-loop.redline");
+        let c_path = CString::new(db_path.to_str().expect("utf8")).expect("cstring");
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), RLDB_OK);
+
+        let batch = CString::new(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); \
+             INSERT INTO t VALUES(1, 'a'); \
+             INSERT INTO t VALUES(2, 'b');",
+        )
+        .unwrap();
+        assert_eq!(
+            sqlite3_exec(db, batch.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+            RLDB_OK
+        );
+
+        let query = CString::new("SELECT v FROM t ORDER BY id").unwrap();
+        let mut count = 0usize;
+        assert_eq!(
+            sqlite3_exec(
+                db,
+                query.as_ptr(),
+                Some(count_callback),
+                &mut count as *mut usize as *mut c_void,
+                ptr::null_mut()
+            ),
+            RLDB_OK
+        );
+        assert_eq!(count, 2);
+
+        let mut errmsg: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            sqlite3_exec(
+                db,
+                query.as_ptr(),
+                Some(abort_callback),
+                ptr::null_mut(),
+                &mut errmsg
+            ),
+            RLDB_ERROR
+        );
+        assert!(!errmsg.is_null());
+        assert_eq!(
+            unsafe { CStr::from_ptr(errmsg) }.to_str().expect("errmsg"),
+            "query aborted"
+        );
+        sqlite3_free(errmsg as *mut c_void);
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_null_statement_handles_return_misuse() {
+        assert_eq!(sqlite3_step(ptr::null_mut()), RLDB_MISUSE);
+        assert_eq!(sqlite3_reset(ptr::null_mut()), RLDB_MISUSE);
+        assert_eq!(sqlite3_finalize(ptr::null_mut()), RLDB_MISUSE);
+        assert_eq!(sqlite3_bind_null(ptr::null_mut(), 1), RLDB_MISUSE);
+        assert_eq!(sqlite3_column_bytes(ptr::null_mut(), 0), RLDB_MISUSE);
     }
 
     #[test]

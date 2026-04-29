@@ -846,6 +846,7 @@ dependencies = [
  "fail",
  "parking_lot",
  "redlinedb-kernel",
+ "serde_json",
  "sqlparser",
  "tempfile",
  "thiserror",

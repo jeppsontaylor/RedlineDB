@@ -5,17 +5,19 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use smallvec::SmallVec;
 
+use crate::engine::ConcurrentTxStatus;
 use crate::format::bytes::{read_u16, read_u32, read_u64, write_u16, write_u32, write_u64};
 use crate::format::{
-    PAGE_HEADER_LEN, Page, PageGeneration, PageId, PageKind, RelId, SLOT_LEN, TuplePtr,
+    Csn, PAGE_HEADER_LEN, Page, PageGeneration, PageId, PageKind, RelId, SLOT_LEN, TuplePtr, TxId,
 };
 use crate::storage::BufferPool;
+use crate::txn::{Snapshot, TxState};
 use crate::wal::{WalCoordinator, WalPayload, WalRecordKind};
 use crate::{Error, Result};
 
 pub const INDEX_SPECIAL_LEN: usize = 256;
 const INDEX_MAGIC: u32 = 0x5244_4958; // "RDIX"
-const INDEX_VERSION: u16 = 1;
+pub const INDEX_VERSION: u16 = 2;
 const PAGE_META_KIND: u8 = 1;
 const PAGE_LEAF_KIND: u8 = 2;
 const PAGE_INTERNAL_KIND: u8 = 3;
@@ -30,6 +32,7 @@ const PAGE_LEFT_OFF: usize = 18;
 const PAGE_RIGHT_OFF: usize = 26;
 const PAGE_HIGH_KEY_LEN_OFF: usize = 34;
 const PAGE_HIGH_KEY_OFF: usize = 36;
+const NON_TRANSACTIONAL_DELETE_TX: TxId = TxId(u64::MAX);
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -366,6 +369,17 @@ impl BtreeIndex {
         Ok(index)
     }
 
+    pub fn format_version(buffer: &BufferPool, meta_page_id: PageId) -> Result<u16> {
+        let guard = buffer.pin(meta_page_id)?;
+        guard.with_page(|page| {
+            let special = page.special_bytes()?;
+            if read_u32(special, 0)? != INDEX_MAGIC {
+                return Err(Error::CorruptPage("index magic mismatch"));
+            }
+            read_u16(special, 4)
+        })
+    }
+
     pub fn insert(&self, logical_key: &[u8], row: IndexRowRef) -> Result<()> {
         self.insert_tx(crate::format::TxId::ZERO, logical_key, row)
     }
@@ -414,7 +428,8 @@ impl BtreeIndex {
                 logical_key: logical_key.to_vec(),
                 row,
                 physical: physical.as_slice().to_vec(),
-                dead: false,
+                create_tx: tx_id,
+                delete_tx: TxId::ZERO,
             };
             match entries.binary_search_by(|entry| entry.compare(&candidate)) {
                 Ok(pos) => {
@@ -471,7 +486,7 @@ impl BtreeIndex {
     }
 
     pub fn delete_mark(&self, logical_key: &[u8], row: IndexRowRef) -> Result<()> {
-        self.delete_mark_tx(crate::format::TxId::ZERO, logical_key, row)
+        self.delete_mark_tx(NON_TRANSACTIONAL_DELETE_TX, logical_key, row)
     }
 
     pub fn delete_mark_tx(
@@ -480,32 +495,27 @@ impl BtreeIndex {
         logical_key: &[u8],
         row: IndexRowRef,
     ) -> Result<()> {
-        self.set_dead_flag_tx(tx_id, logical_key, row, true)
+        self.delete_mark_tx_inner(tx_id, logical_key, row, None)
     }
 
-    /// Inverse of [`Self::delete_mark_tx`]: clears the dead flag on the entry
-    /// matching `(logical_key, row)`. Used by SQL-side rollback to undo a
-    /// `delete_mark_tx` that was performed inside a transaction that later
-    /// aborted, so committed readers regain visibility of the index entry.
-    pub fn undelete_mark_tx(
+    pub fn delete_mark_tx_visible(
         &self,
-        tx_id: crate::format::TxId,
+        tx_status: &ConcurrentTxStatus,
+        snapshot: &Snapshot,
+        owner: Option<TxId>,
+        tx_id: TxId,
         logical_key: &[u8],
         row: IndexRowRef,
     ) -> Result<()> {
-        self.set_dead_flag_tx(tx_id, logical_key, row, false)
+        self.delete_mark_tx_inner(tx_id, logical_key, row, Some((tx_status, snapshot, owner)))
     }
 
-    /// Walk the leaf chain for `logical_key` (using physical-key navigation so
-    /// duplicate-key runs spanning multiple leaves are visited) and flip the
-    /// `dead` flag on the entry that matches `row`. Returns silently if no
-    /// matching entry is found in the requested state.
-    fn set_dead_flag_tx(
+    fn delete_mark_tx_inner(
         &self,
-        tx_id: crate::format::TxId,
+        tx_id: TxId,
         logical_key: &[u8],
         row: IndexRowRef,
-        target_dead: bool,
+        visibility: Option<(&ConcurrentTxStatus, &Snapshot, Option<TxId>)>,
     ) -> Result<()> {
         let _structure = self
             .inner
@@ -535,18 +545,18 @@ impl BtreeIndex {
                 if let Entry::Leaf {
                     logical_key: key,
                     row: entry_row,
-                    dead,
+                    delete_tx,
                     ..
                 } = entry
                 {
                     if key.as_slice() == logical_key {
                         last_key_matches_search = true;
                     }
-                    if *dead == target_dead {
-                        continue;
-                    }
                     if key.as_slice() == logical_key && *entry_row == row {
-                        *dead = target_dead;
+                        if delete_marker_visible(*delete_tx, visibility) {
+                            return Ok(());
+                        }
+                        *delete_tx = tx_id;
                         changed = true;
                         break;
                     }
@@ -594,7 +604,7 @@ impl BtreeIndex {
         let entries = self.read_entries(page_ref)?;
         let live: Vec<_> = entries
             .into_iter()
-            .filter(|entry| !entry.is_dead_leaf())
+            .filter(|entry| entry.physically_live())
             .collect();
         if live.len() == self.read_entries(page_ref)?.len() {
             return Ok(());
@@ -609,6 +619,44 @@ impl BtreeIndex {
         )?;
         drop(page);
         // LSN sentinel: mutation. Leaf compaction rewrites the page in place.
+        guard.mark_dirty(crate::format::Lsn(1))?;
+        Ok(())
+    }
+
+    pub fn prune_committed_deletes_before(
+        &self,
+        page_id: PageId,
+        tx_status: &ConcurrentTxStatus,
+        horizon: Csn,
+    ) -> Result<()> {
+        let guard = self.inner.buffer.pin(page_id)?;
+        let mut page = guard.mutable_frame()?;
+        let page_ref = page
+            .page
+            .as_mut()
+            .ok_or(Error::CorruptPage("resident frame missing page"))?;
+        let header = Self::read_page_header(page_ref)?;
+        if header.kind != PAGE_LEAF_KIND {
+            return Err(Error::CorruptPage("expected leaf page"));
+        }
+        let entries = self.read_entries(page_ref)?;
+        let live: Vec<_> = entries
+            .iter()
+            .filter(|entry| !entry.is_committed_deleted_before(tx_status, horizon))
+            .cloned()
+            .collect();
+        if live.len() == entries.len() {
+            return Ok(());
+        }
+        Self::rewrite_leaf(
+            page_ref,
+            self.descriptor().index_id,
+            &live,
+            header.left,
+            header.right,
+            header.high_key,
+        )?;
+        drop(page);
         guard.mark_dirty(crate::format::Lsn(1))?;
         Ok(())
     }
@@ -650,6 +698,26 @@ impl BtreeIndex {
     }
 
     pub fn point_lookup(&self, logical_key: &[u8]) -> Result<Vec<IndexRowRef>> {
+        self.point_lookup_filter(logical_key, |entry| entry.physically_live())
+    }
+
+    pub fn point_lookup_visible(
+        &self,
+        tx_status: &ConcurrentTxStatus,
+        snapshot: &Snapshot,
+        owner: Option<TxId>,
+        logical_key: &[u8],
+    ) -> Result<Vec<IndexRowRef>> {
+        self.point_lookup_filter(logical_key, |entry| {
+            entry_visible(entry, tx_status, snapshot, owner)
+        })
+    }
+
+    fn point_lookup_filter(
+        &self,
+        logical_key: &[u8],
+        mut visible: impl FnMut(&Entry) -> bool,
+    ) -> Result<Vec<IndexRowRef>> {
         // Descend to the leaf whose physical-key range *starts* at or below
         // the search key. With physical separators throughout, navigation
         // keyed on `logical_key` always lands on a leaf whose first entry's
@@ -671,14 +739,13 @@ impl BtreeIndex {
                     if let Entry::Leaf {
                         logical_key: key,
                         row,
-                        dead,
                         ..
                     } = entry
                     {
                         if first_entry_key.is_none() {
                             first_entry_key = Some(key.clone());
                         }
-                        if *dead {
+                        if !visible(entry) {
                             continue;
                         }
                         if key.as_slice() == logical_key {
@@ -713,6 +780,28 @@ impl BtreeIndex {
     }
 
     pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<IndexRowRef>> {
+        self.range_scan_filter(start, end, |entry| entry.physically_live())
+    }
+
+    pub fn range_scan_visible(
+        &self,
+        tx_status: &ConcurrentTxStatus,
+        snapshot: &Snapshot,
+        owner: Option<TxId>,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<IndexRowRef>> {
+        self.range_scan_filter(start, end, |entry| {
+            entry_visible(entry, tx_status, snapshot, owner)
+        })
+    }
+
+    fn range_scan_filter(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        mut visible: impl FnMut(&Entry) -> bool,
+    ) -> Result<Vec<IndexRowRef>> {
         let mut out = Vec::new();
         let mut leaf_id = self.find_leaf(self.meta()?.root_page_id, start)?;
         loop {
@@ -724,16 +813,13 @@ impl BtreeIndex {
                 let header = Self::read_page_header(page)?;
                 let mut last_key: Option<Vec<u8>> = None;
                 for entry in self.read_entries(page)? {
+                    if !visible(&entry) {
+                        continue;
+                    }
                     if let Entry::Leaf {
-                        logical_key,
-                        row,
-                        dead,
-                        ..
+                        logical_key, row, ..
                     } = entry
                     {
-                        if dead {
-                            continue;
-                        }
                         if logical_key.as_slice() >= start && logical_key.as_slice() < end {
                             out.push(row);
                         }
@@ -841,7 +927,8 @@ impl BtreeIndex {
                 logical_key: logical_key.to_vec(),
                 row,
                 physical,
-                dead: false,
+                create_tx: tx_id,
+                delete_tx: TxId::ZERO,
             });
             entries.sort_by(|a, b| a.compare(b));
             // Pick a split position that does not cleave a duplicate-key run
@@ -1099,10 +1186,7 @@ impl BtreeIndex {
         let entry_count = entries.len();
         for entry in entries {
             match entry {
-                Entry::Leaf { physical, dead, .. } => {
-                    if dead {
-                        continue;
-                    }
+                Entry::Leaf { physical, .. } => {
                     if let Some(prev) = &last
                         && prev.as_slice() > physical.as_slice()
                     {
@@ -1284,10 +1368,17 @@ impl BtreeIndex {
                 logical_key,
                 row,
                 physical,
-                dead,
+                create_tx,
+                delete_tx,
             } = entry
             {
-                page.insert_cell(&LeafCell::encode(logical_key, *row, physical, *dead))?;
+                page.insert_cell(&LeafCell::encode(
+                    logical_key,
+                    *row,
+                    physical,
+                    *create_tx,
+                    *delete_tx,
+                ))?;
             }
         }
         Ok(())
@@ -1433,7 +1524,8 @@ enum Entry {
         logical_key: Vec<u8>,
         row: IndexRowRef,
         physical: Vec<u8>,
-        dead: bool,
+        create_tx: TxId,
+        delete_tx: TxId,
     },
     Internal {
         separator: Vec<u8>,
@@ -1476,42 +1568,54 @@ impl Entry {
         }
     }
 
-    fn is_dead_leaf(&self) -> bool {
-        matches!(self, Entry::Leaf { dead: true, .. })
+    fn physically_live(&self) -> bool {
+        matches!(self, Entry::Leaf { delete_tx, .. } if *delete_tx == TxId::ZERO)
+    }
+
+    fn is_committed_deleted_before(&self, tx_status: &ConcurrentTxStatus, horizon: Csn) -> bool {
+        match self {
+            Entry::Leaf { delete_tx, .. } if *delete_tx != TxId::ZERO => {
+                matches!(tx_status.state(*delete_tx), TxState::Committed(csn) if csn < horizon)
+            }
+            _ => false,
+        }
     }
 }
 
 struct LeafCell;
 struct InternalCell;
 
-const LEAF_DEAD_FLAG: u16 = 0x8000;
-
 impl LeafCell {
-    fn encode(logical_key: &[u8], row: IndexRowRef, physical: &[u8], dead: bool) -> Vec<u8> {
-        let mut out = Vec::with_capacity(26 + logical_key.len() + physical.len());
+    fn encode(
+        logical_key: &[u8],
+        row: IndexRowRef,
+        physical: &[u8],
+        create_tx: TxId,
+        delete_tx: TxId,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(42 + logical_key.len() + physical.len());
         out.extend_from_slice(&(logical_key.len() as u16).to_le_bytes());
-        let physical_len = (physical.len() as u16) | if dead { LEAF_DEAD_FLAG } else { 0 };
-        out.extend_from_slice(&physical_len.to_le_bytes());
+        out.extend_from_slice(&(physical.len() as u16).to_le_bytes());
         out.extend_from_slice(&row.row_id.0.to_le_bytes());
         out.extend_from_slice(&row.tuple.page_id.0.to_le_bytes());
         out.extend_from_slice(&row.tuple.slot.to_le_bytes());
         out.extend_from_slice(&row.tuple.generation.0.to_le_bytes());
+        out.extend_from_slice(&create_tx.0.to_le_bytes());
+        out.extend_from_slice(&delete_tx.0.to_le_bytes());
         out.extend_from_slice(logical_key);
         out.extend_from_slice(physical);
         out
     }
 
     fn decode(bytes: &[u8]) -> Result<Entry> {
-        if bytes.len() < 26 {
+        if bytes.len() < 42 {
             return Err(Error::BufferTooSmall {
-                needed: 26,
+                needed: 42,
                 actual: bytes.len(),
             });
         }
         let logical_len = read_u16(bytes, 0)? as usize;
-        let physical_len_raw = read_u16(bytes, 2)?;
-        let dead = physical_len_raw & LEAF_DEAD_FLAG != 0;
-        let physical_len = (physical_len_raw & !LEAF_DEAD_FLAG) as usize;
+        let physical_len = read_u16(bytes, 2)? as usize;
         let row = IndexRowRef {
             row_id: crate::format::RowId(read_u64(bytes, 4)?),
             tuple: TuplePtr::new_with_generation(
@@ -1520,7 +1624,9 @@ impl LeafCell {
                 PageGeneration(read_u32(bytes, 22)?),
             ),
         };
-        let logical_start = 26;
+        let create_tx = TxId(read_u64(bytes, 26)?);
+        let delete_tx = TxId(read_u64(bytes, 34)?);
+        let logical_start = 42;
         let physical_start = logical_start + logical_len;
         let physical_end = physical_start + physical_len;
         if physical_end > bytes.len() {
@@ -1530,7 +1636,8 @@ impl LeafCell {
             logical_key: bytes[logical_start..physical_start].to_vec(),
             row,
             physical: bytes[physical_start..physical_end].to_vec(),
-            dead,
+            create_tx,
+            delete_tx,
         })
     }
 }
@@ -1645,9 +1752,51 @@ impl BtreeIndex {
                     logical_key,
                     physical,
                     ..
-                } => 26 + logical_key.len() + physical.len(),
+                } => 42 + logical_key.len() + physical.len(),
                 Entry::Internal { separator, .. } => 10 + separator.len(),
             })
             .sum()
     }
+}
+
+fn entry_visible(
+    entry: &Entry,
+    tx_status: &ConcurrentTxStatus,
+    snapshot: &Snapshot,
+    owner: Option<TxId>,
+) -> bool {
+    let Entry::Leaf {
+        create_tx,
+        delete_tx,
+        ..
+    } = entry
+    else {
+        return false;
+    };
+    if *create_tx != TxId::ZERO && !tx_status.is_tx_visible(*create_tx, snapshot, owner) {
+        return false;
+    }
+    if *delete_tx == NON_TRANSACTIONAL_DELETE_TX {
+        return false;
+    }
+    if *delete_tx != TxId::ZERO && tx_status.is_tx_visible(*delete_tx, snapshot, owner) {
+        return false;
+    }
+    true
+}
+
+fn delete_marker_visible(
+    delete_tx: TxId,
+    visibility: Option<(&ConcurrentTxStatus, &Snapshot, Option<TxId>)>,
+) -> bool {
+    if delete_tx == TxId::ZERO {
+        return false;
+    }
+    if delete_tx == NON_TRANSACTIONAL_DELETE_TX {
+        return true;
+    }
+    let Some((tx_status, snapshot, owner)) = visibility else {
+        return true;
+    };
+    tx_status.is_tx_visible(delete_tx, snapshot, owner)
 }

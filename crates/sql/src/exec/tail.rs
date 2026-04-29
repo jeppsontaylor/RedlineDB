@@ -418,7 +418,6 @@ pub(crate) fn execute_update(
                 &values,
                 fresh.rowid,
                 new_rowid,
-                &mut session.index_undo,
             )?;
             if let Some(returning) = &plan.returning {
                 returning_rows.push(project_returning_row(
@@ -444,7 +443,7 @@ pub(crate) fn execute_delete(
     plan: &crate::statement::DeletePlan,
     bindings: &[Option<SqlValue>],
 ) -> Result<ExecutionResult> {
-    with_write_tx(conn, |session, tx| {
+    with_write_tx(conn, |_session, tx| {
         let rows = dml_target_rows(conn, tx, &plan.table, &plan.selection, bindings)?;
         let mut count = 0usize;
         let mut returning_rows = Vec::new();
@@ -474,7 +473,6 @@ pub(crate) fn execute_delete(
                 &plan.table,
                 &live,
                 row.rowid,
-                &mut session.index_undo,
             )?;
             count += 1;
         }
@@ -587,10 +585,26 @@ pub(crate) fn build_row(
     bindings: &[Option<SqlValue>],
 ) -> Result<Vec<SqlValue>> {
     let mut values = vec![SqlValue::Null; table.columns.len()];
+    let mut provided = vec![false; table.columns.len()];
     for (ordinal, expr) in columns.iter().copied().zip(row.iter()) {
         values[ordinal] = eval_scalar(expr, &RowContext::Empty, bindings)?;
+        provided[ordinal] = true;
     }
-    build_default_values(table, values)
+    build_default_values_for_omitted(table, values, &provided)
+}
+
+pub(crate) fn build_row_from_values(
+    table: &Arc<TableDef>,
+    row: &[SqlValue],
+    columns: &[usize],
+) -> Result<Vec<SqlValue>> {
+    let mut values = vec![SqlValue::Null; table.columns.len()];
+    let mut provided = vec![false; table.columns.len()];
+    for (ordinal, value) in columns.iter().copied().zip(row.iter()) {
+        values[ordinal] = value.clone();
+        provided[ordinal] = true;
+    }
+    build_default_values_for_omitted(table, values, &provided)
 }
 
 pub(crate) fn build_default_row(table: &Arc<TableDef>) -> Result<Vec<SqlValue>> {
@@ -603,6 +617,22 @@ pub(crate) fn build_default_values(
 ) -> Result<Vec<SqlValue>> {
     for (idx, column) in table.columns.iter().enumerate() {
         if matches!(values[idx], SqlValue::Null)
+            && let Some(default) = &column.default_value
+        {
+            values[idx] = default.clone();
+        }
+    }
+    apply_row_affinity(table, values)
+}
+
+fn build_default_values_for_omitted(
+    table: &Arc<TableDef>,
+    mut values: Vec<SqlValue>,
+    provided: &[bool],
+) -> Result<Vec<SqlValue>> {
+    for (idx, column) in table.columns.iter().enumerate() {
+        if !provided.get(idx).copied().unwrap_or(false)
+            && matches!(values[idx], SqlValue::Null)
             && let Some(default) = &column.default_value
         {
             values[idx] = default.clone();
@@ -729,8 +759,13 @@ fn collect_unique_conflicts(
         }
         if let Some(handle) = crate::exec::index_dml::open_index_handle(conn.engine(), index) {
             let key = crate::exec::index_dml::build_index_key(index, values);
-            let (kernel_guard, hit) =
-                crate::exec::index_dml::probe_unique_for_conflict(&handle, tx, skip_rowid, &key)?;
+            let (kernel_guard, hit) = crate::exec::index_dml::probe_unique_for_conflict(
+                conn.engine(),
+                &handle,
+                tx,
+                skip_rowid,
+                &key,
+            )?;
             if let Some(rowid) = hit {
                 conflicts.push(UniqueConflict {
                     rowid,
@@ -899,7 +934,6 @@ fn apply_upsert_update(
         &values,
         existing.rowid,
         new_rowid,
-        &mut ctx.session.index_undo,
     )?;
     Ok(InsertOutcome::Updated {
         rowid: new_rowid,
@@ -935,7 +969,6 @@ pub(super) fn insert_row_with_resolution(
             table,
             values,
             rowid,
-            &mut session.index_undo,
         )?;
         session.last_insert_rowid = Some(rowid.0 as i64);
         return Ok(InsertOutcome::Inserted {
@@ -967,7 +1000,6 @@ pub(super) fn insert_row_with_resolution(
                             table,
                             &old_row.values,
                             conflict.rowid,
-                            &mut session.index_undo,
                         )?;
                     }
                 }
@@ -982,7 +1014,6 @@ pub(super) fn insert_row_with_resolution(
                 table,
                 values,
                 rowid,
-                &mut session.index_undo,
             )?;
             session.last_insert_rowid = Some(rowid.0 as i64);
             Ok(InsertOutcome::Inserted {

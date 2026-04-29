@@ -218,6 +218,7 @@ pub struct InsertPlan {
     pub table: Arc<TableDef>,
     pub columns: Vec<usize>,
     pub rows: Vec<Vec<Expr>>,
+    pub source_select: Option<Box<SelectPlan>>,
     pub default_values: bool,
     pub returning: Option<Vec<SelectItem>>,
     pub conflict: Option<InsertConflict>,

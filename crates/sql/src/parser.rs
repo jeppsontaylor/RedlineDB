@@ -118,7 +118,7 @@ fn bind_statement(
 ) -> Result<PreparedTemplate> {
     match statement {
         SqlStatement::Query(query) => bind_query(conn, schema, schema_epoch, sql, *query),
-        SqlStatement::Insert(insert) => bind_insert(schema, schema_epoch, sql, insert),
+        SqlStatement::Insert(insert) => bind_insert(conn, schema, schema_epoch, sql, insert),
         SqlStatement::Update(update) => bind_update(schema, schema_epoch, sql, update),
         SqlStatement::Delete(delete) => bind_delete(schema, schema_epoch, sql, delete),
         SqlStatement::CreateTable(create_table) => {

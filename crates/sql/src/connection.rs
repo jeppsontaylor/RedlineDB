@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::fs;
+use std::fs::File;
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,12 +14,15 @@ use redlinedb_kernel::engine::page_heap::VacuumStats;
 use redlinedb_kernel::engine::{
     CheckpointStats, CommitOutcome, Engine, EngineConfig, RecoveryTarget, StorageStatsSnapshot, Txn,
 };
+use redlinedb_kernel::error::Error as KernelError;
 use redlinedb_kernel::txn::Isolation;
 
 use crate::error::{Error, Result};
 use crate::parser::parse_prepared_template;
 use crate::session::{BeginMode, SessionState, UniqueLockTable};
 use crate::statement::{PreparedTemplate, Statement, Step};
+
+const USER_VERSION_FILE: &str = "user_version.redline";
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 struct StatementCacheKey {
@@ -165,6 +171,7 @@ impl Database {
     pub fn create(path: impl AsRef<Path>, opts: DbOptions) -> Result<Arc<Self>> {
         let base = path.as_ref();
         let engine = Engine::create(base, opts.engine)?;
+        save_user_version(base, 0)?;
         let stats_store = StatsStore::new(base);
         let stats = stats_store
             .load()?
@@ -181,13 +188,14 @@ impl Database {
             stats_config: opts.stats,
             query_memory: opts.query_memory,
             optimizer: opts.optimizer,
-            user_version: Mutex::new(0),
+            user_version: Mutex::new(load_user_version(base)?),
         }))
     }
 
     pub fn open(path: impl AsRef<Path>, opts: DbOptions) -> Result<Arc<Self>> {
         let base = path.as_ref();
         let engine = Engine::open(base, opts.engine)?;
+        let user_version = load_user_version(base)?;
         let stats_store = StatsStore::new(base);
         let stats = stats_store
             .load()?
@@ -204,7 +212,7 @@ impl Database {
             stats_config: opts.stats,
             query_memory: opts.query_memory,
             optimizer: opts.optimizer,
-            user_version: Mutex::new(0),
+            user_version: Mutex::new(user_version),
         }))
     }
 
@@ -215,6 +223,7 @@ impl Database {
     ) -> Result<Arc<Self>> {
         let base = path.as_ref();
         let engine = Engine::open_with_recovery_target(base, opts.engine, target)?;
+        let user_version = load_user_version(base)?;
         let stats_store = StatsStore::new(base);
         let stats = stats_store
             .load()?
@@ -231,7 +240,7 @@ impl Database {
             stats_config: opts.stats,
             query_memory: opts.query_memory,
             optimizer: opts.optimizer,
-            user_version: Mutex::new(0),
+            user_version: Mutex::new(user_version),
         }))
     }
 
@@ -290,6 +299,10 @@ impl Database {
         Ok(self.engine.storage_stats()?)
     }
 
+    pub fn integrity_check(&self) -> Result<Vec<String>> {
+        Ok(self.engine.integrity_check()?)
+    }
+
     pub fn tx_status_stats(&self) -> redlinedb_kernel::engine::TxStatusStats {
         self.engine.tx_status_stats()
     }
@@ -314,8 +327,10 @@ impl Database {
         *self.user_version.lock().expect("user_version poisoned")
     }
 
-    pub(crate) fn set_user_version(&self, value: i64) {
+    pub(crate) fn set_user_version(&self, value: i64) -> Result<()> {
+        save_user_version(self.path.as_ref(), value)?;
         *self.user_version.lock().expect("user_version poisoned") = value;
+        Ok(())
     }
 }
 
@@ -367,30 +382,23 @@ impl Connection {
             .tx
             .take()
             .ok_or(Error::TransactionState("no active transaction"))?;
-        // Keep SQL-side index repair only for definite pre-durable failures.
-        // An outcome that may already be committed must not be repaired, or we
-        // would clobber durable index bytes that recovery expects to see.
         match self.db.engine.commit(tx) {
             Ok(CommitOutcome::Committed(_)) => {
-                session.index_undo.clear();
                 session.kernel_unique_guards.clear();
                 session.unique_guards.clear();
                 Ok(())
             }
             Ok(CommitOutcome::MaybeCommitted) => {
-                session.index_undo.clear();
                 session.kernel_unique_guards.clear();
                 session.unique_guards.clear();
                 Err(Error::CommitMaybeCommitted)
             }
             Ok(CommitOutcome::RolledBack) => {
-                session.index_undo.clear();
                 session.kernel_unique_guards.clear();
                 session.unique_guards.clear();
                 Err(Error::TransactionState("transaction rolled back"))
             }
             Err(err) => {
-                crate::exec::replay_index_undo_after_commit_failure(&self.db.engine, &mut session);
                 session.kernel_unique_guards.clear();
                 session.unique_guards.clear();
                 Err(err.into())
@@ -400,16 +408,10 @@ impl Connection {
 
     pub fn rollback(&self) -> Result<()> {
         let mut session = self.session.lock().expect("session poisoned");
-        let mut tx = session
+        let tx = session
             .tx
             .take()
             .ok_or(Error::TransactionState("no active transaction"))?;
-        // Replay any SQL-side index inverses against the live tx BEFORE the
-        // kernel rollback makes the heap mutations invisible. Without this,
-        // rolled-back DELETE/UPDATE leaves the durable dead flag set on the
-        // index entry (hiding committed rows) and rolled-back INSERT leaves
-        // a stale entry that would falsely conflict on the next unique probe.
-        crate::exec::replay_index_undo(&self.db.engine, &mut session, &mut tx);
         let result = self.db.engine.rollback(tx);
         session.kernel_unique_guards.clear();
         session.unique_guards.clear();
@@ -453,8 +455,8 @@ impl Connection {
         self.db.user_version()
     }
 
-    pub(crate) fn set_user_version(&self, value: i64) {
-        self.db.set_user_version(value);
+    pub(crate) fn set_user_version(&self, value: i64) -> Result<()> {
+        self.db.set_user_version(value)
     }
 
     pub(crate) fn schema_epoch(&self) -> redlinedb_kernel::catalog::SchemaEpoch {
@@ -471,6 +473,10 @@ impl Connection {
 
     pub(crate) fn stats_config(&self) -> &StatsConfig {
         self.db.stats_config()
+    }
+
+    pub(crate) fn integrity_check(&self) -> Result<Vec<String>> {
+        self.db.integrity_check()
     }
 
     pub(crate) fn query_memory(&self) -> &QueryMemoryConfig {
@@ -559,6 +565,33 @@ fn hash_optimizer(optimizer: &OptimizerConfig, query_memory: &QueryMemoryConfig)
     optimizer.hash(&mut hasher);
     query_memory.hash(&mut hasher);
     hasher.finish()
+}
+
+fn load_user_version(base: &Path) -> Result<i64> {
+    let path = base.join(USER_VERSION_FILE);
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut text = String::new();
+    File::open(&path)
+        .and_then(|mut file| file.read_to_string(&mut text))
+        .map_err(KernelError::Io)?;
+    text.trim()
+        .parse::<i64>()
+        .map_err(|_| KernelError::InvalidRecord("invalid user_version sidecar").into())
+}
+
+fn save_user_version(base: &Path, value: i64) -> Result<()> {
+    fs::create_dir_all(base).map_err(KernelError::Io)?;
+    let path = base.join(USER_VERSION_FILE);
+    let temp_path = base.join(format!("{USER_VERSION_FILE}.tmp"));
+    {
+        let mut file = File::create(&temp_path).map_err(KernelError::Io)?;
+        writeln!(file, "{value}").map_err(KernelError::Io)?;
+        file.sync_all().map_err(KernelError::Io)?;
+    }
+    fs::rename(&temp_path, &path).map_err(KernelError::Io)?;
+    Ok(())
 }
 
 #[allow(dead_code)]

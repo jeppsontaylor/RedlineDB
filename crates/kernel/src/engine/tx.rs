@@ -1,6 +1,8 @@
+use crate::catalog::IndexId as CatalogIndexId;
 use crate::catalog::SchemaSnapshot;
 use crate::engine::lock::RowKey;
 use crate::format::{Csn, TxId};
+use crate::index::BtreeIndex;
 use crate::txn::{Isolation, Snapshot, TxState};
 use crate::{Error, Result};
 use std::collections::{BTreeSet, HashMap};
@@ -13,9 +15,16 @@ pub struct Txn {
     isolation: Isolation,
     snapshot: Snapshot,
     pending_schema_snapshot: Option<Arc<SchemaSnapshot>>,
+    pending_index_handles: Vec<PendingIndexHandle>,
     row_locks: Vec<RowKey>,
     open: bool,
     lifecycle: Option<Arc<TxnLifecycle>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PendingIndexHandle {
+    Install(CatalogIndexId, Arc<BtreeIndex>),
+    Remove(CatalogIndexId),
 }
 
 impl Txn {
@@ -30,6 +39,7 @@ impl Txn {
             isolation,
             snapshot,
             pending_schema_snapshot: None,
+            pending_index_handles: Vec::new(),
             row_locks: Vec::new(),
             open: true,
             lifecycle: Some(lifecycle),
@@ -61,6 +71,14 @@ impl Txn {
 
     pub(crate) fn pending_schema_snapshot(&self) -> Option<Arc<SchemaSnapshot>> {
         self.pending_schema_snapshot.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn push_pending_index_handle(&mut self, action: PendingIndexHandle) {
+        self.pending_index_handles.push(action);
+    }
+
+    pub(crate) fn pending_index_handles(&self) -> &[PendingIndexHandle] {
+        &self.pending_index_handles
     }
 
     pub(crate) fn ensure_open(&self) -> Result<()> {

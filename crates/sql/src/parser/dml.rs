@@ -1,6 +1,7 @@
 use super::*;
 
 pub(crate) fn bind_insert(
+    _conn: &Connection,
     schema: Arc<SchemaSnapshot>,
     schema_epoch: SchemaEpoch,
     sql: &str,
@@ -25,6 +26,7 @@ pub(crate) fn bind_insert(
     };
 
     let mut rows = Vec::new();
+    let mut source_select = None;
     let mut default_values = false;
     if let Some(source) = insert.source {
         match *source.body {
@@ -37,9 +39,26 @@ pub(crate) fn bind_insert(
                     rows.push(exprs);
                 }
             }
+            SetExpr::Select(select) => {
+                let template = bind_simple_select_query(
+                    Arc::clone(&schema),
+                    schema_epoch,
+                    sql,
+                    select,
+                    source.order_by,
+                    source.limit_clause,
+                    &mut params,
+                )?;
+                let PreparedKind::Select(plan) = template.kind else {
+                    return Err(Error::UnsupportedSql(
+                        "INSERT SELECT source must bind as SELECT".to_owned(),
+                    ));
+                };
+                source_select = Some(Box::new(plan));
+            }
             _ => {
                 return Err(Error::UnsupportedSql(
-                    "INSERT source must be VALUES".to_owned(),
+                    "INSERT source must be VALUES or SELECT".to_owned(),
                 ));
             }
         }
@@ -70,6 +89,7 @@ pub(crate) fn bind_insert(
             table,
             columns,
             rows,
+            source_select,
             default_values,
             returning,
             conflict,

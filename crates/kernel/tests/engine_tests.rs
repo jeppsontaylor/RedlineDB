@@ -5,6 +5,8 @@ use redlinedb_kernel::catalog::{
 };
 use redlinedb_kernel::engine::{CommitOutcome, Engine, EngineConfig};
 use redlinedb_kernel::format::{Csn, RelId, RowId};
+use redlinedb_kernel::index::{BtreeIndex, INDEX_VERSION};
+use redlinedb_kernel::storage::PageFile;
 use redlinedb_kernel::txn::{Isolation, TxState};
 use redlinedb_kernel::wal::{WalConfig, WalPayload, WalReader, WalRecordKind};
 use std::sync::{Arc, Barrier};
@@ -78,6 +80,116 @@ fn storage_stats_snapshot_reports_core_counters() {
     assert!(stats.wal_durable_lsn.0 > 0);
     assert!(stats.buffer.resident_pages >= 1);
     assert!(stats.tx.committed_states >= 1);
+}
+
+#[test]
+fn engine_rebuilds_v1_index_meta_on_open() {
+    let (temp, engine) = test_engine();
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    let table = engine
+        .create_table(
+            &mut tx,
+            CreateTableSpec {
+                schema: None,
+                name: DbName::new("t_migrate"),
+                columns: vec![ColumnSpec {
+                    name: DbName::new("v"),
+                    declared_type: Some("TEXT".to_owned()),
+                    constraints: Vec::new(),
+                    collation: None,
+                    default_value: None,
+                }],
+                constraints: Vec::new(),
+                if_not_exists: false,
+                strict: false,
+                without_rowid: false,
+                normalized_sql: Some("CREATE TABLE t_migrate(v TEXT)".to_owned()),
+            },
+        )
+        .unwrap();
+    engine.commit(tx).unwrap();
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    let row = engine.reserve_row_id();
+    let mut payload = Vec::new();
+    encode_record(&[ValueRef::Text("alpha")], &mut payload).unwrap();
+    engine
+        .insert_for_relation(&mut tx, table.relation_id, row, payload)
+        .unwrap();
+    engine.commit(tx).unwrap();
+
+    let mut tx = engine.begin(Isolation::Snapshot).unwrap();
+    let index = engine
+        .create_index(
+            &mut tx,
+            CreateIndexSpec {
+                schema: None,
+                name: DbName::new("ix_t_migrate_v"),
+                table: QualifiedName {
+                    schema: DbName::new("main"),
+                    name: DbName::new("t_migrate"),
+                },
+                unique: false,
+                columns: vec![IndexColumnSpec {
+                    name: DbName::new("v"),
+                    sort_dir: SortDir::Asc,
+                    collation: None,
+                }],
+                origin: IndexOrigin::User,
+                normalized_sql: Some("CREATE INDEX ix_t_migrate_v ON t_migrate(v)".to_owned()),
+            },
+        )
+        .unwrap();
+    let old_meta = index.meta_page_id.unwrap();
+    engine.commit(tx).unwrap();
+    engine.checkpoint().unwrap();
+    drop(engine);
+
+    let page_file = PageFile::open(
+        temp.path().join("data.redline"),
+        redlinedb_kernel::format::DEFAULT_PAGE_SIZE,
+    )
+    .unwrap();
+    let mut page = page_file.read_page(old_meta).unwrap();
+    redlinedb_kernel::format::bytes::write_u16(page.special_bytes_mut().unwrap(), 4, 1).unwrap();
+    let lsn = page.header().unwrap().page_lsn;
+    page.set_page_lsn(lsn).unwrap();
+    page_file.write_page(&page).unwrap();
+    page_file.sync_data().unwrap();
+    drop(page_file);
+
+    let reopened = Engine::open(
+        temp.path(),
+        EngineConfig {
+            rel_id: RelId(1),
+            wal: WalConfig {
+                segment_bytes: 65536,
+                ..WalConfig::default()
+            },
+            commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
+            lock_shards: 32,
+            busy_timeout: Duration::from_millis(250),
+            heap_lanes: 16,
+            page_size: redlinedb_kernel::format::DEFAULT_PAGE_SIZE,
+            buffer_pool_pages: 256,
+            data_file_name: "data.redline".to_owned(),
+        },
+    )
+    .unwrap();
+    let migrated = reopened
+        .schema_snapshot()
+        .indexes
+        .iter()
+        .find(|idx| idx.name.as_ref() == "ix_t_migrate_v")
+        .unwrap()
+        .clone();
+    let new_meta = migrated.meta_page_id.unwrap();
+    assert_ne!(old_meta, new_meta);
+    assert_eq!(
+        BtreeIndex::format_version(reopened.buffer_pool_for_tests(), new_meta).unwrap(),
+        INDEX_VERSION
+    );
+    assert!(reopened.index_handle(migrated.index_id).is_some());
 }
 
 #[test]

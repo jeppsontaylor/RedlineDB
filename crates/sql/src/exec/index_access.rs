@@ -198,11 +198,8 @@ pub(crate) fn try_match_index_access(
     None
 }
 
-/// Run a point lookup through `BtreeIndex::point_lookup` and return the
-/// surviving rowids after a heap visibility check. Visibility is
-/// enforced by `Engine::get_for_relation`, which honors the tx
-/// snapshot — orphaned index entries (e.g. from a rolled-back insert)
-/// are filtered out here.
+/// Run a point lookup through the index MVCC visibility filter and return
+/// surviving rowids after the heap visibility check.
 pub(crate) fn execute_index_point_lookup(
     engine: &Engine,
     tx: &mut Txn,
@@ -219,7 +216,8 @@ pub(crate) fn execute_index_point_lookup(
         // return here keeps the executor safe under stale snapshots.
         return Ok(Vec::new());
     };
-    let entries = handle.point_lookup(key)?;
+    let entries =
+        handle.point_lookup_visible(engine.tx_status(), tx.snapshot(), Some(tx.id()), key)?;
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         if visible_in_relation(engine, tx, table, entry.row_id)? {
@@ -229,8 +227,7 @@ pub(crate) fn execute_index_point_lookup(
     Ok(out)
 }
 
-/// Run a range scan through `BtreeIndex::range_scan` (half-open
-/// `[start, end)` over leaf cursors) and return surviving rowids.
+/// Run a visible range scan (half-open `[start, end)`) and return surviving rowids.
 pub(crate) fn execute_index_range_scan(
     engine: &Engine,
     tx: &mut Txn,
@@ -242,7 +239,8 @@ pub(crate) fn execute_index_range_scan(
     let Some(handle) = open_handle(engine, index) else {
         return Ok(Vec::new());
     };
-    let entries = handle.range_scan(start, end)?;
+    let entries =
+        handle.range_scan_visible(engine.tx_status(), tx.snapshot(), Some(tx.id()), start, end)?;
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         if visible_in_relation(engine, tx, table, entry.row_id)? {
