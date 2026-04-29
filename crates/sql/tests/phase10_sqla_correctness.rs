@@ -194,6 +194,52 @@ mod phase10_sqla_correctness {
         assert_int(&run_scalar("SELECT 6 / 2"), 3);
     }
 
+    // --- Bug 5: NULL in scalar functions -----------------------------------
+
+    #[test]
+    fn length_of_null_is_null() {
+        assert_null(&run_scalar("SELECT length(NULL)"));
+    }
+
+    #[test]
+    fn length_of_text_still_works() {
+        assert_int(&run_scalar("SELECT length('abc')"), 3);
+    }
+
+    #[test]
+    fn lower_upper_of_null_is_null() {
+        assert_null(&run_scalar("SELECT lower(NULL)"));
+        assert_null(&run_scalar("SELECT upper(NULL)"));
+    }
+
+    #[test]
+    fn abs_of_null_is_null() {
+        assert_null(&run_scalar("SELECT abs(NULL)"));
+    }
+
+    #[test]
+    fn round_of_null_is_null() {
+        assert_null(&run_scalar("SELECT round(NULL)"));
+        assert_null(&run_scalar("SELECT round(NULL, 2)"));
+        assert_null(&run_scalar("SELECT round(1.5, NULL)"));
+    }
+
+    #[test]
+    fn coalesce_skips_null_regression() {
+        // Regression: coalesce(NULL, 1) → 1.
+        assert_int(&run_scalar("SELECT coalesce(NULL, 1)"), 1);
+    }
+
+    #[test]
+    fn coalesce_returns_first_nonnull_text() {
+        assert_text(&run_scalar("SELECT coalesce(NULL, NULL, 'x')"), "x");
+    }
+
+    #[test]
+    fn ifnull_propagates_when_both_null() {
+        assert_null(&run_scalar("SELECT ifnull(NULL, NULL)"));
+    }
+
     // Round-trip: combination of fixes — divide-by-zero in WHERE filter must
     // not panic, and propagated NULL must filter out the row.
     #[test]

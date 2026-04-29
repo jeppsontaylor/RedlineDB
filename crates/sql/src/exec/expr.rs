@@ -741,7 +741,11 @@ fn glob_match(text: &[u8], pattern: &[u8]) -> bool {
 }
 
 fn round_function(values: &[SqlValue]) -> Result<SqlValue> {
-    if values.is_empty() {
+    // SQLite: round(NULL, ...) and round(x, NULL) return NULL.
+    if values.is_empty() || matches!(values[0], SqlValue::Null) {
+        return Ok(SqlValue::Null);
+    }
+    if values.len() > 1 && matches!(values[1], SqlValue::Null) {
         return Ok(SqlValue::Null);
     }
     let value = numeric_value(&values[0])?;
@@ -874,19 +878,35 @@ fn eval_function(
 
     let name = func.name.to_string().to_ascii_lowercase();
     match name.as_str() {
-        "length" => Ok(SqlValue::Integer(
-            value_to_string(values.first().unwrap_or(&SqlValue::Null)).len() as i64,
-        )),
-        "lower" => Ok(SqlValue::Text(Arc::from(
-            value_to_string(values.first().unwrap_or(&SqlValue::Null)).to_ascii_lowercase(),
-        ))),
-        "upper" => Ok(SqlValue::Text(Arc::from(
-            value_to_string(values.first().unwrap_or(&SqlValue::Null)).to_ascii_uppercase(),
-        ))),
+        "length" => match values.first() {
+            // SQLite: length(NULL) is NULL, not 0.
+            Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+            Some(other) => Ok(SqlValue::Integer(value_to_string(other).len() as i64)),
+        },
+        "lower" => match values.first() {
+            Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+            Some(other) => Ok(SqlValue::Text(Arc::from(
+                value_to_string(other).to_ascii_lowercase(),
+            ))),
+        },
+        "upper" => match values.first() {
+            Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+            Some(other) => Ok(SqlValue::Text(Arc::from(
+                value_to_string(other).to_ascii_uppercase(),
+            ))),
+        },
         "abs" => match values.first() {
-            Some(SqlValue::Integer(v)) => Ok(SqlValue::Integer(v.abs())),
+            // SQLite: abs(NULL) is NULL, not an error.
+            Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+            Some(SqlValue::Integer(v)) => Ok(SqlValue::Integer(v.wrapping_abs())),
             Some(SqlValue::Real(v)) => Ok(SqlValue::Real(v.abs())),
-            _ => Err(Error::DatatypeMismatch),
+            // Coerce text / blob to numeric then abs (SQLite implicit-numeric).
+            Some(SqlValue::Text(_)) | Some(SqlValue::Blob(_)) => {
+                match numeric_value(values.first().unwrap()) {
+                    Ok(v) => Ok(SqlValue::Real(v.abs())),
+                    Err(_) => Ok(SqlValue::Real(0.0)),
+                }
+            }
         },
         "coalesce" | "ifnull" => {
             for value in values {
@@ -907,9 +927,11 @@ fn eval_function(
             }
         }
         "round" => round_function(&values),
-        "hex" => Ok(SqlValue::Text(Arc::from(hex_value(
-            values.first().unwrap_or(&SqlValue::Null),
-        )))),
+        "hex" => match values.first() {
+            // SQLite: hex(NULL) is NULL, not the empty string.
+            Some(SqlValue::Null) | None => Ok(SqlValue::Null),
+            Some(other) => Ok(SqlValue::Text(Arc::from(hex_value(other)))),
+        },
         "quote" => Ok(SqlValue::Text(Arc::from(quote_value(
             values.first().unwrap_or(&SqlValue::Null),
         )))),
