@@ -3,7 +3,7 @@ use redlinedb_kernel::catalog::{
     ColumnConstraintSpec, ColumnSpec, ConflictAction, CreateIndexSpec, CreateTableSpec, DbName,
     IndexColumnSpec, IndexOrigin, QualifiedName, SchemaId, SortDir, ValueRef, encode_record,
 };
-use redlinedb_kernel::engine::{Engine, EngineConfig};
+use redlinedb_kernel::engine::{CommitOutcome, Engine, EngineConfig};
 use redlinedb_kernel::format::{Csn, RelId, RowId};
 use redlinedb_kernel::txn::{Isolation, TxState};
 use redlinedb_kernel::wal::{WalConfig, WalPayload, WalReader, WalRecordKind};
@@ -258,7 +258,10 @@ fn same_rowid_in_different_relations_survives_update_delete_rollback_and_vacuum(
         .update_for_relation(&mut tx, rel_a, row, b"a2".to_vec())
         .unwrap();
     engine.delete_for_relation(&mut tx, rel_b, row).unwrap();
-    let delete_csn = engine.commit(tx).unwrap();
+    let delete_csn = match engine.commit(tx).unwrap() {
+        CommitOutcome::Committed(csn) => csn,
+        outcome => panic!("unexpected commit outcome: {outcome:?}"),
+    };
 
     let retained = engine.vacuum_with_horizon(delete_csn).unwrap();
     assert_eq!(retained.dead_rows_removed, 0);
@@ -342,7 +345,10 @@ fn concurrent_disjoint_updates_all_commit() {
                 engine
                     .update(&mut tx, row, format!("new-{idx}").into_bytes())
                     .unwrap();
-                engine.commit(tx).unwrap()
+                match engine.commit(tx).unwrap() {
+                    CommitOutcome::Committed(csn) => csn,
+                    outcome => panic!("unexpected commit outcome: {outcome:?}"),
+                }
             })
         })
         .collect();
@@ -384,7 +390,10 @@ fn concurrent_same_row_snapshot_updates_have_one_winner() {
                     let _ = engine.rollback(tx);
                     return update.map(|_| Csn(0));
                 }
-                engine.commit(tx)
+                engine.commit(tx).map(|outcome| match outcome {
+                    CommitOutcome::Committed(csn) => csn,
+                    CommitOutcome::MaybeCommitted | CommitOutcome::RolledBack => Csn(0),
+                })
             })
         })
         .collect();
@@ -506,7 +515,10 @@ fn concurrent_autocommit_inserts_recover_after_group_commit() {
                     .insert(&mut tx, format!("group-{idx}").into_bytes())
                     .unwrap();
                 barrier.wait();
-                let csn = engine.commit(tx).unwrap();
+                let csn = match engine.commit(tx).unwrap() {
+                    CommitOutcome::Committed(csn) => csn,
+                    outcome => panic!("unexpected commit outcome: {outcome:?}"),
+                };
                 (idx, row, csn)
             })
         })
@@ -646,7 +658,10 @@ fn checkpoint_reopen_restores_tx_frontier_metadata() {
     let row = reopened
         .insert(&mut tx, b"after-frontier".to_vec())
         .unwrap();
-    let csn = reopened.commit(tx).unwrap();
+    let csn = match reopened.commit(tx).unwrap() {
+        CommitOutcome::Committed(csn) => csn,
+        outcome => panic!("unexpected commit outcome: {outcome:?}"),
+    };
     assert!(csn > before.published_csn);
     let mut reader = reopened.begin(Isolation::Snapshot).unwrap();
     assert_eq!(

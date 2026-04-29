@@ -33,6 +33,9 @@ pub enum Error {
     #[error("transaction state error: {0}")]
     TransactionState(&'static str),
 
+    #[error("commit outcome uncertain")]
+    CommitMaybeCommitted,
+
     #[error("constraint violation: {0}")]
     ConstraintViolation(String),
 
@@ -55,6 +58,7 @@ impl PartialEq for Error {
             (Self::ParameterOutOfRange(a), Self::ParameterOutOfRange(b)) => a == b,
             (Self::SchemaChanged, Self::SchemaChanged) => true,
             (Self::TransactionState(a), Self::TransactionState(b)) => a == b,
+            (Self::CommitMaybeCommitted, Self::CommitMaybeCommitted) => true,
             (Self::ConstraintViolation(a), Self::ConstraintViolation(b)) => a == b,
             (Self::DatatypeMismatch, Self::DatatypeMismatch) => true,
             _ => false,

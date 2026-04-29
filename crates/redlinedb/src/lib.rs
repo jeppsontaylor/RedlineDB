@@ -685,8 +685,9 @@ impl<'conn> Transaction<'conn> {
 
     pub fn commit(&mut self) -> Result<()> {
         if !self.committed {
-            self.conn.commit()?;
+            let result = self.conn.commit();
             self.committed = true;
+            result?;
         }
         Ok(())
     }

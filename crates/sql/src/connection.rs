@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use redlinedb_kernel::catalog::{SchemaSnapshot, StatsEpoch, StatsSnapshot, StatsStore};
 use redlinedb_kernel::engine::page_heap::VacuumStats;
 use redlinedb_kernel::engine::{
-    CheckpointStats, Engine, EngineConfig, RecoveryTarget, StorageStatsSnapshot, Txn,
+    CheckpointStats, CommitOutcome, Engine, EngineConfig, RecoveryTarget, StorageStatsSnapshot, Txn,
 };
 use redlinedb_kernel::txn::Isolation;
 
@@ -367,20 +367,27 @@ impl Connection {
             .tx
             .take()
             .ok_or(Error::TransactionState("no active transaction"))?;
-        // Wave 7 P0 #3: a failure inside `engine.commit` (e.g. WAL fsync error
-        // or a failpoint-injected fault) leaves SQL-side index page mutations
-        // visible — `insert_tx`/`delete_mark_tx` already flipped durable bytes
-        // on the leaf page, and the kernel rollback that runs inside
-        // `commit` does not undo physical index mutations. Until the commit
-        // result is in hand we must NOT clear `index_undo`; on `Err` we run
-        // the inverse against a fresh tx so the heap and the physical
-        // indexes stay consistent.
+        // Keep SQL-side index repair only for definite pre-durable failures.
+        // An outcome that may already be committed must not be repaired, or we
+        // would clobber durable index bytes that recovery expects to see.
         match self.db.engine.commit(tx) {
-            Ok(_) => {
+            Ok(CommitOutcome::Committed(_)) => {
                 session.index_undo.clear();
                 session.kernel_unique_guards.clear();
                 session.unique_guards.clear();
                 Ok(())
+            }
+            Ok(CommitOutcome::MaybeCommitted) => {
+                session.index_undo.clear();
+                session.kernel_unique_guards.clear();
+                session.unique_guards.clear();
+                Err(Error::CommitMaybeCommitted)
+            }
+            Ok(CommitOutcome::RolledBack) => {
+                session.index_undo.clear();
+                session.kernel_unique_guards.clear();
+                session.unique_guards.clear();
+                Err(Error::TransactionState("transaction rolled back"))
             }
             Err(err) => {
                 crate::exec::replay_index_undo_after_commit_failure(&self.db.engine, &mut session);

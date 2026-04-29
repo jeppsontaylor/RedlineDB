@@ -1740,15 +1740,13 @@ fn planner_does_not_advertise_index_without_handle() {
     assert_eq!(stmt.step().expect("done"), Step::Done);
 }
 
-/// P0 #3: when `engine.commit` fails after the SQL layer has already
-/// mutated physical index pages, the SQL-side `index_undo` log must
-/// be replayed against a fresh tx. Otherwise an INSERT that raced a
-/// commit-failure would leave a unique-key entry visible on the
-/// index even though the heap row was rolled back, which breaks the
-/// next INSERT of the same key.
+/// P0 #3: when `engine.commit` reports a maybe-committed outcome after
+/// the SQL layer has already mutated physical index pages, we must not
+/// run SQL-side index repair. The durable index entry needs to remain
+/// visible, even though the client still sees an error from the commit.
 #[cfg(feature = "failpoints")]
 #[test]
-fn commit_failure_replays_index_undo() {
+fn commit_failure_surfaces_maybe_committed_without_index_repair() {
     use redlinedb_kernel::engine::arm_commit_failure_for_thread;
     use redlinedb_kernel::failpoints;
     use std::sync::Mutex;
@@ -1782,18 +1780,17 @@ fn commit_failure_replays_index_undo() {
 
     let err = conn
         .execute("INSERT INTO t VALUES (1, 'first')")
-        .expect_err("commit must fail");
+        .expect_err("commit must be ambiguous");
     assert!(
-        format!("{err:?}").contains("commit-failure-replays-index-undo"),
+        format!("{err:?}").contains("commit outcome uncertain"),
         "unexpected error from injected commit failure: {err:?}"
     );
 
-    // Disarm before the next commit so the repair path can run.
+    // Disarm before the next statement; the durable row/index bytes
+    // should remain visible and no repair path should run.
     arm_commit_failure_for_thread(false);
     failpoints::cfg("engine::commit::before_publish", "off").expect("disable commit failpoint");
 
-    conn.execute("INSERT INTO t VALUES (1, 'second')")
-        .expect("re-insert after rollback");
     let mut stmt = conn
         .prepare("SELECT v FROM t WHERE k = 1")
         .expect("prepare");
@@ -1803,11 +1800,20 @@ fn commit_failure_replays_index_undo() {
     }
     assert_eq!(
         rows,
-        vec!["second".to_owned()],
-        "rolled-back INSERT must not leave an orphan row visible"
+        vec!["first".to_owned()],
+        "maybe-committed INSERT must leave the durable row visible"
     );
 
-    // Total row count must match: only the second insert survived.
+    let duplicate = conn
+        .execute("INSERT INTO t VALUES (1, 'second')")
+        .expect_err("duplicate unique key must still conflict");
+    assert!(
+        format!("{duplicate:?}").contains("constraint")
+            || format!("{duplicate:?}").contains("unique"),
+        "unexpected duplicate-key error: {duplicate:?}"
+    );
+
+    // Total row count must match: only the first insert survived.
     let mut stmt = conn
         .prepare("SELECT COUNT(*) FROM t")
         .expect("prepare count");

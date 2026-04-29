@@ -104,3 +104,46 @@ fn engine_commit_before_publish_hook_fires() {
         "engine::commit::before_publish must panic when armed"
     );
 }
+
+/// Lane E smoke: the same hook should also surface a non-panicking
+/// maybe-committed outcome when the action requests `return(...)`.
+#[test]
+fn engine_commit_before_publish_returns_maybe_committed() {
+    use redlinedb_kernel::engine::{
+        CommitOutcome, Engine, EngineConfig, arm_commit_failure_for_thread,
+    };
+
+    let scenario = fail::FailScenario::setup();
+    failpoints::cfg(
+        "engine::commit::before_publish",
+        "return(commit-outcome-uncertain)",
+    )
+    .expect("configure commit failpoint");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let engine = Engine::create(tmp.path(), EngineConfig::default()).expect("create engine");
+    let mut tx = engine
+        .begin(redlinedb_kernel::txn::Isolation::Snapshot)
+        .expect("begin");
+    let row = engine
+        .insert(&mut tx, b"value-1".to_vec())
+        .expect("insert before commit");
+
+    arm_commit_failure_for_thread(true);
+    let outcome = engine.commit(tx).expect("commit outcome");
+    arm_commit_failure_for_thread(false);
+    failpoints::cfg("engine::commit::before_publish", "off").expect("disable commit failpoint");
+    drop(scenario);
+
+    assert_eq!(outcome, CommitOutcome::MaybeCommitted);
+
+    let mut observer = engine
+        .begin(redlinedb_kernel::txn::Isolation::Snapshot)
+        .expect("begin observer");
+    assert_eq!(
+        engine
+            .get(&mut observer, row)
+            .expect("read after maybe commit"),
+        Some(b"value-1".to_vec())
+    );
+}

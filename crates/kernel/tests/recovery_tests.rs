@@ -1,5 +1,5 @@
 use redlinedb_kernel::Error;
-use redlinedb_kernel::engine::{Engine, EngineConfig};
+use redlinedb_kernel::engine::{CommitOutcome, Engine, EngineConfig};
 use redlinedb_kernel::format::{Csn, RelId, RowId};
 use redlinedb_kernel::txn::Isolation;
 use redlinedb_kernel::wal::{WalConfig, WalPayload};
@@ -227,7 +227,10 @@ fn recovered_engine_allocates_above_recovered_ids() {
     let reopened = Engine::open(temp.path(), config()).unwrap();
     let mut tx = reopened.begin(Isolation::Snapshot).unwrap();
     let new_row = reopened.insert(&mut tx, b"new".to_vec()).unwrap();
-    let csn = reopened.commit(tx).unwrap();
+    let csn = match reopened.commit(tx).unwrap() {
+        CommitOutcome::Committed(csn) => csn,
+        outcome => panic!("unexpected commit outcome: {outcome:?}"),
+    };
     assert!(new_row > old_row);
     assert!(csn.0 > 1);
 }

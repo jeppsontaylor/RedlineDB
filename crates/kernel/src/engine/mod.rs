@@ -148,6 +148,13 @@ pub enum CommitDurability {
     UnsafeDev,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitOutcome {
+    Committed(Csn),
+    RolledBack,
+    MaybeCommitted,
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         let parallelism = std::thread::available_parallelism()
@@ -495,7 +502,7 @@ impl Engine {
             .delete_for_relation(tx.id(), tx.snapshot(), &self.txs, rel_id, row_id, Lsn(1))
     }
 
-    pub fn commit(&self, mut tx: Txn) -> Result<Csn> {
+    pub fn commit(&self, mut tx: Txn) -> Result<CommitOutcome> {
         tx.ensure_open()?;
         let pending_schema = tx.pending_schema_snapshot();
         if let Some(snapshot) = pending_schema.as_deref() {
@@ -538,55 +545,49 @@ impl Engine {
             return Err(err);
         }
 
-        // Lane E failpoint: THE critical hook - WAL fsync has acked but
-        // the CSN has not been published yet. Crashing here lets
-        // harnesses prove recovery republishes the committed CSN
-        // watermark from the WAL even though no in-memory observer
-        // ever saw the commit. Lane KH P0 #3 extends this with the
-        // closure form so the SQL-side commit-failure rollback test
-        // can configure `return(arg)` to make commit return Err
-        // without panicking — required to drive the index-undo repair
-        // path the SQL layer now installs. The fail crate registry is
-        // process-wide, so to keep parallel tests in the same binary
-        // unaffected the closure gates the actual injection on a
-        // thread-local flag that only the arming test sets; on every
-        // other thread the closure performs the success path verbatim
-        // and returns `Ok(csn)`.
-        let pending_schema_for_closure = pending_schema.clone();
-        let _ = &pending_schema_for_closure;
+        // Lane E failpoint: WAL fsync has acked but the CSN is not yet
+        // visible to in-memory observers. The injected path returns
+        // `MaybeCommitted` after publishing the commit locally, so higher
+        // layers can surface the uncertainty without replaying any SQL-side
+        // index repair.
+        let _pending_schema_for_closure = pending_schema.clone();
         crate::fail_point!("engine::commit::before_publish", |arg: Option<String>| {
             if !commit_failure_armed_for_thread() {
-                // Not the arming thread; behave as if the failpoint
-                // were disarmed by completing the success path the
-                // body just below would take.
-                self.txs.publish_commit(tx.id(), csn);
-                if let Some(snapshot) = pending_schema_for_closure {
-                    let _ = self.catalog_store.save_atomic(&snapshot);
-                    self.catalog.publish(snapshot);
-                }
-                self.release_locks(&mut tx);
-                tx.close();
-                return Ok(csn);
+                let _ = arg;
+                return Ok(self.finish_commit(
+                    &mut tx,
+                    csn,
+                    _pending_schema_for_closure.clone(),
+                    CommitOutcome::Committed(csn),
+                ));
             }
-            // Arming thread: simulate a post-flush failure.
-            self.txs.cancel_reserved_csn(csn);
-            self.txs.abort(tx.id());
-            self.release_locks(&mut tx);
-            tx.close();
-            let detail =
+            let _detail =
                 arg.unwrap_or_else(|| "engine::commit::before_publish injected fault".to_string());
-            Err(Error::Io(std::io::Error::other(detail)))
+            return Ok(self.finish_commit(
+                &mut tx,
+                csn,
+                _pending_schema_for_closure.clone(),
+                CommitOutcome::MaybeCommitted,
+            ));
         });
-        self.txs.publish_commit(tx.id(), csn);
+        Ok(self.finish_commit(&mut tx, csn, pending_schema, CommitOutcome::Committed(csn)))
+    }
 
+    fn finish_commit(
+        &self,
+        tx: &mut Txn,
+        csn: Csn,
+        pending_schema: Option<Arc<crate::catalog::SchemaSnapshot>>,
+        outcome: CommitOutcome,
+    ) -> CommitOutcome {
+        self.txs.publish_commit(tx.id(), csn);
         if let Some(snapshot) = pending_schema {
             let _ = self.catalog_store.save_atomic(&snapshot);
             self.catalog.publish(snapshot);
         }
-
-        self.release_locks(&mut tx);
+        self.release_locks(tx);
         tx.close();
-        Ok(csn)
+        outcome
     }
 
     pub fn rollback(&self, mut tx: Txn) -> Result<()> {
