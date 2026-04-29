@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use redlinedb_bench::Cli;
-use redlinedb_bench::config::{CompareConfig, WorkloadKind};
+use redlinedb_bench::config::{CompareConfig, EngineKind, WorkloadKind};
 
 fn run_spec(engine: redlinedb_bench::config::EngineKind) -> redlinedb_bench::config::RunSpec {
     redlinedb_bench::config::RunSpec {
@@ -59,6 +59,38 @@ fn phase10_v3_configs_register_feature_workloads() {
         assert!(
             config.workloads.contains(&workload),
             "{workload:?} missing from phase10 v3 smoke config"
+        );
+    }
+}
+
+#[test]
+fn phase10_v3_sqlite_compare_config_filters_ann_workloads() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("bench/certification-phase10-v3-compare.toml");
+    let config = CompareConfig::load(&path).expect("load phase10 v3 compare config");
+    assert_eq!(
+        config.engines,
+        vec![EngineKind::Redline, EngineKind::Sqlite]
+    );
+    for workload in [
+        WorkloadKind::JsonPathExtract,
+        WorkloadKind::JsonPathUpdate,
+        WorkloadKind::VectorFlatSearch,
+        WorkloadKind::CommitStormBatched,
+        WorkloadKind::LargeSortSpill,
+    ] {
+        assert!(
+            config.workloads.contains(&workload),
+            "{workload:?} missing from phase10 v3 compare config"
+        );
+    }
+    for workload in [
+        WorkloadKind::VectorAnnSearch,
+        WorkloadKind::VectorAnnSearchDisk,
+    ] {
+        assert!(
+            !config.workloads.contains(&workload),
+            "{workload:?} should be excluded from the SQLite comparison config"
         );
     }
 }
