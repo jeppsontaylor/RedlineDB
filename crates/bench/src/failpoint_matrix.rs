@@ -21,7 +21,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
@@ -359,41 +359,4 @@ mod tests {
         assert_eq!(translate_action("sleep(10)", 1), "sleep(10)");
         assert_eq!(translate_action("50%panic", 1), "50%panic");
     }
-}
-
-/// Public type alias for downstream callers (e.g. integration tests
-/// that want to reload a JSON report and re-evaluate gates).
-pub type Report = FailpointMatrixReport;
-pub type Run = FailpointMatrixRun;
-
-/// Path-based wrapper around [`FailpointMatrixConfig::load`] that keeps
-/// callers from having to import the config module directly.
-pub fn load_config(path: &PathBuf) -> Result<FailpointMatrixConfig> {
-    FailpointMatrixConfig::load(path)
-}
-
-/// Number of cases in the parsed config. Used by smoke tests so that
-/// an accidentally truncated TOML loudly fails CI.
-pub fn case_count(config: &FailpointMatrixConfig) -> usize {
-    config.cases.len()
-}
-
-/// Returns true if every redline-strict case under the report reports
-/// `lost_acked_commits == 0`. Used by the gates module so that the
-/// matrix can be evaluated independently of the runner.
-pub fn evaluate_zero_lost_acked_commits(report: &FailpointMatrixReport) -> bool {
-    report
-        .runs
-        .iter()
-        .filter(|run| run.engine == EngineKind::Redline && run.durability == DurabilityKind::Strict)
-        .all(|run| run.lost_acked_commits == 0)
-}
-
-/// Reload a matrix report from disk and re-evaluate the strict gate.
-pub fn evaluate_zero_lost_acked_commits_from_path(path: &Path) -> Result<bool> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("read failpoint matrix report {}", path.display()))?;
-    let report: FailpointMatrixReport = serde_json::from_str(&raw)
-        .with_context(|| format!("parse failpoint matrix report {}", path.display()))?;
-    Ok(evaluate_zero_lost_acked_commits(&report))
 }
