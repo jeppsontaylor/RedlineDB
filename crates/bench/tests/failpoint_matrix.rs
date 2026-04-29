@@ -14,9 +14,11 @@
 use std::path::PathBuf;
 
 use redlinedb_bench::config::{
-    DurabilityKind, EngineKind, FailpointMatrixArgs, FailpointMatrixConfig,
+    DurabilityKind, EngineKind, ExpectExit, FailpointMatrixArgs, FailpointMatrixCase,
+    FailpointMatrixConfig,
 };
 use redlinedb_bench::failpoint_matrix;
+use redlinedb_bench::failpoint_matrix::ObservedRun;
 
 fn matrix_path() -> PathBuf {
     redlinedb_bench::default_failpoint_matrix_path()
@@ -266,4 +268,179 @@ fn failpoint_action_return_is_honored() {
         "panic action must unwind, distinguishing it from return",
     );
     failpoints::cfg(name, "off").expect("disarm after panic test");
+}
+
+/// Build a synthetic `FailpointMatrixCase` for verdict-only tests.
+///
+/// The runner's three-clause gate (`evaluate_verdict`) is independent
+/// of the spawn pipeline; tests construct synthetic
+/// (`case`, `observed`) pairs to exercise verdict logic without
+/// spawning a child binary. (Spawning a child from the cargo test
+/// harness invokes the test binary itself, which has no
+/// `failpoint-child` subcommand and panics during clap parsing —
+/// that's why the existing end-to-end test has to opt into
+/// `expect_zero_acks = true`.)
+fn synthetic_case(
+    action: &str,
+    expect_child_exit: ExpectExit,
+    expect_zero_acks: bool,
+) -> FailpointMatrixCase {
+    FailpointMatrixCase {
+        name: "synthetic".to_owned(),
+        failpoint: "engine::commit::before_publish".to_owned(),
+        action: action.to_owned(),
+        durabilities: vec![DurabilityKind::Strict],
+        rows: 16,
+        kill_after_n_hits: vec![1],
+        expect_zero_acks,
+        expect_child_exit,
+    }
+}
+
+/// Lane FP reviewer-finding: a TOML case configured with
+/// `action = "abort"` must surface as a configuration error, not as
+/// a silent no-op.
+///
+/// Two-part assertion. (1) The TOML config schema accepts the
+/// keyword (it's a free-form string passed verbatim to fail::cfg) so
+/// loading parses cleanly. (2) The kernel-side `failpoints::cfg`
+/// validator rejects the token before `fail::cfg` ever sees it; the
+/// returned error message names the offending token for ops debugging.
+/// (3) The lane-fp gate, applied to a synthetic observation that
+/// mirrors what the runner sees when the child failed to arm the
+/// failpoint (`exit != 0, acks == 0`), reports `passed = false`
+/// because zero acks without `expect_zero_acks` is a vacuous oracle.
+#[test]
+fn failpoint_matrix_rejects_unknown_action() {
+    // 1. TOML schema parses an `action = "abort"` case literally.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg_path = tmp.path().join("matrix.toml");
+    std::fs::write(
+        &cfg_path,
+        r#"
+durabilities = ["strict"]
+
+[[cases]]
+name = "abort-rejected"
+failpoint = "engine::commit::before_publish"
+action = "abort"
+durabilities = ["strict"]
+rows = 4
+kill_after_n_hits = [1]
+expect_child_exit = "non-zero"
+"#,
+    )
+    .unwrap();
+    let parsed = FailpointMatrixConfig::load(&cfg_path).expect("parse synthetic abort case");
+    assert_eq!(parsed.cases[0].action, "abort");
+
+    // 2. Kernel `failpoints::cfg` validator rejects the token. This
+    // is the boundary the matrix runner crosses inside the child.
+    let cfg_err = redlinedb_kernel::failpoints::cfg("matrix-abort", "abort")
+        .expect_err("abort must be rejected by validator");
+    assert!(
+        cfg_err.to_lowercase().contains("abort"),
+        "validator error names the unsupported token: {cfg_err}"
+    );
+
+    // 3. Verdict on the synthetic observation a runner would see
+    // when the child failed to arm the failpoint and exited 1: zero
+    // acks, zero recovered, non-zero exit. The default
+    // `expect_zero_acks = false` flips passed to false.
+    let case = synthetic_case(
+        "abort",
+        ExpectExit::NonZero,
+        /* expect_zero_acks */ false,
+    );
+    let observed = ObservedRun {
+        child_exit_status: Some(1),
+        child_exit_success: false,
+        acknowledged: 0,
+        recovered: 0,
+        lost_acked_commits: 0,
+    };
+    let (passed, reason) = failpoint_matrix::evaluate_verdict(&case, &observed);
+    assert!(
+        !passed,
+        "abort-action case must NOT pass via the new gate: {reason}"
+    );
+    assert!(
+        reason.contains("expect_zero_acks") || reason.contains("acknowledged=0"),
+        "reason mentions the zero-ack vacuous-oracle check: {reason}"
+    );
+}
+
+/// Lane FP reviewer-finding: when `expect_child_exit = "non-zero"`
+/// but the observed child exit is 0 (clean), the gate must FAIL.
+/// Previously the runner only checked `lost_acked_commits`, so a
+/// case where the child legitimately completed the workload could
+/// still be misclassified.
+#[test]
+fn failpoint_matrix_fails_when_child_exit_unexpected() {
+    let case = synthetic_case(
+        "return",
+        ExpectExit::NonZero,
+        /* expect_zero_acks */ false,
+    );
+    let observed = ObservedRun {
+        child_exit_status: Some(0),
+        child_exit_success: true,
+        acknowledged: 1024, // full ack count, oracle is non-vacuous
+        recovered: 1024,
+        lost_acked_commits: 0,
+    };
+    let (passed, reason) = failpoint_matrix::evaluate_verdict(&case, &observed);
+    assert!(
+        !passed,
+        "child exited cleanly but gate expected non-zero — must FAIL: {reason}"
+    );
+    assert!(
+        reason.contains("expect_child_exit"),
+        "pass_reason must explain the exit-status mismatch: {reason}"
+    );
+}
+
+/// Lane FP reviewer-finding: a case with zero acks AND
+/// `expect_zero_acks = false` (the default) must FAIL because the
+/// gate oracle is vacuous. This is the central anti-false-pass
+/// guarantee: a child that dies before any commit acks is no
+/// evidence about durability and the gate must flag it.
+#[test]
+fn failpoint_matrix_fails_when_zero_acks_without_expect() {
+    let case = synthetic_case(
+        "panic",
+        ExpectExit::NonZero,
+        /* expect_zero_acks */ false,
+    );
+    let observed = ObservedRun {
+        child_exit_status: Some(101),
+        child_exit_success: false,
+        acknowledged: 0,
+        recovered: 0,
+        lost_acked_commits: 0,
+    };
+    let (passed, reason) = failpoint_matrix::evaluate_verdict(&case, &observed);
+    assert!(
+        !passed,
+        "zero acks without expect_zero_acks must fail the gate: {reason}"
+    );
+    assert!(
+        reason.contains("expect_zero_acks"),
+        "pass_reason must mention expect_zero_acks: {reason}"
+    );
+
+    // And the symmetric: same observation, but opt-in to
+    // expect_zero_acks. Now the case passes (kill failed before any
+    // ack, but that was expected).
+    let case_opt_in = synthetic_case(
+        "panic",
+        ExpectExit::NonZero,
+        /* expect_zero_acks */ true,
+    );
+    let (passed_opt_in, reason_opt_in) =
+        failpoint_matrix::evaluate_verdict(&case_opt_in, &observed);
+    assert!(
+        passed_opt_in,
+        "with expect_zero_acks=true the same observation passes: {reason_opt_in}"
+    );
 }

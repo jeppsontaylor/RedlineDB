@@ -193,26 +193,16 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
         std::process::abort();
     }));
 
-    // Arm the failpoint registry. `init` is idempotent and `cfg` only
-    // succeeds when the `failpoints` feature was enabled at compile
-    // time, which we guarantee via the bench's direct dep on
-    // `redlinedb-kernel = { features = ["failpoints"] }`.
-    //
-    // The action string is forwarded VERBATIM to `fail::cfg`. The only
-    // transformation we apply is prepending the `K*` count when
-    // `kill_after_n_hits > 1` so the failpoint fires the K-th time
-    // rather than immediately. Previous revisions silently rewrote
-    // `return` and `abort` to `panic`, which made the
-    // `wal-fsync-skipped` case test panic-mid-fsync rather than
-    // skipped-fsync semantics. See `apply_kill_count`.
+    // Initialise the registry BEFORE we open the engine — `init` is
+    // idempotent and only succeeds when the `failpoints` feature is
+    // compiled in. The actual `cfg` call is deferred until after the
+    // schema is up so the schema-setup commits are NOT counted
+    // against `kill_after_n_hits`. Previously the failpoint was armed
+    // before `CREATE TABLE`, which meant `engine::commit::before_publish`
+    // (and any other commit-path hook) fired during schema creation
+    // and the workload never reached the first INSERT — making
+    // `acked = 0` for every kill case.
     redlinedb_kernel::failpoints::init();
-    let action = apply_kill_count(&args.action, args.kill_after_n_hits);
-    eprintln!(
-        "failpoint-child: arming failpoint={} action={} (raw={})",
-        args.failpoint, action, args.action
-    );
-    redlinedb_kernel::failpoints::cfg(&args.failpoint, &action)
-        .map_err(|err| anyhow::anyhow!("arm failpoint {}: {}", args.failpoint, err))?;
 
     let mut options = redlinedb::OpenOptions::default();
     options.memory.cache_bytes = 8 * 1024 * 1024;
@@ -236,6 +226,38 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
     // Open the ack log with the documented durability contract: see
     // `open_ack_log` for fsync details.
     let mut ack = open_ack_log(&args.ack_log)?;
+
+    // NOW arm the failpoint. For panic-style cases with
+    // `kill_after_n_hits > 1` we route through a counted-callback
+    // failpoint (`cfg_skip_then_panic`) so the workload actually
+    // survives the first K-1 hits and crashes on the K-th. The
+    // `K*panic` grammar in fail 0.5.x means "apply panic up to K
+    // times" — i.e. panic on the FIRST hit — which is the wrong
+    // semantic and is what produced the previous false-pass results
+    // (the workload died during schema setup before any commit
+    // acked, the gate had no oracle, and the case trivially
+    // satisfied `lost <= 0`).
+    //
+    // Other actions (`return`, `off`, `sleep`, etc.) are forwarded
+    // through the string `cfg` path, where the kernel validator
+    // rejects unknown task tokens like `abort` loudly.
+    if args.action.trim() == "panic" && args.kill_after_n_hits > 1 {
+        let skip = (args.kill_after_n_hits - 1) as usize;
+        eprintln!(
+            "failpoint-child: arming failpoint={} action=skip-then-panic (skip={skip}, kill_after_n_hits={})",
+            args.failpoint, args.kill_after_n_hits,
+        );
+        redlinedb_kernel::failpoints::cfg_skip_then_panic(&args.failpoint, skip)
+            .map_err(|err| anyhow::anyhow!("arm failpoint {}: {}", args.failpoint, err))?;
+    } else {
+        let action = apply_kill_count(&args.action, args.kill_after_n_hits);
+        eprintln!(
+            "failpoint-child: arming failpoint={} action={} (raw={})",
+            args.failpoint, action, args.action
+        );
+        redlinedb_kernel::failpoints::cfg(&args.failpoint, &action)
+            .map_err(|err| anyhow::anyhow!("arm failpoint {}: {}", args.failpoint, err))?;
+    }
 
     // Every 16 rows the child also calls `Database::checkpoint()` so
     // failpoints that gate the checkpoint path (`engine::checkpoint`,
@@ -336,21 +358,14 @@ fn run_case(
     let lost_clamped = lost.max(0);
 
     let child_exit_status = status.code();
-    let exit_ok = matches_expected_exit(case.expect_child_exit, &status);
-    let acks_ok = acknowledged > 0 || case.expect_zero_acks;
-    let no_lost = lost_clamped == 0;
-
-    let (passed, pass_reason) = build_verdict(
-        case,
-        exit_ok,
-        acks_ok,
-        no_lost,
+    let observed = ObservedRun {
+        child_exit_status,
+        child_exit_success: status.success(),
         acknowledged,
         recovered,
-        lost_clamped,
-        child_exit_status,
-        status.success(),
-    );
+        lost_acked_commits: lost_clamped,
+    };
+    let (passed, pass_reason) = evaluate_verdict(case, &observed);
 
     Ok(FailpointMatrixRun {
         case: case.name.clone(),
@@ -369,56 +384,76 @@ fn run_case(
     })
 }
 
-fn matches_expected_exit(expect: ExpectExit, status: &std::process::ExitStatus) -> bool {
+/// Snapshot of what the parent observed about a single child run.
+/// The verdict-evaluator pulls everything it needs from this struct,
+/// keeping it independent of `std::process::ExitStatus` so unit tests
+/// can construct synthetic observations without spawning a child.
+#[derive(Debug, Clone)]
+pub struct ObservedRun {
+    pub child_exit_status: Option<i32>,
+    pub child_exit_success: bool,
+    pub acknowledged: usize,
+    pub recovered: usize,
+    pub lost_acked_commits: i64,
+}
+
+fn matches_expected_exit(expect: ExpectExit, observed: &ObservedRun) -> bool {
     match expect {
         ExpectExit::Any => true,
-        ExpectExit::Zero => status.success(),
+        ExpectExit::Zero => observed.child_exit_success,
         // Non-zero covers both an exit code != 0 and signal-deaths
         // (e.g. SIGABRT from the panic hook), where `code()` returns
         // None. A successful exit (code 0) does NOT count as the
         // expected death.
-        ExpectExit::NonZero => !status.success(),
+        ExpectExit::NonZero => !observed.child_exit_success,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_verdict(
-    case: &FailpointMatrixCase,
-    exit_ok: bool,
-    acks_ok: bool,
-    no_lost: bool,
-    acknowledged: usize,
-    recovered: usize,
-    lost: i64,
-    child_exit_status: Option<i32>,
-    success: bool,
-) -> (bool, String) {
+/// Apply the lane-fp three-clause gate to a `(case, observed)` pair.
+///
+/// Pass condition is the AND of:
+///
+/// 1. `child_exit_success` matches `case.expect_child_exit`,
+/// 2. `acknowledged > 0` OR `case.expect_zero_acks == true`,
+/// 3. `lost_acked_commits == 0`.
+///
+/// Returns `(passed, reason)` where `reason` is a human-readable
+/// summary suitable for the per-case JSON report. Public so the
+/// bench-level tests can construct synthetic observations and
+/// exercise the verdict logic without spawning a child binary.
+pub fn evaluate_verdict(case: &FailpointMatrixCase, observed: &ObservedRun) -> (bool, String) {
+    let exit_ok = matches_expected_exit(case.expect_child_exit, observed);
+    let acks_ok = observed.acknowledged > 0 || case.expect_zero_acks;
+    let no_lost = observed.lost_acked_commits == 0;
     let passed = exit_ok && acks_ok && no_lost;
+
     let mut failures: Vec<String> = Vec::new();
     if !exit_ok {
-        let observed = format_status(child_exit_status, success);
+        let observed_str = format_status(observed.child_exit_status, observed.child_exit_success);
         failures.push(format!(
-            "child exit {observed} did not match expect_child_exit={:?}",
+            "child exit {observed_str} did not match expect_child_exit={:?}",
             case.expect_child_exit
         ));
     }
     if !acks_ok {
-        failures.push(format!(
+        failures.push(
             "acknowledged=0 with expect_zero_acks=false (oracle would be vacuous; \
              set expect_zero_acks=true if the failpoint legitimately fires before \
-             any commit acks)",
-        ));
+             any commit acks)"
+                .to_owned(),
+        );
     }
     if !no_lost {
         failures.push(format!(
-            "lost_acked_commits={lost} (acknowledged={acknowledged} recovered={recovered})"
+            "lost_acked_commits={} (acknowledged={} recovered={})",
+            observed.lost_acked_commits, observed.acknowledged, observed.recovered,
         ));
     }
     let reason = if passed {
         format!(
-            "exit matched {:?}, acknowledged={acknowledged} (>=1 or expect_zero_acks), \
+            "exit matched {:?}, acknowledged={} (>=1 or expect_zero_acks), \
              lost_acked_commits=0",
-            case.expect_child_exit
+            case.expect_child_exit, observed.acknowledged,
         )
     } else {
         format!("verdict=FAIL: {}", failures.join("; "))

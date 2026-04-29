@@ -50,6 +50,12 @@ durabilities = ["strict", "normal"]
 rows = 1024
 kill_after_n_hits = [1, 5, 25]
 expect_child_exit = "non-zero"
+# kill_after_n_hits=1 panics on the FIRST WAL write, which happens
+# inside the workload's first INSERT commit before that commit
+# returns Ok — so acked=0 even though the commit may have durably
+# logged. The kill_after=5/25 variants survive several inserts
+# (acked > 0) and exercise the gate non-vacuously.
+expect_zero_acks = true
 
 [[cases]]
 name = "wal-fsync-skipped"
@@ -72,6 +78,10 @@ durabilities = ["strict", "normal"]
 rows = 1024
 kill_after_n_hits = [1, 5, 25]
 expect_child_exit = "non-zero"
+# Same as wal-write-torn: kill_after=1 panics inside the workload's
+# very first commit before it acks. The kill_after=5/25 cases see
+# acks > 0 and exercise the gate fully.
+expect_zero_acks = true
 
 [[cases]]
 name = "heap-mutation-kill"
@@ -81,6 +91,7 @@ durabilities = ["strict"]
 rows = 1024
 kill_after_n_hits = [1, 5, 25]
 expect_child_exit = "non-zero"
+expect_zero_acks = true
 
 [[cases]]
 name = "index-insert-kill"
@@ -90,6 +101,7 @@ durabilities = ["strict"]
 rows = 1024
 kill_after_n_hits = [1, 5, 25]
 expect_child_exit = "non-zero"
+expect_zero_acks = true
 
 [[cases]]
 name = "catalog-rename-kill"

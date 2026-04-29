@@ -66,6 +66,50 @@ pub fn cfg(_name: &str, _action: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Configure `name` so that the first `skip_hits` invocations are
+/// no-ops and the very next one panics, killing the process.
+///
+/// This is the building block the bench failpoint-matrix runner uses
+/// to implement `kill_after_n_hits > 1`. The fail crate's `K*action`
+/// grammar means "apply action up to K times" — i.e. `5*panic` panics
+/// on the FIRST hit and stays armed for 4 more — which is the wrong
+/// semantic for "let the workload survive K-1 hits then crash on the
+/// K-th". A counted-callback failpoint expresses the right semantic
+/// without needing to extend the fail grammar.
+///
+/// Internally we register a `cfg_callback` whose closure increments
+/// an atomic counter and panics once the counter passes `skip_hits`.
+/// The callback's owning `Arc` is leaked into the registry the way
+/// `fail::cfg_callback` does normally — there is no need for a
+/// separate cleanup path because the failpoint is armed for the
+/// lifetime of the child process.
+///
+/// `skip_hits == 0` is equivalent to `cfg(name, "panic")` (panics on
+/// the first hit). Callers should prefer the string form when they
+/// don't need a count.
+#[cfg(feature = "failpoints")]
+pub fn cfg_skip_then_panic(name: &str, skip_hits: usize) -> Result<(), String> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_for_closure = Arc::clone(&counter);
+    let skip = skip_hits;
+    let name_for_panic = name.to_owned();
+    fail::cfg_callback(name, move || {
+        let current = counter_for_closure.fetch_add(1, Ordering::SeqCst);
+        if current >= skip {
+            panic!("failpoint {name_for_panic:?} fired (count={current}, skip={skip})");
+        }
+    })
+}
+
+/// Counted-skip variant (no-op when feature is disabled).
+#[cfg(not(feature = "failpoints"))]
+pub fn cfg_skip_then_panic(_name: &str, _skip_hits: usize) -> Result<(), String> {
+    Ok(())
+}
+
 /// Validate an action string against the `fail` 0.5.x grammar.
 ///
 /// Grammar (matching `fail::Action::from_str`):
