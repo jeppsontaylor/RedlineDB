@@ -5,6 +5,7 @@ RUN apt-get update \
     ca-certificates \
     procps \
     sqlite3 \
+    strace \
     python3 \
     python3-pip \
   && python3 -m pip install --no-cache-dir matplotlib numpy pandas \
