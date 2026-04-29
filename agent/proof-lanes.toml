@@ -62,7 +62,6 @@ commands = [
   "rtk cargo run -p redlinedb-bench -- recover-matrix --config crates/bench/bench/recovery-matrix.toml --out target/bench/recovery-matrix.json --seed 7",
 ]
 
-# TODO Lane E: failpoint-matrix subcommand and config TBD
 [phase9-failpoint-matrix]
 commands = [
   "rtk cargo run -p redlinedb-bench -- failpoint-matrix --config crates/bench/bench/failpoint-matrix.toml --out target/bench/failpoint-matrix.json --seed 7",

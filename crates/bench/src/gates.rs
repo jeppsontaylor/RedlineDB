@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::config::{DurabilityKind, EngineKind, WorkloadKind};
+use crate::failpoint_matrix::FailpointMatrixReport;
 use crate::report::RunRecord;
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +108,52 @@ fn gate_writer_advantage(records: &[RunRecord]) -> GateResult {
         passed,
         detail: "redline writers-disjoint throughput exceeds sqlite by 1.5x at 8 threads"
             .to_owned(),
+    }
+}
+
+/// Lane E gate: every redline-strict failpoint matrix case must report
+/// `lost_acked_commits == 0`. Returned as a [`GateResult`] so it
+/// composes with the rest of the bench harness's gate pipeline.
+pub fn gate_zero_lost_acked_commits(report: &FailpointMatrixReport) -> GateResult {
+    let mut offenders: Vec<String> = Vec::new();
+    for run in &report.runs {
+        if run.engine == EngineKind::Redline
+            && run.durability == DurabilityKind::Strict
+            && run.lost_acked_commits > 0
+        {
+            offenders.push(format!(
+                "{} (failpoint={}, kill_after_n_hits={}, acked={}, recovered={}, lost={})",
+                run.case,
+                run.failpoint,
+                run.kill_after_n_hits,
+                run.acknowledged,
+                run.recovered,
+                run.lost_acked_commits
+            ));
+        }
+    }
+    let passed = offenders.is_empty();
+    let detail = if passed {
+        format!(
+            "all {} redline-strict failpoint cases reported zero lost acked commits",
+            report
+                .runs
+                .iter()
+                .filter(|run| run.engine == EngineKind::Redline
+                    && run.durability == DurabilityKind::Strict)
+                .count()
+        )
+    } else {
+        format!(
+            "{} redline-strict cases lost acked commits: [{}]",
+            offenders.len(),
+            offenders.join("; ")
+        )
+    };
+    GateResult {
+        name: "failpoint_zero_lost_acked_commits".to_owned(),
+        passed,
+        detail,
     }
 }
 

@@ -81,6 +81,10 @@ impl ControlStore {
     }
 
     fn write_named(&self, name: &str, control: &ControlFile) -> Result<()> {
+        // Lane E failpoint: armed before the control-file generation lands on
+        // disk. Crashing here forces the dual-control-file recovery path to
+        // fall back to the previous generation's checksum-valid image.
+        crate::fail_point!("storage::control::write");
         let path = self.dir.join(name);
         let bytes = control.encode()?;
         let mut file = OpenOptions::new()

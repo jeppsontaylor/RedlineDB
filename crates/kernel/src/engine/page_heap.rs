@@ -516,6 +516,11 @@ impl PageBackedHeap {
                             // signals recovery replay where we must NOT append
                             // a new WAL record.
                             if lsn != Lsn::ZERO {
+                                // Lane E failpoint: armed at the moment a heap
+                                // mutation would emit a WAL PageImage record.
+                                // Crashing here yields a page that took the
+                                // mutation in memory but never reached the WAL.
+                                crate::fail_point!("heap::mutation");
                                 let snapshot = staged_page.clone();
                                 let generation = snapshot.header()?.generation;
                                 // LSN sentinel: legit init. The page-LSN field

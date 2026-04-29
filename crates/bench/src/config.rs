@@ -22,9 +22,12 @@ pub enum Command {
     Compat(CompatArgs),
     Recover(RecoverArgs),
     RecoverMatrix(RecoverMatrixArgs),
+    FailpointMatrix(FailpointMatrixArgs),
     Gates(GatesArgs),
     #[command(hide = true)]
     RecoverChild(RecoverChildArgs),
+    #[command(hide = true)]
+    FailpointChild(FailpointChildArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -156,6 +159,44 @@ pub struct RecoverChildArgs {
     pub rows: usize,
     #[arg(long, default_value_t = 32)]
     pub checkpoint_every_rows: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct FailpointMatrixArgs {
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub out: PathBuf,
+    #[arg(long, default_value_t = 7)]
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct FailpointChildArgs {
+    #[arg(long, value_enum)]
+    pub engine: EngineKind,
+    #[arg(long, value_enum)]
+    pub durability: DurabilityKind,
+    #[arg(long)]
+    pub db_dir: PathBuf,
+    #[arg(long)]
+    pub ack_log: PathBuf,
+    /// Name of the failpoint to arm (e.g. `engine::commit::before_publish`).
+    #[arg(long)]
+    pub failpoint: String,
+    /// Action to inject. Currently `panic`, `return`, or `abort` are
+    /// recognised; everything else is forwarded verbatim to `fail::cfg`.
+    #[arg(long)]
+    pub action: String,
+    /// Number of rows to attempt. The child returns naturally if it
+    /// finishes the workload before the failpoint fires.
+    #[arg(long, default_value_t = 1024)]
+    pub rows: usize,
+    /// Stop arming the failpoint after this many hits, then exit cleanly.
+    /// Used for `kill_after_n_hits` cases that survive the configured
+    /// number of fires without dying.
+    #[arg(long, default_value_t = 1)]
+    pub kill_after_n_hits: u64,
 }
 
 #[derive(
@@ -311,6 +352,31 @@ pub struct RecoveryMatrixCase {
     pub checkpoint_every_rows: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct FailpointMatrixConfig {
+    #[serde(default = "default_failpoint_durabilities")]
+    pub durabilities: Vec<DurabilityKind>,
+    pub cases: Vec<FailpointMatrixCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FailpointMatrixCase {
+    pub name: String,
+    /// Failpoint name registered in the kernel (e.g.
+    /// `engine::commit::before_publish`).
+    pub failpoint: String,
+    /// One of `panic`, `return`, `abort`, or any literal `fail` crate
+    /// action string. The harness translates the high-level keywords
+    /// into safe `fail::cfg` directives.
+    pub action: String,
+    #[serde(default = "default_failpoint_durabilities")]
+    pub durabilities: Vec<DurabilityKind>,
+    #[serde(default = "default_rows")]
+    pub rows: usize,
+    #[serde(default = "default_failpoint_kill_after_n_hits")]
+    pub kill_after_n_hits: Vec<u64>,
+}
+
 impl CompareConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
@@ -374,6 +440,27 @@ fn default_recovery_kill_windows() -> Vec<u64> {
 
 fn default_checkpoint_every_rows() -> usize {
     32
+}
+
+fn default_failpoint_durabilities() -> Vec<DurabilityKind> {
+    vec![DurabilityKind::Strict]
+}
+
+fn default_failpoint_kill_after_n_hits() -> Vec<u64> {
+    vec![1]
+}
+
+impl FailpointMatrixConfig {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("read failpoint matrix {}", path.display()))?;
+        let config = toml::from_str::<Self>(&raw)
+            .with_context(|| format!("parse failpoint matrix {}", path.display()))?;
+        if config.cases.is_empty() {
+            bail!("failpoint matrix must define at least one case");
+        }
+        Ok(config)
+    }
 }
 
 impl FromStr for WorkloadKind {

@@ -33,6 +33,9 @@ phase9-smoke:
 phase9-certify:
   rtk cargo run -p redlinedb-bench -- certify --config crates/bench/bench/certification.toml --out-dir target/bench/certify-certification --seed 7 --repetitions 5 --warmup 1
 
+phase9-failpoint-matrix:
+  rtk cargo run -p redlinedb-bench -- failpoint-matrix --config crates/bench/bench/failpoint-matrix.toml --out target/bench/failpoint-matrix.json --seed 7
+
 security:
   rtk cargo audit
   rtk cargo deny check

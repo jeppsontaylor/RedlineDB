@@ -1,0 +1,72 @@
+# Lane E failpoint-matrix scenarios.
+#
+# Each `[[cases]]` block names one kernel failpoint, the action the
+# `fail` crate should inject when it fires, and the durability + hit
+# count parameters to multiply across. The bench harness spawns a
+# child per (durability, kill_after_n_hits) tuple, arms the named
+# failpoint, runs the INSERT-then-fsync-ack workload, and on child
+# death verifies that every fsynced ack row is recoverable.
+#
+# `kill_after_n_hits` controls the `K*action` prefix passed to
+# `fail::cfg`; values > 1 let the workload survive the first K-1
+# fires and crash on the K-th, exposing late-stage divergence.
+#
+# Default `durabilities` covers the only contract Lane E gates on
+# (`strict`); cases that explicitly list `durabilities = ["strict",
+# "normal"]` extend coverage for non-fsync-skipping variants.
+
+[[cases]]
+name = "wal-write-torn"
+failpoint = "wal::write_encoded"
+action = "panic"
+durabilities = ["strict", "normal"]
+rows = 1024
+kill_after_n_hits = [1, 5, 25]
+
+[[cases]]
+name = "wal-fsync-skipped"
+failpoint = "wal::flush"
+action = "return"
+durabilities = ["strict"]
+rows = 1024
+kill_after_n_hits = [1, 5, 25]
+
+[[cases]]
+name = "commit-publish-kill"
+failpoint = "engine::commit::before_publish"
+action = "abort"
+durabilities = ["strict", "normal"]
+rows = 1024
+kill_after_n_hits = [1, 5, 25]
+
+[[cases]]
+name = "heap-mutation-kill"
+failpoint = "heap::mutation"
+action = "abort"
+durabilities = ["strict"]
+rows = 1024
+kill_after_n_hits = [1, 5, 25]
+
+[[cases]]
+name = "index-insert-kill"
+failpoint = "index::insert"
+action = "abort"
+durabilities = ["strict"]
+rows = 1024
+kill_after_n_hits = [1, 5, 25]
+
+[[cases]]
+name = "catalog-rename-kill"
+failpoint = "catalog::save::rename"
+action = "abort"
+durabilities = ["strict"]
+rows = 64
+kill_after_n_hits = [1]
+
+[[cases]]
+name = "checkpoint-kill"
+failpoint = "engine::checkpoint"
+action = "abort"
+durabilities = ["strict"]
+rows = 1024
+kill_after_n_hits = [1, 3]
