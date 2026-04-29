@@ -368,6 +368,8 @@ impl Connection {
             .take()
             .ok_or(Error::TransactionState("no active transaction"))?;
         let result = self.db.engine.commit(tx);
+        session.index_undo.clear();
+        session.kernel_unique_guards.clear();
         session.unique_guards.clear();
         result?;
         Ok(())
@@ -375,11 +377,18 @@ impl Connection {
 
     pub fn rollback(&self) -> Result<()> {
         let mut session = self.session.lock().expect("session poisoned");
-        let tx = session
+        let mut tx = session
             .tx
             .take()
             .ok_or(Error::TransactionState("no active transaction"))?;
+        // Replay any SQL-side index inverses against the live tx BEFORE the
+        // kernel rollback makes the heap mutations invisible. Without this,
+        // rolled-back DELETE/UPDATE leaves the durable dead flag set on the
+        // index entry (hiding committed rows) and rolled-back INSERT leaves
+        // a stale entry that would falsely conflict on the next unique probe.
+        crate::exec::replay_index_undo(&self.db.engine, &mut session, &mut tx);
         let result = self.db.engine.rollback(tx);
+        session.kernel_unique_guards.clear();
         session.unique_guards.clear();
         session.failed = false;
         result?;

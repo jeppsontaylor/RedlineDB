@@ -1156,6 +1156,182 @@ mod lane_b {
         assert_index_has_key(&conn, "t_a_uq", &[OwnedValue::Integer(1)]);
         assert_index_missing_key(&conn, "t_a_uq", &[OwnedValue::Integer(2)]);
     }
+
+    /// Regression: rolling back an INSERT must remove the durable index
+    /// entry the SQL DML wrote. Without per-tx index undo, the insert_tx
+    /// page mutation persists past rollback and the next legitimate INSERT
+    /// of the same key fails with `Constraint`.
+    #[test]
+    fn rolled_back_insert_does_not_leave_stale_index_entry() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE UNIQUE INDEX t_a_uq ON t(a)")
+            .expect("create index");
+
+        // Open a tx, insert (1, 'rolled-back'), then roll back.
+        conn.begin(redlinedb_sql::BeginMode::Deferred)
+            .expect("begin");
+        conn.execute("INSERT INTO t VALUES (1, 'rolled-back')")
+            .expect("insert under tx");
+        conn.rollback().expect("rollback");
+
+        // Index must NOT carry a stale entry for key 1.
+        assert_index_missing_key(&conn, "t_a_uq", &[OwnedValue::Integer(1)]);
+
+        // A fresh INSERT of the same UNIQUE key must succeed (no false
+        // conflict from the rolled-back entry).
+        conn.execute("INSERT INTO t VALUES (1, 'fresh')")
+            .expect("re-insert after rollback must succeed");
+
+        // And the new row should be visible via both the heap and the index.
+        let mut stmt = conn
+            .prepare("SELECT b FROM t WHERE a = 1")
+            .expect("prepare");
+        assert_eq!(stmt.step().expect("step"), Step::Row);
+        assert_eq!(stmt.column_text(0).expect("b"), "fresh");
+        assert_eq!(stmt.step().expect("done"), Step::Done);
+        assert_index_has_key(&conn, "t_a_uq", &[OwnedValue::Integer(1)]);
+    }
+
+    /// Regression: rolling back a DELETE must clear the dead flag on the
+    /// committed row's index entry. Without index-undo, the delete_mark
+    /// stays durable and indexed reads silently miss the row.
+    #[test]
+    fn rolled_back_delete_does_not_hide_committed_row() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_a_idx ON t(a)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (5, 'five')")
+            .expect("insert + commit");
+
+        conn.begin(redlinedb_sql::BeginMode::Deferred)
+            .expect("begin");
+        conn.execute("DELETE FROM t WHERE a = 5")
+            .expect("delete under tx");
+        conn.rollback().expect("rollback");
+
+        // Heap path: row is back, visible via TableScan.
+        let mut stmt = conn
+            .prepare("SELECT b FROM t WHERE b = 'five'")
+            .expect("prepare heap path");
+        assert_eq!(stmt.step().expect("step"), Step::Row);
+        assert_eq!(stmt.column_text(0).expect("b"), "five");
+        assert_eq!(stmt.step().expect("done"), Step::Done);
+
+        // Index path: row is also back, no longer hidden by a durable dead
+        // flag (the SQL-side undo replayed the inverse undelete_mark).
+        let mut stmt = conn
+            .prepare("SELECT b FROM t WHERE a = 5")
+            .expect("prepare index path");
+        assert_eq!(stmt.step().expect("step"), Step::Row);
+        assert_eq!(stmt.column_text(0).expect("b"), "five");
+        assert_eq!(stmt.step().expect("done"), Step::Done);
+
+        assert_index_has_key(&conn, "t_a_idx", &[OwnedValue::Integer(5)]);
+    }
+
+    /// Regression: rolling back an UPDATE that moved an indexed value must
+    /// keep the OLD index key live — the rolled-back tx delete-marked the
+    /// old entry and inserted a new one; rollback must reverse both.
+    #[test]
+    fn rolled_back_update_restores_old_indexed_value() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_a_idx ON t(a)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (10, 'ten')")
+            .expect("seed");
+
+        conn.begin(redlinedb_sql::BeginMode::Deferred)
+            .expect("begin");
+        conn.execute("UPDATE t SET a = 20 WHERE b = 'ten'")
+            .expect("update under tx");
+        conn.rollback().expect("rollback");
+
+        // Index path: the old key (10) is alive again; the new key (20) is
+        // gone (its insert was rolled back).
+        assert_index_has_key(&conn, "t_a_idx", &[OwnedValue::Integer(10)]);
+        assert_index_missing_key(&conn, "t_a_idx", &[OwnedValue::Integer(20)]);
+
+        // SELECT via the index must still return the original row.
+        let mut stmt = conn
+            .prepare("SELECT b FROM t WHERE a = 10")
+            .expect("prepare");
+        assert_eq!(stmt.step().expect("step"), Step::Row);
+        assert_eq!(stmt.column_text(0).expect("b"), "ten");
+        assert_eq!(stmt.step().expect("done"), Step::Done);
+    }
+
+    /// Regression: with the kernel `UniqueKeyGuard` held across the heap
+    /// insert, two concurrent writers attempting the same UNIQUE key must
+    /// have exactly one succeed and the other surface a `Constraint`.
+    /// Repeated 10x to flush the race window.
+    #[test]
+    fn concurrent_unique_inserts_only_one_succeeds() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        for run in 0..10 {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("concurrent-uq.db");
+            let db = Database::create(&path, DbOptions::default()).expect("create");
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+                .expect("create");
+            conn.execute("CREATE UNIQUE INDEX t_a_uq ON t(a)")
+                .expect("create index");
+            drop(conn);
+
+            // Two threads racing on the same DB file via two SQL connections,
+            // each issuing an INSERT of (1, ...). One must win.
+            let key = run as i64 + 1;
+            let db_a = StdArc::clone(&db);
+            let db_b = StdArc::clone(&db);
+            let handle_a = thread::spawn(move || {
+                let conn = db_a.connect();
+                conn.execute(&format!("INSERT INTO t VALUES ({key}, 'A')"))
+            });
+            let handle_b = thread::spawn(move || {
+                let conn = db_b.connect();
+                conn.execute(&format!("INSERT INTO t VALUES ({key}, 'B')"))
+            });
+            let result_a = handle_a.join().expect("thread A join");
+            let result_b = handle_b.join().expect("thread B join");
+
+            // Exactly one must succeed; the other must surface the unique
+            // violation. Either ordering is acceptable.
+            let successes = [&result_a, &result_b].iter().filter(|r| r.is_ok()).count();
+            assert_eq!(
+                successes, 1,
+                "run {run}: exactly one writer must win; got A={result_a:?} B={result_b:?}"
+            );
+            let failures: Vec<_> = [&result_a, &result_b]
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .collect();
+            assert_eq!(failures.len(), 1);
+            let msg = format!("{:?}", failures[0]);
+            assert!(
+                msg.contains("UNIQUE") || msg.contains("Constraint"),
+                "run {run}: loser must surface unique violation, got {msg}"
+            );
+
+            // The winning row must be in the heap exactly once.
+            let conn = db.connect();
+            let mut stmt = conn
+                .prepare(&format!("SELECT b FROM t WHERE a = {key}"))
+                .expect("prepare");
+            let mut rows = Vec::new();
+            while let Step::Row = stmt.step().expect("step") {
+                rows.push(stmt.column_text(0).expect("b").to_owned());
+            }
+            assert_eq!(rows.len(), 1, "run {run}: exactly one row must commit");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,5 +1583,84 @@ mod lane_c {
             !plan_and.contains("MULTI-INDEX"),
             "multi-index AND must stay off:\n{plan_and}"
         );
+    }
+
+    /// Regression: composite (a, b) index with WHERE a = ? must surface every
+    /// row that shares the leading-key value. The previous upper-bound for the
+    /// half-open range was `prefix || 0x00`, which sorts BEFORE every full
+    /// composite key (because the next part starts with a non-zero type tag),
+    /// so the range returned an empty set.
+    #[test]
+    fn composite_index_leading_prefix_returns_all_rows() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_ab ON t(a, b)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (1, 'x')")
+            .expect("insert 1x");
+        conn.execute("INSERT INTO t VALUES (1, 'y')")
+            .expect("insert 1y");
+        conn.execute("INSERT INTO t VALUES (1, 'z')")
+            .expect("insert 1z");
+        conn.execute("INSERT INTO t VALUES (2, 'x')")
+            .expect("insert 2x");
+
+        // The planner must pick the (a, b) composite index for `WHERE a = 1`.
+        let plan = explain_text(&conn, "SELECT b FROM t WHERE a = 1");
+        assert!(
+            plan.contains("USING INDEX t_ab"),
+            "expected (a,b) index path for leading-only equality, got plan:\n{plan}"
+        );
+
+        let mut stmt = conn
+            .prepare("SELECT b FROM t WHERE a = 1 ORDER BY b")
+            .expect("prepare");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push(stmt.column_text(0).expect("b").to_owned());
+        }
+        assert_eq!(
+            rows,
+            vec!["x".to_owned(), "y".to_owned(), "z".to_owned()],
+            "leading-prefix range must surface every (a=1, *) row"
+        );
+    }
+
+    /// Regression: composite (a, b) index with WHERE a = ? AND b = ? is a
+    /// full-key point lookup; the upper bound must be tight enough to NOT
+    /// surface rows for other `b` values, and lax enough to include the
+    /// requested one.
+    #[test]
+    fn composite_index_leading_prefix_with_explicit_b() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_ab ON t(a, b)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (1, 'x')")
+            .expect("insert 1x");
+        conn.execute("INSERT INTO t VALUES (1, 'y')")
+            .expect("insert 1y");
+        conn.execute("INSERT INTO t VALUES (1, 'z')")
+            .expect("insert 1z");
+        conn.execute("INSERT INTO t VALUES (2, 'x')")
+            .expect("insert 2x");
+
+        // Full-key equality should resolve to a point lookup.
+        let plan = explain_text(&conn, "SELECT b FROM t WHERE a = 1 AND b = 'y'");
+        assert!(
+            plan.contains("USING INDEX t_ab") && plan.contains("PointLookup"),
+            "expected (a,b) IndexPointLookup, got plan:\n{plan}"
+        );
+
+        let mut stmt = conn
+            .prepare("SELECT b FROM t WHERE a = 1 AND b = 'y'")
+            .expect("prepare");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push(stmt.column_text(0).expect("b").to_owned());
+        }
+        assert_eq!(rows, vec!["y".to_owned()]);
     }
 }

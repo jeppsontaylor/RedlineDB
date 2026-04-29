@@ -122,8 +122,12 @@ struct UniqueKeyLockState {
     depth: usize,
 }
 
-pub struct UniqueKeyGuard<'a> {
-    table: &'a UniqueKeyLockTable,
+/// Owns its lock table via `Arc` so the guard can be stored across SQL-side
+/// transaction state (e.g. inside `SessionState`) without lifetime gymnastics.
+/// The guard's `Drop` releases the per-key reservation for `owner`.
+#[derive(Debug)]
+pub struct UniqueKeyGuard {
+    table: Arc<UniqueKeyLockTable>,
     shard: usize,
     key: Vec<u8>,
     owner: u64,
@@ -144,7 +148,7 @@ impl UniqueKeyLockTable {
         }
     }
 
-    pub fn lock(&self, key: &[u8], owner: u64) -> Result<UniqueKeyGuard<'_>> {
+    pub fn lock(self: &Arc<Self>, key: &[u8], owner: u64) -> Result<UniqueKeyGuard> {
         let shard = self.shard(key);
         let mut map = self.shards[shard]
             .lock()
@@ -157,7 +161,7 @@ impl UniqueKeyLockTable {
                     state.owner = Some(owner);
                     state.depth = 1;
                     return Ok(UniqueKeyGuard {
-                        table: self,
+                        table: Arc::clone(self),
                         shard,
                         key,
                         owner,
@@ -166,7 +170,7 @@ impl UniqueKeyLockTable {
                 Some(current) if current == owner => {
                     state.depth += 1;
                     return Ok(UniqueKeyGuard {
-                        table: self,
+                        table: Arc::clone(self),
                         shard,
                         key,
                         owner,
@@ -204,7 +208,7 @@ impl UniqueKeyLockTable {
     }
 }
 
-impl Drop for UniqueKeyGuard<'_> {
+impl Drop for UniqueKeyGuard {
     fn drop(&mut self) {
         self.table
             .unlock(self.shard, std::mem::take(&mut self.key), self.owner);
@@ -360,9 +364,15 @@ impl BtreeIndex {
         let mut physical = KeyBuf::new();
         physical.extend_logical(logical_key);
         physical.append_row_ref_suffix(row);
+        // Navigate by the candidate's *physical* bytes: separators in the tree
+        // are normally logical keys, but a duplicate-key split (where every
+        // entry on a leaf shared one logical key) installs a physical-key
+        // separator instead. Comparing with physical bytes works for both
+        // cases — physical = logical || row_ref_suffix, so it sorts identically
+        // to logical for non-duplicate keys and resolves duplicates by row_id.
         loop {
             let root = self.meta()?.root_page_id;
-            let path = self.find_leaf_path(root, logical_key)?;
+            let path = self.find_leaf_path(root, physical.as_slice())?;
             let leaf_id = *path.last().ok_or(Error::CorruptPage("empty search path"))?;
             let guard = self.inner.buffer.pin(leaf_id)?;
             let mut page = guard.mutable_frame()?;
@@ -374,7 +384,9 @@ impl BtreeIndex {
             if header.kind != PAGE_LEAF_KIND {
                 return Err(Error::CorruptPage("expected leaf page"));
             }
-            if !header.high_key.is_empty() && logical_key >= header.high_key.as_slice() {
+            // Defensive: if the leaf still claims our key belongs to a sibling
+            // (concurrent split window), retry the descent.
+            if !header.high_key.is_empty() && physical.as_slice() >= header.high_key.as_slice() {
                 continue;
             }
             let mut entries = self.read_entries(page_ref)?;
@@ -400,7 +412,7 @@ impl BtreeIndex {
             let required = Self::encoded_entries_len(&entries) + entries.len() * SLOT_LEN;
             if required > body_capacity {
                 drop(page);
-                let path = self.find_leaf_path(self.meta()?.root_page_id, logical_key)?;
+                let path = self.find_leaf_path(self.meta()?.root_page_id, physical.as_slice())?;
                 let leaf_id = *path.last().ok_or(Error::CorruptPage("empty search path"))?;
                 self.split_leaf_and_insert(
                     &path[..path.len().saturating_sub(1)],
@@ -451,60 +463,106 @@ impl BtreeIndex {
         logical_key: &[u8],
         row: IndexRowRef,
     ) -> Result<()> {
+        self.set_dead_flag_tx(tx_id, logical_key, row, true)
+    }
+
+    /// Inverse of [`Self::delete_mark_tx`]: clears the dead flag on the entry
+    /// matching `(logical_key, row)`. Used by SQL-side rollback to undo a
+    /// `delete_mark_tx` that was performed inside a transaction that later
+    /// aborted, so committed readers regain visibility of the index entry.
+    pub fn undelete_mark_tx(
+        &self,
+        tx_id: crate::format::TxId,
+        logical_key: &[u8],
+        row: IndexRowRef,
+    ) -> Result<()> {
+        self.set_dead_flag_tx(tx_id, logical_key, row, false)
+    }
+
+    /// Walk the leaf chain for `logical_key` (using physical-key navigation so
+    /// duplicate-key runs spanning multiple leaves are visited) and flip the
+    /// `dead` flag on the entry that matches `row`. Returns silently if no
+    /// matching entry is found in the requested state.
+    fn set_dead_flag_tx(
+        &self,
+        tx_id: crate::format::TxId,
+        logical_key: &[u8],
+        row: IndexRowRef,
+        target_dead: bool,
+    ) -> Result<()> {
         let _structure = self
             .inner
             .structure_lock
             .lock()
             .map_err(|_| Error::CorruptPage("index structure mutex poisoned"))?;
-        let path = self.find_leaf_path(self.meta()?.root_page_id, logical_key)?;
-        let leaf_id = *path.last().ok_or(Error::CorruptPage("empty search path"))?;
-        let guard = self.inner.buffer.pin(leaf_id)?;
-        let mut page = guard.mutable_frame()?;
-        let page_ref = page
-            .page
-            .as_mut()
-            .ok_or(Error::CorruptPage("resident frame missing page"))?;
-        let header = Self::read_page_header(page_ref)?;
-        if header.kind != PAGE_LEAF_KIND {
-            return Err(Error::CorruptPage("expected leaf page"));
-        }
-        let mut entries = self.read_entries(page_ref)?;
-        let mut changed = false;
-        for entry in &mut entries {
-            if let Entry::Leaf {
-                logical_key: key,
-                row: entry_row,
-                dead,
-                ..
-            } = entry
-                && !*dead
-                && key.as_slice() == logical_key
-                && *entry_row == row
-            {
-                *dead = true;
-                changed = true;
-                break;
+        let mut probe = KeyBuf::new();
+        probe.extend_logical(logical_key);
+        probe.append_row_ref_suffix(row);
+        let path = self.find_leaf_path(self.meta()?.root_page_id, probe.as_slice())?;
+        let mut leaf_id = *path.last().ok_or(Error::CorruptPage("empty search path"))?;
+        loop {
+            let guard = self.inner.buffer.pin(leaf_id)?;
+            let mut page = guard.mutable_frame()?;
+            let page_ref = page
+                .page
+                .as_mut()
+                .ok_or(Error::CorruptPage("resident frame missing page"))?;
+            let header = Self::read_page_header(page_ref)?;
+            if header.kind != PAGE_LEAF_KIND {
+                return Err(Error::CorruptPage("expected leaf page"));
             }
-        }
-        if changed {
-            Self::rewrite_leaf(
-                page_ref,
-                self.descriptor().index_id,
-                &entries,
-                header.left,
-                header.right,
-                header.high_key,
-            )?;
+            let mut entries = self.read_entries(page_ref)?;
+            let mut changed = false;
+            let mut last_key_matches_search = false;
+            for entry in &mut entries {
+                if let Entry::Leaf {
+                    logical_key: key,
+                    row: entry_row,
+                    dead,
+                    ..
+                } = entry
+                {
+                    if key.as_slice() == logical_key {
+                        last_key_matches_search = true;
+                    }
+                    if *dead == target_dead {
+                        continue;
+                    }
+                    if key.as_slice() == logical_key && *entry_row == row {
+                        *dead = target_dead;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            if changed {
+                Self::rewrite_leaf(
+                    page_ref,
+                    self.descriptor().index_id,
+                    &entries,
+                    header.left,
+                    header.right,
+                    header.high_key,
+                )?;
+                drop(page);
+                // Lane E failpoint: armed before the delete-mark becomes durable;
+                // verifies that recovery either restores the entry (if pre-fsync)
+                // or surfaces the tombstone (if post-fsync) but never both.
+                crate::fail_point!("index::delete");
+                // LSN sentinel: mutation. Leaf delete-mark path.
+                guard.mark_dirty(crate::format::Lsn(1))?;
+                self.record_page_image(leaf_id, tx_id)?;
+                return Ok(());
+            }
+            // No match here. If duplicates of this logical_key may continue on
+            // the right sibling, walk right and keep looking.
             drop(page);
-            // Lane E failpoint: armed before the delete-mark becomes durable;
-            // verifies that recovery either restores the entry (if pre-fsync)
-            // or surfaces the tombstone (if post-fsync) but never both.
-            crate::fail_point!("index::delete");
-            // LSN sentinel: mutation. Leaf delete-mark path.
-            guard.mark_dirty(crate::format::Lsn(1))?;
-            self.record_page_image(leaf_id, tx_id)?;
+            if last_key_matches_search && let Some(right) = header.right {
+                leaf_id = right;
+                continue;
+            }
+            return Ok(());
         }
-        Ok(())
     }
 
     pub fn compact_leaf_page(&self, page_id: PageId) -> Result<()> {
@@ -540,7 +598,7 @@ impl BtreeIndex {
         Ok(())
     }
 
-    pub fn lock_unique_key(&self, owner: u64, logical_key: &[u8]) -> Result<UniqueKeyGuard<'_>> {
+    pub fn lock_unique_key(&self, owner: u64, logical_key: &[u8]) -> Result<UniqueKeyGuard> {
         self.inner.unique_locks.lock(logical_key, owner)
     }
 
@@ -576,17 +634,24 @@ impl BtreeIndex {
     }
 
     pub fn point_lookup(&self, logical_key: &[u8]) -> Result<Vec<IndexRowRef>> {
-        let mut page_id = self.meta()?.root_page_id;
+        // Descend to the leaf whose physical-key range *starts* at or below
+        // the search key. With physical separators throughout, navigation
+        // keyed on `logical_key` always lands on a leaf whose first entry's
+        // logical key is <= search_key OR is the smallest logical key strictly
+        // greater than the search key (the latter happens when duplicates
+        // straddled an internal split). From there we walk right through
+        // sibling leaves until a leaf whose entries are entirely past the
+        // search key — at that point all matches have been collected.
+        let mut page_id = self.find_leaf(self.meta()?.root_page_id, logical_key)?;
+        let mut out: Vec<IndexRowRef> = Vec::new();
         loop {
-            page_id = self.find_leaf(page_id, logical_key)?;
             let guard = self.inner.buffer.pin(page_id)?;
-            let next = guard.with_page(|page| {
+            let (first_past_key, right_link) = guard.with_page(|page| {
                 let header = Self::read_page_header(page)?;
-                if !header.high_key.is_empty() && logical_key >= header.high_key.as_slice() {
-                    return Ok::<Option<Vec<IndexRowRef>>, Error>(None);
-                }
-                let mut out = Vec::new();
-                for entry in self.read_entries(page)? {
+                let entries = self.read_entries(page)?;
+                let mut matched_here = false;
+                let mut first_entry_key: Option<Vec<u8>> = None;
+                for entry in &entries {
                     if let Entry::Leaf {
                         logical_key: key,
                         row,
@@ -594,33 +659,41 @@ impl BtreeIndex {
                         ..
                     } = entry
                     {
-                        if dead {
+                        if first_entry_key.is_none() {
+                            first_entry_key = Some(key.clone());
+                        }
+                        if *dead {
                             continue;
                         }
                         if key.as_slice() == logical_key {
-                            out.push(row);
-                        } else if !out.is_empty() {
+                            out.push(*row);
+                            matched_here = true;
+                        } else if matched_here {
+                            // Within one leaf, matches are contiguous because
+                            // entries are sorted by physical (= logical || row
+                            // suffix). Once we pass them we can stop scanning.
                             break;
                         }
                     }
                 }
-                Ok(Some(out))
+                let first_past = first_entry_key
+                    .as_deref()
+                    .map(|k| k > logical_key)
+                    .unwrap_or(false);
+                Ok((first_past, header.right))
             })?;
-            match next {
-                Some(rows) => return Ok(rows),
-                None => {
-                    let guard = self.inner.buffer.pin(page_id)?;
-                    let right = guard.with_page(|page| {
-                        let header = Self::read_page_header(page)?;
-                        Ok(header.right)
-                    })?;
-                    match right {
-                        Some(next_page) => page_id = next_page,
-                        None => return Ok(Vec::new()),
-                    }
-                }
+            // Stop once we land on a leaf whose first entry's logical key is
+            // already strictly past the search key — the leaf chain is sorted,
+            // so nothing further could match.
+            if first_past_key {
+                break;
+            }
+            match right_link {
+                Some(next) => page_id = next,
+                None => break,
             }
         }
+        Ok(out)
     }
 
     pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<IndexRowRef>> {
@@ -721,13 +794,36 @@ impl BtreeIndex {
                 dead: false,
             });
             entries.sort_by(|a, b| a.compare(b));
-            let split = entries.len() / 2;
+            // Pick a split position that does not cleave a duplicate-key run
+            // unless every entry on the page shares one logical key. This keeps
+            // `point_lookup` correct under the existing right-walk traversal:
+            // every duplicate of a given logical_key sits on a single leaf,
+            // and the parent separator is the right-half's first key (strictly
+            // greater than every key on the left half).
+            let split = Self::choose_leaf_split(&entries);
             let right_entries = entries.split_off(split);
-            let left_high = right_entries
-                .first()
-                .and_then(|entry| entry.logical_key())
-                .unwrap_or_default()
-                .to_vec();
+            // Most splits land on a clean key boundary (chosen by
+            // `choose_leaf_split`) and can use the right half's first logical
+            // key as a compact separator. When duplicates of one logical key
+            // span both halves (only possible when the page held one logical
+            // key throughout), fall back to the right half's first *physical*
+            // key (logical_key || row_ref suffix) so the separator is strictly
+            // greater than every left-side entry.
+            let left_high = match (entries.last(), right_entries.first()) {
+                (Some(last_left), Some(first_right))
+                    if last_left.logical_key() == first_right.logical_key() =>
+                {
+                    first_right
+                        .physical()
+                        .map(|p| p.to_vec())
+                        .unwrap_or_default()
+                }
+                _ => right_entries
+                    .first()
+                    .and_then(|entry| entry.logical_key())
+                    .unwrap_or_default()
+                    .to_vec(),
+            };
             let header = Self::read_page_header(page)?;
             Ok((entries, right_entries, left_high, header))
         })?;
@@ -1046,12 +1142,28 @@ impl BtreeIndex {
                 .ok_or(Error::CorruptPage("internal page missing leftmost child"))?;
             return self.min_key_for_page(child);
         }
-        for entry in entries {
-            if let Some(key) = entry.logical_key() {
-                return Ok(key.to_vec());
+        // Propagate the LEAF's first key. Use the logical bytes when the
+        // entire subtree shares a single logical key — that's the
+        // duplicate-run case where we need an unambiguous separator that
+        // survives propagation; the physical bytes (logical || row_ref)
+        // resolve ties strictly. Otherwise the logical key suffices and is
+        // shorter, keeping internal pages compact.
+        let first_logical = entries.iter().find_map(|e| e.logical_key());
+        let last_logical = entries.iter().rev().find_map(|e| e.logical_key());
+        match (first_logical, last_logical) {
+            (Some(first), Some(last)) if first == last => {
+                // All entries on this leaf share one logical key. Use the
+                // first entry's physical bytes so the separator is strictly
+                // greater than every key on the left sibling but still sorts
+                // before any key with a greater logical value.
+                let first_physical = entries.iter().find_map(|e| e.physical());
+                Ok(first_physical
+                    .map(|p| p.to_vec())
+                    .unwrap_or_else(|| first.to_vec()))
             }
+            (Some(first), _) => Ok(first.to_vec()),
+            _ => Ok(Vec::new()),
         }
-        Ok(Vec::new())
     }
 
     fn page_body_capacity(&self, page_id: PageId) -> Result<usize> {
@@ -1314,6 +1426,13 @@ impl Entry {
         }
     }
 
+    fn physical(&self) -> Option<&[u8]> {
+        match self {
+            Entry::Leaf { physical, .. } => Some(physical),
+            Entry::Internal { .. } => None,
+        }
+    }
+
     fn is_dead_leaf(&self) -> bool {
         matches!(self, Entry::Leaf { dead: true, .. })
     }
@@ -1437,7 +1556,45 @@ pub fn encode_physical_key(logical_key: &[u8], row: IndexRowRef) -> KeyBuf {
 }
 
 impl BtreeIndex {
+    /// Choose a split position for a leaf whose entries are sorted by
+    /// `physical` (logical_key + row_ref suffix). Prefers a position near the
+    /// midpoint where the boundary lies between two distinct logical keys —
+    /// that keeps every duplicate of a given key on a single leaf, which is
+    /// the invariant `point_lookup`'s right-walk relies on. When the entire
+    /// page is one duplicate run the midpoint is returned and the caller
+    /// adopts a physical-key separator instead (see `split_leaf_and_insert`).
+    fn choose_leaf_split(entries: &[Entry]) -> usize {
+        let n = entries.len();
+        if n <= 1 {
+            return n;
+        }
+        let mid = n / 2;
+        // Search outward from the midpoint for a position `i` where
+        // entries[i-1].logical_key != entries[i].logical_key.
+        for offset in 0..n {
+            for &candidate in &[mid.saturating_add(offset), mid.saturating_sub(offset)] {
+                if candidate == 0 || candidate >= n {
+                    continue;
+                }
+                let prev = entries[candidate - 1].logical_key();
+                let next = entries[candidate].logical_key();
+                if prev != next {
+                    return candidate;
+                }
+            }
+        }
+        // Whole page is one duplicate run; fall back to the midpoint and rely
+        // on the physical-key separator path in the caller.
+        mid
+    }
+
     fn encoded_entries_len(entries: &[Entry]) -> usize {
+        // Leaf cells are encoded as 2+2+8+8+2+4 = 26 bytes of header plus the
+        // logical_key + physical payload. Internal cells are 2+8 = 10 bytes of
+        // header plus the separator. The pre-split size estimator used to say
+        // `18` for leaves which underestimated by 8 bytes per entry; with many
+        // entries that meant the post-split halves no longer fit, surfacing
+        // as `Error::PageFull` ("no free slot space on page").
         entries
             .iter()
             .map(|entry| match entry {
@@ -1445,7 +1602,7 @@ impl BtreeIndex {
                     logical_key,
                     physical,
                     ..
-                } => 18 + logical_key.len() + physical.len(),
+                } => 26 + logical_key.len() + physical.len(),
                 Entry::Internal { separator, .. } => 10 + separator.len(),
             })
             .sum()

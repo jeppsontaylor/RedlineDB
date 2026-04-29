@@ -11,12 +11,6 @@ workloads = [
 ]
 durabilities = ["strict", "normal"]
 threads = [1, 2, 4, 8, 16, 32, 64, 128]
-# NEEDS_REVIEW (kernel follow-up): rows lowered from 4096 to 128 to avoid the
-# BtreeIndex leaf-split regression on duplicate keys (kv.tenant has 32 values,
-# 4096 rows = 128 duplicates each, which currently overflows a leaf page when
-# the DML INSERT path drives both the heap and the secondary index. Same bug
-# tracked from the smoke lane; raise once the split heuristic special-cases
-# identical keys).
-rows = 128
+rows = 4096
 seconds = 2
 cache_mib = 32

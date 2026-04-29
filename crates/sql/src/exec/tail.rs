@@ -418,6 +418,7 @@ pub(crate) fn execute_update(
                 &values,
                 fresh.rowid,
                 new_rowid,
+                &mut session.index_undo,
             )?;
             if let Some(returning) = &plan.returning {
                 returning_rows.push(project_returning_row(
@@ -443,7 +444,7 @@ pub(crate) fn execute_delete(
     plan: &crate::statement::DeletePlan,
     bindings: &[Option<SqlValue>],
 ) -> Result<ExecutionResult> {
-    with_write_tx(conn, |_, tx| {
+    with_write_tx(conn, |session, tx| {
         let rows = collect_table_rows(conn.engine(), tx, &plan.table)?;
         let mut count = 0usize;
         let mut returning_rows = Vec::new();
@@ -473,6 +474,7 @@ pub(crate) fn execute_delete(
                 &plan.table,
                 &live,
                 row.rowid,
+                &mut session.index_undo,
             )?;
             count += 1;
         }
@@ -691,7 +693,7 @@ fn collect_unique_conflicts(
         }
         if let Some(handle) = crate::exec::index_dml::open_index_handle(conn.engine(), index) {
             let key = crate::exec::index_dml::build_index_key(index, values);
-            let (_guard, hit) =
+            let (kernel_guard, hit) =
                 crate::exec::index_dml::probe_unique_for_conflict(&handle, tx, skip_rowid, &key)?;
             if let Some(rowid) = hit {
                 conflicts.push(UniqueConflict {
@@ -700,18 +702,18 @@ fn collect_unique_conflicts(
                     key_ordinals: index.keys.iter().map(|key| key.ordinal as usize).collect(),
                 });
             }
-            // The kernel `UniqueKeyGuard` lifetime is tied to the
-            // `BtreeIndex` Arc and not stored in the SQL session; once we
-            // return, the kernel guard drops, releasing the per-key
-            // lock. The kernel performs the actual write under its own
-            // structure_lock during `insert_tx`, so a brief gap here is
-            // safe — any racing writer would acquire the same kernel
-            // guard before its own probe.
-            //
-            // We still take a SQL-side guard so legacy callers that
-            // share `unique_locks()` continue to serialize against this
-            // key. The dual locking is harmless and matches what the
-            // legacy fallback below does.
+            // Hold the kernel `UniqueKeyGuard` until end-of-transaction so
+            // the probe-to-insert window stays serialized — dropping the
+            // guard between `point_lookup` and `insert_tx` reopens the race
+            // where two writers both see "no duplicate" and both commit.
+            // The guard lives in `SessionState::kernel_unique_guards` and
+            // releases on commit/rollback when that vector is cleared.
+            session.kernel_unique_guards.push(kernel_guard);
+
+            // We still take a SQL-side guard so legacy callers that share
+            // `unique_locks()` continue to serialize against this key. The
+            // dual locking is harmless and matches the legacy fallback
+            // below; the SQL guard is also released on commit/rollback.
             let sql_lock_key = unique_key_bytes(table.table_id.0, index.index_id.0, &key_values)?;
             let sql_guard = conn.unique_locks().lock(sql_lock_key, tx.id().0)?;
             session.unique_guards.push(sql_guard);
@@ -861,6 +863,7 @@ fn apply_upsert_update(
         &values,
         existing.rowid,
         new_rowid,
+        &mut ctx.session.index_undo,
     )?;
     Ok(InsertOutcome::Updated {
         rowid: new_rowid,
@@ -896,6 +899,7 @@ pub(super) fn insert_row_with_resolution(
             table,
             values,
             rowid,
+            &mut session.index_undo,
         )?;
         session.last_insert_rowid = Some(rowid.0 as i64);
         return Ok(InsertOutcome::Inserted {
@@ -927,6 +931,7 @@ pub(super) fn insert_row_with_resolution(
                             table,
                             &old_row.values,
                             conflict.rowid,
+                            &mut session.index_undo,
                         )?;
                     }
                 }
@@ -941,6 +946,7 @@ pub(super) fn insert_row_with_resolution(
                 table,
                 values,
                 rowid,
+                &mut session.index_undo,
             )?;
             session.last_insert_rowid = Some(rowid.0 as i64);
             Ok(InsertOutcome::Inserted {

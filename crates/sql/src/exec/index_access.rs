@@ -545,19 +545,39 @@ fn encode_prefix_key(index: &IndexDef, leading_values: &[SqlValue]) -> Vec<u8> {
 }
 
 /// Smallest byte string strictly greater than `bytes`. The encoding
-/// always terminates each key part with `0xff`, so appending `0x00`
-/// produces the smallest strict successor — this is also the start of
-/// "the next prefix" when used for prefix scans.
+/// terminates each key part with `0xff`, but the next part is appended
+/// AFTER that terminator, so the strict successor must increment the
+/// prefix as a binary number rather than appending. We strip trailing
+/// `0xff` bytes (they cannot be incremented in place) and bump the
+/// rightmost non-`0xff` byte; if the entire prefix is `0xff`s we fall
+/// back to `[0xff; 32]`, which sorts past anything `encode_index_key`
+/// produces for a single value.
 fn next_key(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes.to_vec();
-    out.push(0x00);
+    while let Some(&last) = out.last() {
+        if last == 0xff {
+            out.pop();
+        } else {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return vec![0xff; 32];
+    }
+    if let Some(last) = out.last_mut() {
+        *last = last.saturating_add(1);
+    }
     out
 }
 
 /// Returns `[start, end)` byte bounds whose half-open range covers
 /// every key that begins with `prefix`. The prefix is inclusive on the
-/// low end and exclusive on the high end (so we use `next_key` to step
-/// past anything that shares the prefix).
+/// low end and exclusive on the high end. Composite keys put the
+/// next-part type tag IMMEDIATELY after the part separator (`0xff`),
+/// so the upper bound has to be the binary successor of the prefix —
+/// not `prefix || 0x00`, which sorts BEFORE every full key whose
+/// suffix begins with `0x10` (Integer), `0x20` (Real), `0x30` (Text),
+/// or `0x40` (Blob).
 fn prefix_bounds(prefix: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let start = prefix.to_vec();
     let end = next_key(prefix);

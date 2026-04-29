@@ -565,6 +565,85 @@ fn engine_create_index_allocates_meta_page_and_recovers() {
     }
 }
 
+/// Regression test for the B-tree leaf-split heuristic when many entries
+/// share one logical key. Before the fix, splitting a leaf full of duplicates
+/// would either lose entries (point_lookup walked only one of the resulting
+/// leaves) or surface `Error::PageFull` ("no free slot space on page") because
+/// the size estimator under-counted leaf cells by 8 bytes each. The fix:
+/// sort entries by `(logical_key, row_ref)` (already stable) and use a
+/// physical-key separator when a duplicate run spans leaves; navigate
+/// inserts/lookups by physical bytes; walk right at the leaf level to gather
+/// duplicates that ended up on later siblings.
+#[test]
+fn leaf_split_handles_duplicate_keys() {
+    let temp = TempDir::new().unwrap();
+    let page_file = Arc::new(PageFile::create(temp.path().join("data.redline"), 512).unwrap());
+    let buffer = Arc::new(BufferPool::new(Arc::clone(&page_file), 256).unwrap());
+    let index = BtreeIndex::create(
+        Arc::clone(&buffer),
+        IndexDescriptor::new(IndexId(99), RelId(1), IndexUniqueness::NonUnique),
+    )
+    .unwrap();
+
+    // 200 entries all sharing the same logical key, each with a distinct
+    // row_id. With page_size=512 bytes, this run cannot fit on a single
+    // leaf — the fix keeps every entry findable across the leaf chain.
+    const DUP_COUNT: u64 = 200;
+    for i in 0..DUP_COUNT {
+        index
+            .insert(
+                b"dup",
+                IndexRowRef::with_row_id(
+                    redlinedb_kernel::format::RowId(i),
+                    TuplePtr::new_with_generation(
+                        PageId(1_000 + i),
+                        i as u16,
+                        redlinedb_kernel::format::PageGeneration::ONE,
+                    ),
+                ),
+            )
+            .expect("insert duplicate key entry");
+    }
+
+    // Point lookup must return every entry, regardless of which leaf the
+    // duplicate ended up on.
+    let hits = index.point_lookup(b"dup").expect("point_lookup");
+    assert_eq!(
+        hits.len() as u64,
+        DUP_COUNT,
+        "point_lookup must surface every duplicate entry, got {}",
+        hits.len()
+    );
+    let mut row_ids: Vec<_> = hits.iter().map(|h| h.row_id.0).collect();
+    row_ids.sort_unstable();
+    let expected: Vec<u64> = (0..DUP_COUNT).collect();
+    assert_eq!(row_ids, expected, "all original row_ids must be present");
+
+    // Range scan over the broader key space must return the same set
+    // (range_scan walks every leaf from the start key).
+    let range = index.range_scan(b"a", b"z").expect("range_scan");
+    assert_eq!(
+        range.len() as u64,
+        DUP_COUNT,
+        "range_scan must surface every duplicate entry, got {}",
+        range.len()
+    );
+
+    // The tree must validate cleanly: every leaf still has children pointers
+    // wired up, levels match, and physical keys remain sorted within pages.
+    let report = index.validate().expect("validate");
+    assert!(
+        report.errors.is_empty(),
+        "validate errors: {:?}",
+        report.errors
+    );
+    assert!(
+        report.leaf_pages >= 2,
+        "duplicate run should have spilled into multiple leaves; saw {} leaves",
+        report.leaf_pages
+    );
+}
+
 fn snapshot_index_pages(
     buffer: &Arc<BufferPool>,
     rel_id: RelId,
