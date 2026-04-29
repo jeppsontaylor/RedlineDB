@@ -369,6 +369,31 @@ Artifact SHA-256:
 
 - `phase9-baseline`, `wave1-fused`, `wave2-fused`, `wave3-fused`, `wave4-fused`, `wave5-fused`, `phase9-fusion-green`, `wave6-fused`, `phase9-fusion-green-v2`, `wave7-fused`, `phase9-fusion-green-v3`, `phase9-xbabe1-certified`.
 
+## Paper v1 (paper-v1 tag)
+
+The Phase 9 deliverables include a 10-page IEEE conference paper at `paper/main.pdf`.
+
+Title: **RedlineDB: A Rust-Native, Concurrent-Write Embedded SQL Engine That Stays SQLite-Compatible Without Inheriting Its Concurrency Cliff**
+
+Build:
+```
+pdflatex -output-directory=build paper/main.tex
+bibtex build/main
+pdflatex -output-directory=build paper/main.tex
+pdflatex -output-directory=build paper/main.tex
+```
+
+Artifact:
+- `paper/main.pdf` — `8d92202d3dd3f8e5bc320e896300cdd48a7a40c905c6760869c35a7da4396e52` (10 pages, 387,639 bytes)
+
+Components:
+- `paper/main.tex` — IEEEtran two-column scaffold
+- `paper/sections/{abstract,introduction,background,architecture,implementation,methodology,evaluation,discussion,conclusion,appendix}.tex` — 5,509 words body
+- `paper/figs/{architecture,dataflow,fig1_throughput_scaling,fig2_latency_p99,fig3_ratio_bars,fig4_scaling_efficiency,fig5_recovery_failpoint}.eps` — 7 EPS figures (TikZ + matplotlib)
+- `paper/data/{headline_table,loc_comparison,cert_totals,perf_aggregates}.csv` — table data sources
+- `paper/refs/refs.bib` — 49 BibTeX entries (49 distinct `\cite` keys, every entry used)
+- `paper/scripts/{build_figs.py,check_refs.py,_bibcheck.tex}` — reproducibility scripts
+
 ## Verified Proof
 
 These commands passed in the current workspace:
