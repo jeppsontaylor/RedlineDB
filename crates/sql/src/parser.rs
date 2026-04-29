@@ -39,6 +39,7 @@ pub(crate) use dml::*;
 mod pragma;
 #[allow(unused_imports)]
 pub(crate) use pragma::*;
+pub(crate) mod savepoint;
 mod select;
 #[allow(unused_imports)]
 pub(crate) use select::*;
@@ -49,6 +50,149 @@ pub(crate) fn is_pragma_sql(sql: &str) -> bool {
         .trim_start()
         .to_ascii_lowercase()
         .starts_with("pragma")
+}
+
+/// Split `sql` into `(head, tail)` where `head` is the first statement
+/// (including its trailing `;` if present) and `tail` is the remainder of the
+/// input. `tail` is a byte slice of the original `sql`, with no leading
+/// whitespace stripped — this matches SQLite's `pzTail` contract where the
+/// tail pointer must reference into the caller's original buffer.
+///
+/// The split is "string-aware": semicolons inside `'...'`, `"..."`, or
+/// `[...]` (SQLite legacy bracket quoting) and inside `--` line comments or
+/// `/* ... */` block comments are not considered terminators. Doubled quote
+/// characters inside a string are treated as escapes.
+///
+/// If `sql` contains no terminating semicolon, the entire string is the
+/// `head` and `tail` is empty. If `sql` is purely whitespace/comments, both
+/// `head` and `tail` are returned trimmed appropriately.
+pub fn split_first_statement(sql: &str) -> (&str, &str) {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let len = bytes.len();
+    let mut in_string: Option<u8> = None;
+    while i < len {
+        let b = bytes[i];
+        if let Some(quote) = in_string {
+            // Inside a string literal: handle escaped quote (doubled quote).
+            if b == quote {
+                if i + 1 < len && bytes[i + 1] == quote {
+                    i += 2;
+                    continue;
+                }
+                in_string = None;
+                i += 1;
+                continue;
+            }
+            // SQLite-style `[...]` legacy bracket quoting closes on `]`.
+            if quote == b'[' && b == b']' {
+                in_string = None;
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => {
+                in_string = Some(b);
+                i += 1;
+            }
+            b'[' => {
+                in_string = Some(b'[');
+                i += 1;
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                // Line comment until \n or EOF.
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                // Block comment until */
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                if i + 1 < len {
+                    i += 2;
+                }
+            }
+            b';' => {
+                let head_end = i + 1;
+                return (&sql[..head_end], &sql[head_end..]);
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    (sql, "")
+}
+
+/// True if `sql` (after trimming whitespace and stripping comments) is empty.
+/// Used to detect SQL that is entirely a comment block — `sqlite3_prepare_v2`
+/// treats such input as a successful no-op (`out_stmt` becomes NULL).
+pub fn is_blank_sql(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let len = bytes.len();
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() || b == b';' {
+            i += 1;
+            continue;
+        }
+        if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// Iterate over every top-level statement in `sql`, yielding `(head, tail)`
+/// pairs analogous to repeatedly calling `split_first_statement`. Skips runs
+/// of pure-whitespace/comment chunks. The yielded `head` slice is the SQL of
+/// one statement (including its trailing `;` if any) and `tail` is the
+/// remainder of the input after that statement.
+///
+/// Used by tests and by callers that want the full split up-front; runtime
+/// `Connection::execute` walks the splitter incrementally so it can stop at
+/// the first failing statement.
+#[allow(dead_code)]
+pub fn split_statements(sql: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = sql;
+    while !rest.is_empty() {
+        if is_blank_sql(rest) {
+            break;
+        }
+        let (head, tail) = split_first_statement(rest);
+        if head.is_empty() {
+            break;
+        }
+        if !is_blank_sql(head) {
+            out.push(head);
+        }
+        rest = tail;
+    }
+    out
 }
 
 pub fn parse_prepared_template(conn: &Connection, sql: &str) -> Result<PreparedTemplate> {
