@@ -263,7 +263,9 @@ fn strace_summary(
              ------ ----------- ----------- --------- --------- ----------------\n",
         );
         for (name, calls) in &totals {
-            text.push_str(&format!("   0.00    0.000000           0 {calls:>9}         0 {name}\n"));
+            text.push_str(&format!(
+                "   0.00    0.000000           0 {calls:>9}         0 {name}\n"
+            ));
         }
         let _ = fs::write(&aggregate_path, text);
     }
@@ -325,11 +327,7 @@ fn run_child(
 
     let mut command = if wrap_with_strace {
         let mut c = Command::new("strace");
-        c.arg("-c")
-            .arg("-o")
-            .arg(&strace_path)
-            .arg("--")
-            .arg(&exe);
+        c.arg("-c").arg("-o").arg(&strace_path).arg("--").arg(&exe);
         c
     } else {
         Command::new(&exe)
