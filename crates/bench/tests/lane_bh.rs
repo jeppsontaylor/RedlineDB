@@ -133,6 +133,7 @@ fn certify_warmup_runs_are_discarded() {
         config_hash: String::new(),
         runs_jsonl_hash: String::new(),
         summary_csv_hash: String::new(),
+        ratio_csv_hash: String::new(),
         report_md_hash: String::new(),
         git_sha: None,
         git_dirty: None,
@@ -231,6 +232,74 @@ fn summary_csv_has_p50_p95_max() {
             "header missing column {col}: {header}"
         );
     }
+}
+
+#[test]
+fn ratio_csv_groups_redline_vs_sqlite() {
+    use redlinedb_bench::config::{DurabilityKind, EngineKind, WorkloadKind};
+    use redlinedb_bench::process_metrics::ProcessMetrics;
+    use redlinedb_bench::report::{Checksum, LatencySummary, MetricsSummary, RunRecord};
+
+    fn record(engine: EngineKind, qps: f64, p95: u64, p99: u64) -> RunRecord {
+        RunRecord {
+            run_id: format!("{engine:?}"),
+            engine,
+            workload: WorkloadKind::HotRowUpdate,
+            durability: DurabilityKind::Strict,
+            threads: 4,
+            seed: 1,
+            cache_bytes: 1024,
+            environment: redlinedb_bench::report::RunEnvironment {
+                hostname: "h".to_owned(),
+                git_sha: None,
+                git_dirty: None,
+                rustc_version: None,
+                sqlite_version: None,
+                logical_cpus: 1,
+                memory_mib: None,
+                image_digest: None,
+            },
+            metrics: MetricsSummary {
+                operations: 10,
+                failures: if engine == EngineKind::Redline { 1 } else { 0 },
+                busy_errors: 0,
+                locked_errors: 2,
+                timeout_errors: 3,
+                elapsed_ms: 1,
+                throughput_ops_per_sec: qps,
+                latency: LatencySummary {
+                    p50_us: 1,
+                    p95_us: p95,
+                    p99_us: p99,
+                    p999_us: p99,
+                    max_us: p99,
+                },
+            },
+            checksum: Checksum::default(),
+            data_bytes: 1,
+            wal_bytes: 1,
+            engine_stats: serde_json::json!({}),
+            process_metrics: Some(ProcessMetrics {
+                fdatasync_count: Some(5),
+                pwrite_count: Some(7),
+                ..Default::default()
+            }),
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("ratio.csv");
+    redlinedb_bench::certify::write_ratio_csv_for_test(
+        &path,
+        &[
+            record(EngineKind::Redline, 200.0, 20, 30),
+            record(EngineKind::Sqlite, 100.0, 40, 50),
+        ],
+    )
+    .expect("write ratio csv");
+    let raw = fs::read_to_string(&path).expect("read csv");
+    assert!(raw.contains("redline_median_qps,sqlite_median_qps,ratio"));
+    assert!(raw.contains("hot-row-update,strict,4,200.000000,100.000000,2.000000"));
 }
 
 /// P1 #7 — connection-limit workload smoke test. Use Redline with a

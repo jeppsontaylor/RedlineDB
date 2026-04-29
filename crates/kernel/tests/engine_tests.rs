@@ -22,6 +22,7 @@ fn test_engine() -> (TempDir, Arc<Engine>) {
                 segment_bytes: 65536,
                 ..WalConfig::default()
             },
+            commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
             lock_shards: 32,
             busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,
@@ -45,6 +46,7 @@ fn engine_uses_bounded_page_backed_heap_residency() {
                 segment_bytes: 65536,
                 ..WalConfig::default()
             },
+            commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
             lock_shards: 32,
             busy_timeout: Duration::from_millis(250),
             heap_lanes: 4,
@@ -401,6 +403,7 @@ fn concurrent_autocommit_inserts_recover_after_group_commit() {
                 segment_bytes: 65536,
                 ..WalConfig::default()
             },
+            commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
             lock_shards: 32,
             busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,
@@ -504,6 +507,7 @@ fn checkpoint_reopen_restores_tx_frontier_metadata() {
                 segment_bytes: 65536,
                 ..WalConfig::default()
             },
+            commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
             lock_shards: 32,
             busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,
@@ -601,6 +605,7 @@ fn vacuumed_latest_row_survives_checkpoint_reopen() {
                 segment_bytes: 65536,
                 ..WalConfig::default()
             },
+            commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
             lock_shards: 32,
             busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,
@@ -702,6 +707,7 @@ fn ddl_create_table_and_index_survive_reopen() {
                 segment_bytes: 65536,
                 ..WalConfig::default()
             },
+            commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
             lock_shards: 32,
             busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,
@@ -769,6 +775,7 @@ fn ddl_reopens_when_catalog_sidecar_is_deleted() {
                 segment_bytes: 65536,
                 ..WalConfig::default()
             },
+            commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
             lock_shards: 32,
             busy_timeout: Duration::from_millis(250),
             heap_lanes: 16,

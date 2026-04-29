@@ -132,12 +132,20 @@ impl RecoveryReport {
 pub struct EngineConfig {
     pub rel_id: RelId,
     pub wal: WalConfig,
+    pub commit_durability: CommitDurability,
     pub lock_shards: usize,
     pub busy_timeout: Duration,
     pub heap_lanes: usize,
     pub page_size: usize,
     pub buffer_pool_pages: usize,
     pub data_file_name: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitDurability {
+    Strict,
+    Normal,
+    UnsafeDev,
 }
 
 impl Default for EngineConfig {
@@ -148,6 +156,7 @@ impl Default for EngineConfig {
         Self {
             rel_id: RelId(1),
             wal: WalConfig::default(),
+            commit_durability: CommitDurability::Strict,
             lock_shards: (parallelism * 4).max(16),
             busy_timeout: Duration::from_millis(250),
             heap_lanes: parallelism.max(4),
@@ -516,7 +525,12 @@ impl Engine {
             }
         };
 
-        if let Err(err) = self.wal.flush_until(append.end_lsn) {
+        let commit_barrier = match self.config.commit_durability {
+            CommitDurability::Strict => self.wal.flush_until(append.end_lsn),
+            CommitDurability::Normal => self.wal.write_until(append.end_lsn),
+            CommitDurability::UnsafeDev => Ok(append.end_lsn),
+        };
+        if let Err(err) = commit_barrier {
             self.txs.cancel_reserved_csn(csn);
             self.txs.abort(tx.id());
             self.release_locks(&mut tx);
@@ -539,6 +553,7 @@ impl Engine {
         // other thread the closure performs the success path verbatim
         // and returns `Ok(csn)`.
         let pending_schema_for_closure = pending_schema.clone();
+        let _ = &pending_schema_for_closure;
         crate::fail_point!("engine::commit::before_publish", |arg: Option<String>| {
             if !commit_failure_armed_for_thread() {
                 // Not the arming thread; behave as if the failpoint

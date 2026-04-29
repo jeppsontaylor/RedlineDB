@@ -118,13 +118,10 @@ impl BenchEngine for RedlineEngine {
     }
 
     fn checksum(&self) -> Result<crate::report::Checksum> {
-        let mut conn = self.open_conn()?;
-        Ok(crate::report::Checksum {
-            rows: scalar_i64(&mut conn, "SELECT COUNT(*) FROM kv")?,
-            key_sum: scalar_i64(&mut conn, "SELECT MAX(k) FROM kv")?,
-            version_sum: scalar_i64(&mut conn, "SELECT MAX(version) FROM kv")?,
-            payload_bytes: scalar_i64(&mut conn, "SELECT COUNT(*) FROM kv WHERE tenant >= 0")?,
-        })
+        let mut conn = RedlineConn {
+            conn: self.open_conn()?,
+        };
+        crate::engine::kv_checksum(&mut conn)
     }
 }
 
@@ -245,18 +242,6 @@ fn dir_wal_bytes(dir: &Path, name: &str, ext: &str) -> u64 {
         })
         .map(|entry| entry.metadata().map(|meta| meta.len()).unwrap_or(0))
         .sum()
-}
-
-fn scalar_i64(conn: &mut redlinedb::Connection, sql: &str) -> Result<i64> {
-    let mut rows = conn.query(sql, ())?;
-    match rows.step()? {
-        redlinedb::Step::Row(row) => match row.get_ref(0)? {
-            redlinedb::ValueRef::Null => Ok(0),
-            redlinedb::ValueRef::Integer(value) => Ok(value),
-            other => Err(anyhow!("expected integer scalar, got {other:?}")),
-        },
-        redlinedb::Step::Done => Ok(0),
-    }
 }
 
 #[cfg(test)]

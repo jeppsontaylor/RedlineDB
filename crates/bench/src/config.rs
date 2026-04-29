@@ -538,10 +538,17 @@ impl FromStr for WorkloadKind {
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "single-row-insert" => Ok(Self::SingleRowInsert),
-            "batched-insert-100" => Ok(Self::BatchedInsert100),
+            "batched-insert100" | "batched-insert-100" => Ok(Self::BatchedInsert100),
             "point-read-pk" => Ok(Self::PointReadPk),
+            "secondary-index-read" => Ok(Self::SecondaryIndexRead),
+            "secondary-index-range" => Ok(Self::SecondaryIndexRange),
             "writers-disjoint" => Ok(Self::WritersDisjoint),
+            "hot-row-update" => Ok(Self::HotRowUpdate),
             "mixed-oltp" => Ok(Self::MixedOltp),
+            "mixed95-read5-write" => Ok(Self::Mixed95Read5Write),
+            "mixed80-read20-write" => Ok(Self::Mixed80Read20Write),
+            "mixed50-read50-write" => Ok(Self::Mixed50Read50Write),
+            "connection-limit" => Ok(Self::ConnectionLimit),
             _ => bail!("unknown workload {value}"),
         }
     }

@@ -175,6 +175,7 @@ struct WalCoordinatorShared {
 #[derive(Debug)]
 struct WalCoordinatorState {
     reserved_lsn: Lsn,
+    written_lsn: Lsn,
     prev_lsn: Lsn,
     durable_lsn: Lsn,
     pending: VecDeque<QueuedWalRecord>,
@@ -210,6 +211,7 @@ impl WalCoordinator {
         let shared = Arc::new(WalCoordinatorShared {
             state: Mutex::new(WalCoordinatorState {
                 reserved_lsn,
+                written_lsn: reserved_lsn,
                 prev_lsn,
                 durable_lsn,
                 pending: VecDeque::new(),
@@ -313,6 +315,27 @@ impl WalCoordinator {
         }
     }
 
+    pub fn write_until(&self, target_lsn: Lsn) -> Result<Lsn> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| Error::CorruptWal("wal coordinator mutex poisoned"))?;
+
+        loop {
+            check_wal_failure(&state)?;
+            if state.written_lsn >= target_lsn {
+                return Ok(state.written_lsn);
+            }
+            self.shared.cvar.notify_all();
+            state = self
+                .shared
+                .cvar
+                .wait(state)
+                .map_err(|_| Error::CorruptWal("wal coordinator wait poisoned"))?;
+        }
+    }
+
     pub fn flush_all(&self) -> Result<Lsn> {
         // Lane E failpoint: full-WAL flush is the checkpoint barrier; injection
         // here lets harnesses crash between commit-fsync and checkpoint-fsync.
@@ -330,7 +353,7 @@ impl WalCoordinator {
         self.shared
             .state
             .lock()
-            .map(|state| state.reserved_lsn)
+            .map(|state| state.written_lsn)
             .map_err(|_| Error::CorruptWal("wal coordinator mutex poisoned"))
     }
 
@@ -503,6 +526,9 @@ fn wal_writer_loop(mut wal: WalManager, config: WalConfig, shared: Arc<WalCoordi
                 return;
             }
         }
+        if last_written != Lsn::ZERO {
+            publish_written_lsn(&shared, last_written);
+        }
 
         if should_flush {
             wait_for_group_commit_window(&shared, &config, &mut wal, flush_target);
@@ -621,8 +647,13 @@ fn drain_until(
             continue;
         }
 
+        let mut last_written = Lsn::ZERO;
         for record in batch {
+            last_written = record.append.end_lsn;
             wal.write_encoded(record.append, &record.encoded)?;
+        }
+        if last_written != Lsn::ZERO {
+            publish_written_lsn(shared, last_written);
         }
     }
 }
@@ -683,6 +714,15 @@ fn check_wal_failure(state: &WalCoordinatorState) -> Result<()> {
 fn publish_wal_failure(shared: &Arc<WalCoordinatorShared>) {
     if let Ok(mut state) = shared.state.lock() {
         state.failure = Some("wal writer failed");
+        shared.cvar.notify_all();
+    }
+}
+
+fn publish_written_lsn(shared: &Arc<WalCoordinatorShared>, written_lsn: Lsn) {
+    if let Ok(mut state) = shared.state.lock() {
+        if state.written_lsn < written_lsn {
+            state.written_lsn = written_lsn;
+        }
         shared.cvar.notify_all();
     }
 }
@@ -779,6 +819,7 @@ impl<Fs: FileSystem> WalManager<Fs> {
         // `panic`/`abort` actions still kill the thread before
         // `sync_data` runs, exactly like the original site.
         let written = self.written_lsn;
+        let _ = written;
         crate::fail_point!("wal::flush", |_| { Ok(written) });
         self.active_file.sync_data()?;
         // Lane BH P1 #7: count fdatasync calls so the bench harness

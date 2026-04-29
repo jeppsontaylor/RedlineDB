@@ -76,6 +76,28 @@ fn select_distinct_deduplicates_rows() {
 }
 
 #[test]
+fn select_all_preserves_duplicates() {
+    let (_dir, conn) = open_database();
+
+    conn.execute("CREATE TABLE t(v TEXT)")
+        .expect("create table");
+    conn.execute("INSERT INTO t VALUES ('a')")
+        .expect("insert a");
+    conn.execute("INSERT INTO t VALUES ('a')")
+        .expect("insert duplicate a");
+
+    let mut stmt = conn
+        .prepare("SELECT ALL v FROM t ORDER BY rowid")
+        .expect("prepare select all");
+    let mut rows = Vec::new();
+    while let Step::Row = stmt.step().expect("step select all") {
+        rows.push(stmt.column_text(0).expect("v").to_owned());
+    }
+
+    assert_eq!(rows, vec!["a".to_owned(), "a".to_owned()]);
+}
+
+#[test]
 fn begin_commit_and_rollback_persist_and_discard_rows() {
     let (_dir, conn) = open_database();
 

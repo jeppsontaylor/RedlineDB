@@ -438,6 +438,7 @@ fn engine_create_index_allocates_meta_page_and_recovers() {
             segment_bytes: 65_536,
             ..WalConfig::default()
         },
+        commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
         lock_shards: 32,
         busy_timeout: Duration::from_millis(250),
         heap_lanes: 16,

@@ -78,7 +78,8 @@ pub(crate) fn bind_simple_select_query(
     params: &mut ParamLayout,
 ) -> Result<PreparedTemplate> {
     let distinct = match select.distinct {
-        Some(Distinct::Distinct) | Some(Distinct::All) => true,
+        Some(Distinct::Distinct) => true,
+        Some(Distinct::All) => false,
         Some(Distinct::On(_)) => {
             return Err(Error::UnsupportedSql(
                 "DISTINCT ON is not supported".to_owned(),

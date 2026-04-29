@@ -17,6 +17,7 @@ fn config() -> EngineConfig {
             segment_bytes: 65536,
             ..WalConfig::default()
         },
+        commit_durability: redlinedb_kernel::engine::CommitDurability::Strict,
         lock_shards: 32,
         busy_timeout: Duration::from_millis(250),
         heap_lanes: 16,

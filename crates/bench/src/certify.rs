@@ -50,6 +50,7 @@ pub struct CertificationManifest {
     pub config_hash: String,
     pub runs_jsonl_hash: String,
     pub summary_csv_hash: String,
+    pub ratio_csv_hash: String,
     pub report_md_hash: String,
     pub git_sha: Option<String>,
     pub git_dirty: Option<bool>,
@@ -127,6 +128,8 @@ pub fn run(config: &CompareConfig, args: &CertifyArgs) -> Result<CertificationRe
     write_runs_jsonl(&runs_jsonl, &runs)?;
     let summary_csv = args.out_dir.join("summary.csv");
     write_summary_csv(&summary_csv, &runs)?;
+    let ratio_csv = args.out_dir.join("ratio.csv");
+    write_ratio_csv(&ratio_csv, &runs)?;
     let report_md = args.out_dir.join("report.md");
     fs::write(&report_md, crate::gates::markdown_summary(&runs))?;
 
@@ -148,6 +151,7 @@ pub fn run(config: &CompareConfig, args: &CertifyArgs) -> Result<CertificationRe
         config_hash: hash_file(&args.config)?,
         runs_jsonl_hash: hash_file(&runs_jsonl)?,
         summary_csv_hash: hash_file(&summary_csv)?,
+        ratio_csv_hash: hash_file(&ratio_csv)?,
         report_md_hash: hash_file(&report_md)?,
         git_sha: report::collect_environment().git_sha,
         git_dirty: report::collect_environment().git_dirty,
@@ -715,6 +719,11 @@ pub fn write_summary_csv_for_test(path: &Path, runs: &[RunRecord]) -> Result<()>
     write_summary_csv(path, runs)
 }
 
+/// Test-only re-export of [`write_ratio_csv`].
+pub fn write_ratio_csv_for_test(path: &Path, runs: &[RunRecord]) -> Result<()> {
+    write_ratio_csv(path, runs)
+}
+
 fn write_summary_csv(path: &Path, runs: &[RunRecord]) -> Result<()> {
     let mut out = fs::File::create(path)?;
     // Lane BH P1 #7: pre-Lane-BH summary.csv only carried `p99_us`
@@ -751,6 +760,171 @@ fn write_summary_csv(path: &Path, runs: &[RunRecord]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn write_ratio_csv(path: &Path, runs: &[RunRecord]) -> Result<()> {
+    let mut groups: BTreeMap<
+        (
+            crate::config::WorkloadKind,
+            crate::config::DurabilityKind,
+            usize,
+        ),
+        Vec<&RunRecord>,
+    > = BTreeMap::new();
+    for run in runs {
+        groups
+            .entry((run.workload, run.durability, run.threads))
+            .or_default()
+            .push(run);
+    }
+
+    let mut out = fs::File::create(path)?;
+    writeln!(
+        out,
+        "workload,durability,threads,redline_median_qps,sqlite_median_qps,ratio,redline_p95_us,redline_p99_us,sqlite_p95_us,sqlite_p99_us,redline_failures,sqlite_failures,redline_busy_errors,sqlite_busy_errors,redline_locked_errors,sqlite_locked_errors,redline_timeout_errors,sqlite_timeout_errors,redline_fdatasync_count,sqlite_fdatasync_count,redline_pwrite_count,sqlite_pwrite_count,redline_raw_hash,sqlite_raw_hash"
+    )?;
+
+    for ((workload, durability, threads), records) in groups {
+        let redline = records_for_engine(&records, EngineKind::Redline);
+        let sqlite = records_for_engine(&records, EngineKind::Sqlite);
+        let redline_qps = median_f64(
+            redline
+                .iter()
+                .map(|run| run.metrics.throughput_ops_per_sec)
+                .collect(),
+        );
+        let sqlite_qps = median_f64(
+            sqlite
+                .iter()
+                .map(|run| run.metrics.throughput_ops_per_sec)
+                .collect(),
+        );
+        let ratio = match (redline_qps, sqlite_qps) {
+            (Some(redline), Some(sqlite)) if sqlite > 0.0 => Some(redline / sqlite),
+            _ => None,
+        };
+        writeln!(
+            out,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            workload.as_str(),
+            durability.as_str(),
+            threads,
+            fmt_opt_f64(redline_qps),
+            fmt_opt_f64(sqlite_qps),
+            fmt_opt_f64(ratio),
+            fmt_opt_u64(median_u64(
+                redline
+                    .iter()
+                    .map(|run| run.metrics.latency.p95_us)
+                    .collect()
+            )),
+            fmt_opt_u64(median_u64(
+                redline
+                    .iter()
+                    .map(|run| run.metrics.latency.p99_us)
+                    .collect()
+            )),
+            fmt_opt_u64(median_u64(
+                sqlite
+                    .iter()
+                    .map(|run| run.metrics.latency.p95_us)
+                    .collect()
+            )),
+            fmt_opt_u64(median_u64(
+                sqlite
+                    .iter()
+                    .map(|run| run.metrics.latency.p99_us)
+                    .collect()
+            )),
+            sum_u64(redline.iter().map(|run| run.metrics.failures)),
+            sum_u64(sqlite.iter().map(|run| run.metrics.failures)),
+            sum_u64(redline.iter().map(|run| run.metrics.busy_errors)),
+            sum_u64(sqlite.iter().map(|run| run.metrics.busy_errors)),
+            sum_u64(redline.iter().map(|run| run.metrics.locked_errors)),
+            sum_u64(sqlite.iter().map(|run| run.metrics.locked_errors)),
+            sum_u64(redline.iter().map(|run| run.metrics.timeout_errors)),
+            sum_u64(sqlite.iter().map(|run| run.metrics.timeout_errors)),
+            sum_process_counter(&redline, |metrics| metrics.fdatasync_count),
+            sum_process_counter(&sqlite, |metrics| metrics.fdatasync_count),
+            sum_process_counter(&redline, |metrics| metrics.pwrite_count),
+            sum_process_counter(&sqlite, |metrics| metrics.pwrite_count),
+            hash_records(&redline),
+            hash_records(&sqlite),
+        )?;
+    }
+    Ok(())
+}
+
+fn records_for_engine<'a>(records: &[&'a RunRecord], engine: EngineKind) -> Vec<&'a RunRecord> {
+    records
+        .iter()
+        .copied()
+        .filter(|run| run.engine == engine)
+        .collect()
+}
+
+fn median_f64(mut values: Vec<f64>) -> Option<f64> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.total_cmp(right));
+    Some(if values.len() % 2 == 1 {
+        values[values.len() / 2]
+    } else {
+        let upper = values.len() / 2;
+        (values[upper - 1] + values[upper]) / 2.0
+    })
+}
+
+fn median_u64(mut values: Vec<u64>) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some(if values.len() % 2 == 1 {
+        values[values.len() / 2]
+    } else {
+        let upper = values.len() / 2;
+        values[upper - 1].saturating_add(values[upper]) / 2
+    })
+}
+
+fn fmt_opt_f64(value: Option<f64>) -> String {
+    value.map(|value| format!("{value:.6}")).unwrap_or_default()
+}
+
+fn fmt_opt_u64(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn sum_u64(values: impl Iterator<Item = u64>) -> u64 {
+    values.fold(0_u64, u64::saturating_add)
+}
+
+fn sum_process_counter(
+    records: &[&RunRecord],
+    getter: impl Fn(&ProcessMetrics) -> Option<u64>,
+) -> u64 {
+    records
+        .iter()
+        .filter_map(|run| run.process_metrics.as_ref())
+        .filter_map(getter)
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn hash_records(records: &[&RunRecord]) -> String {
+    if records.is_empty() {
+        return String::new();
+    }
+    let mut hasher = Sha256::new();
+    for record in records {
+        if let Ok(bytes) = serde_json::to_vec(record) {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn engine_arg(engine: EngineKind) -> &'static str {

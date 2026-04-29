@@ -144,14 +144,10 @@ impl BenchEngine for SqliteEngine {
     }
 
     fn checksum(&self) -> Result<crate::report::Checksum> {
-        let conn = self.open_conn()?;
-        let checksum = crate::report::Checksum {
-            rows: scalar_i64(&conn, "SELECT COUNT(*) FROM kv")?,
-            key_sum: scalar_i64(&conn, "SELECT MAX(k) FROM kv")?,
-            version_sum: scalar_i64(&conn, "SELECT MAX(version) FROM kv")?,
-            payload_bytes: scalar_i64(&conn, "SELECT COUNT(*) FROM kv WHERE tenant >= 0")?,
+        let mut conn = SqliteConn {
+            conn: self.open_conn()?,
         };
-        Ok(checksum)
+        crate::engine::kv_checksum(&mut conn)
     }
 }
 
@@ -250,9 +246,4 @@ fn seeded_blob(seed: usize) -> Vec<u8> {
 
 fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
-}
-
-fn scalar_i64(conn: &Connection, sql: &str) -> Result<i64> {
-    let value = conn.query_row(sql, [], |row| row.get::<_, Option<i64>>(0))?;
-    Ok(value.unwrap_or(0))
 }

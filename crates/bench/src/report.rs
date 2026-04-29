@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -11,12 +12,13 @@ use crate::config::{DurabilityKind, EngineKind, WorkloadKind};
 use crate::process_metrics::ProcessMetrics;
 use crate::{ensure_parent, gates};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checksum {
     pub rows: i64,
-    pub key_sum: i64,
     pub version_sum: i64,
     pub payload_bytes: i64,
+    pub content_hash: String,
+    pub index_consistency: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -632,14 +632,12 @@ fn execute_select(
                             cursor: 0,
                         }
                     } else {
-                        let rows = collect_table_rows(
-                            conn.engine(),
-                            tx.as_mut().expect("tx present"),
-                            table,
-                        )?
-                        .into_iter()
-                        .map(SqlRow::Table)
-                        .collect::<Vec<_>>();
+                        let tx = tx.as_mut().expect("tx present");
+                        let rows =
+                            table_rows_for_select(conn, tx, table, &plan.selection, bindings)?
+                                .into_iter()
+                                .map(SqlRow::Table)
+                                .collect::<Vec<_>>();
                         SelectRuntimeSource::Batched {
                             node: MaterializeNode::new(order_and_project_rows(
                                 rows,
@@ -783,6 +781,7 @@ fn execute_select(
                 conn.engine(),
                 tx.as_mut().expect("tx present"),
                 &plan.source,
+                &plan.selection,
                 bindings,
             )?;
             let rows = execute_grouped_select(plan, rows, bindings, limit, offset, &mut memory)?;
@@ -831,6 +830,42 @@ fn execute_select(
             Err(err)
         }
     }
+}
+
+fn table_rows_for_select(
+    conn: &Connection,
+    tx: &mut Txn,
+    table: &Arc<TableDef>,
+    selection: &Option<Expr>,
+    bindings: &[Option<SqlValue>],
+) -> Result<Vec<TableRow>> {
+    if let Some(rowid) = selection_rowid_eq(table, selection, bindings)?
+        && let Some(row) = load_table_row_by_rowid(conn.engine(), tx, table, rowid)?
+    {
+        return Ok(vec![row]);
+    }
+
+    if let Some(matched) =
+        index_access::try_match_index_access(conn.engine(), table, selection, bindings)
+        && index_access::open_handle(conn.engine(), &matched.index).is_some()
+    {
+        let rowids = index_access::execute_index_probe(
+            conn.engine(),
+            tx,
+            table,
+            &matched.index,
+            &matched.probe,
+        )?;
+        let mut rows = Vec::with_capacity(rowids.len());
+        for rowid in rowids {
+            if let Some(row) = load_table_row_by_rowid(conn.engine(), tx, table, rowid)? {
+                rows.push(row);
+            }
+        }
+        return Ok(rows);
+    }
+
+    collect_table_rows(conn.engine(), tx, table)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -931,13 +966,16 @@ fn collect_select_rows(
     engine: &Engine,
     tx: &mut Txn,
     source: &SelectSource,
+    selection: &Option<Expr>,
     bindings: &[Option<SqlValue>],
 ) -> Result<Vec<SqlRow>> {
     match source {
-        SelectSource::Table(table) => Ok(collect_table_rows(engine, tx, table)?
-            .into_iter()
-            .map(SqlRow::Table)
-            .collect()),
+        SelectSource::Table(table) => {
+            Ok(table_rows_for_select(conn, tx, table, selection, bindings)?
+                .into_iter()
+                .map(SqlRow::Table)
+                .collect())
+        }
         SelectSource::Tables(tables) => collect_join_rows(engine, tx, tables),
         SelectSource::Joined(source) => collect_join_source_rows(engine, tx, source, bindings),
         SelectSource::SqliteSchema => Ok(engine

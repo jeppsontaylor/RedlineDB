@@ -754,6 +754,11 @@ fn sql_options(options: &OpenOptions) -> redlinedb_sql::DbOptions {
     let buffer_pages = (options.memory.cache_bytes / page_size).max(16);
     db.engine.buffer_pool_pages = buffer_pages;
     db.engine.busy_timeout = options.busy_timeout;
+    db.engine.commit_durability = match options.durability {
+        Durability::Strict => redlinedb_kernel::engine::CommitDurability::Strict,
+        Durability::Normal => redlinedb_kernel::engine::CommitDurability::Normal,
+        Durability::UnsafeDev => redlinedb_kernel::engine::CommitDurability::UnsafeDev,
+    };
     db.optimizer.enabled = options.optimizer.enabled;
     db.optimizer.max_exact_join_tables = options.optimizer.max_exact_join_tables;
     db.optimizer.max_join_alternatives = options.optimizer.max_join_alternatives;

@@ -360,7 +360,7 @@ pub(crate) fn execute_update(
     bindings: &[Option<SqlValue>],
 ) -> Result<ExecutionResult> {
     with_write_tx(conn, |session, tx| {
-        let rows = collect_table_rows(conn.engine(), tx, &plan.table)?;
+        let rows = dml_target_rows(conn, tx, &plan.table, &plan.selection, bindings)?;
         let mut count = 0usize;
         let mut returning_rows = Vec::new();
         for row in rows {
@@ -445,7 +445,7 @@ pub(crate) fn execute_delete(
     bindings: &[Option<SqlValue>],
 ) -> Result<ExecutionResult> {
     with_write_tx(conn, |session, tx| {
-        let rows = collect_table_rows(conn.engine(), tx, &plan.table)?;
+        let rows = dml_target_rows(conn, tx, &plan.table, &plan.selection, bindings)?;
         let mut count = 0usize;
         let mut returning_rows = Vec::new();
         for row in rows {
@@ -484,6 +484,42 @@ pub(crate) fn execute_delete(
             plan.returning.is_some(),
         ))
     })
+}
+
+fn dml_target_rows(
+    conn: &Connection,
+    tx: &mut Txn,
+    table: &Arc<TableDef>,
+    selection: &Option<Expr>,
+    bindings: &[Option<SqlValue>],
+) -> Result<Vec<TableRow>> {
+    if let Some(rowid) = selection_rowid_eq(table, selection, bindings)?
+        && let Some(row) = load_table_row_by_rowid(conn.engine(), tx, table, rowid)?
+    {
+        return Ok(vec![row]);
+    }
+
+    if let Some(matched) =
+        crate::exec::index_access::try_match_index_access(conn.engine(), table, selection, bindings)
+        && crate::exec::index_access::open_handle(conn.engine(), &matched.index).is_some()
+    {
+        let rowids = crate::exec::index_access::execute_index_probe(
+            conn.engine(),
+            tx,
+            table,
+            &matched.index,
+            &matched.probe,
+        )?;
+        let mut rows = Vec::with_capacity(rowids.len());
+        for rowid in rowids {
+            if let Some(row) = load_table_row_by_rowid(conn.engine(), tx, table, rowid)? {
+                rows.push(row);
+            }
+        }
+        return Ok(rows);
+    }
+
+    collect_table_rows(conn.engine(), tx, table)
 }
 
 pub(super) fn project_returning_row(

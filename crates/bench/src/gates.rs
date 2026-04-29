@@ -93,7 +93,7 @@ fn gate_checksums_match(records: &[RunRecord]) -> GateResult {
                 break;
             }
         } else {
-            seen.insert(key, record.checksum);
+            seen.insert(key, record.checksum.clone());
         }
     }
     GateResult {
