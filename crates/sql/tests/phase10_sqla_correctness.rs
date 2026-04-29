@@ -1,0 +1,114 @@
+//! Phase-10 Lane SQL-A correctness regressions.
+//!
+//! Each test in this file pins down a specific SQLite-divergence wrong-result
+//! bug from the audit. The expected behavior matches SQLite (3.x).
+
+use std::sync::Arc;
+
+use redlinedb_sql::{Database, DbOptions, SqlValue, Step};
+use tempfile::tempdir;
+
+fn open_database() -> (tempfile::TempDir, Arc<redlinedb_sql::Connection>) {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("redlinedb-sql-phase10-sqla.db");
+    let db = Database::create(&path, DbOptions::default()).expect("create database");
+    let conn = db.connect();
+    (dir, conn)
+}
+
+#[allow(dead_code)]
+fn run_scalar(sql: &str) -> SqlValue {
+    let (_dir, conn) = open_database();
+    let mut stmt = conn.prepare(sql).expect("prepare scalar");
+    assert_eq!(stmt.step().expect("step scalar"), Step::Row);
+    stmt.column_value(0).expect("scalar value").clone()
+}
+
+#[allow(dead_code)]
+fn assert_null(value: &SqlValue) {
+    assert!(
+        matches!(value, SqlValue::Null),
+        "expected NULL, got {:?}",
+        value
+    );
+}
+
+#[allow(dead_code)]
+fn assert_int(value: &SqlValue, expected: i64) {
+    match value {
+        SqlValue::Integer(v) => assert_eq!(*v, expected, "integer value mismatch"),
+        other => panic!("expected Integer({expected}), got {other:?}"),
+    }
+}
+
+#[allow(dead_code)]
+fn assert_real(value: &SqlValue, expected: f64) {
+    match value {
+        SqlValue::Real(v) => {
+            assert!(
+                (v - expected).abs() < 1e-9,
+                "real value mismatch: got {v}, expected {expected}"
+            );
+        }
+        other => panic!("expected Real({expected}), got {other:?}"),
+    }
+}
+
+#[allow(dead_code)]
+fn assert_text(value: &SqlValue, expected: &str) {
+    match value {
+        SqlValue::Text(v) => assert_eq!(v.as_ref(), expected, "text value mismatch"),
+        other => panic!("expected Text({expected:?}), got {other:?}"),
+    }
+}
+
+mod phase10_sqla_correctness {
+    use super::*;
+
+    // --- Bug 1: SELECT ALL must preserve duplicates --------------------------
+
+    #[test]
+    fn select_all_preserves_duplicates_basic() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(x INTEGER)").expect("create t");
+        conn.execute("INSERT INTO t VALUES (1)").expect("insert 1");
+        conn.execute("INSERT INTO t VALUES (1)")
+            .expect("insert dup");
+        let mut stmt = conn
+            .prepare("SELECT ALL x FROM t")
+            .expect("prepare select all");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push(stmt.column_i64(0).expect("x"));
+        }
+        assert_eq!(rows.len(), 2, "SELECT ALL must keep duplicates");
+        assert_eq!(rows, vec![1, 1]);
+    }
+
+    #[test]
+    fn select_all_distinguishes_from_distinct() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(x INTEGER)").expect("create t");
+        for v in [1, 1, 2, 2, 3] {
+            conn.execute(&format!("INSERT INTO t VALUES ({v})"))
+                .expect("insert");
+        }
+        // SELECT ALL should keep all 5 rows.
+        let mut stmt = conn.prepare("SELECT ALL x FROM t").expect("prepare all");
+        let mut all_rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            all_rows.push(stmt.column_i64(0).expect("x"));
+        }
+        assert_eq!(all_rows.len(), 5);
+
+        // SELECT DISTINCT should collapse to 3 distinct values.
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT x FROM t ORDER BY x")
+            .expect("prepare distinct");
+        let mut distinct_rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            distinct_rows.push(stmt.column_i64(0).expect("x"));
+        }
+        assert_eq!(distinct_rows, vec![1, 2, 3]);
+    }
+}
