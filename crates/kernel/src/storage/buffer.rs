@@ -279,6 +279,14 @@ impl BufferPool {
         self.page_file.page_count()
     }
 
+    /// Lane INT: raw-bytes read used by the integrity checker to recompute
+    /// CRC32 numbers when [`pin`] returns [`Error::InvalidChecksum`]. The
+    /// regular `pin` path runs `Page::from_bytes`, which validates the
+    /// checksum and refuses to surface bytes for a corrupt page.
+    pub fn read_page_bytes_unchecked(&self, page_id: PageId) -> Result<Vec<u8>> {
+        self.page_file.read_page_bytes_unchecked(page_id)
+    }
+
     fn insert_new_frame(&self, page_id: PageId, frame: Arc<FrameEntry>) -> Result<()> {
         let shard_idx = self.shard_idx(page_id);
         let mut shard = self.shards[shard_idx]

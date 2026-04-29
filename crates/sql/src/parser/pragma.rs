@@ -115,6 +115,28 @@ pub(crate) fn parse_pragma_template(
                 rows,
             )
         }
+        "redline_index_check" => pragma_static_select(
+            sql,
+            schema_epoch,
+            vec![String::from("index"), String::from("status")],
+            pragma_redline_index_check_rows(conn)?,
+        ),
+        "redline_full_check" => pragma_static_select(
+            sql,
+            schema_epoch,
+            vec![
+                String::from("relation"),
+                String::from("status"),
+                String::from("heap_rows"),
+                String::from("index_entries"),
+                String::from("heap_minus_index"),
+                String::from("index_minus_heap"),
+                String::from("page_csum_failures"),
+                String::from("lsn_violations"),
+                String::from("details"),
+            ],
+            pragma_redline_full_check_rows(conn)?,
+        ),
         "table_info" => {
             let name = value.ok_or_else(|| {
                 Error::UnsupportedSql("PRAGMA table_info requires a table".to_owned())
@@ -548,6 +570,101 @@ fn pragma_foreign_key_list_rows(
     _table: &redlinedb_kernel::catalog::TableDef,
 ) -> Vec<Vec<SqlValue>> {
     Vec::new()
+}
+
+/// `PRAGMA redline_index_check`: emit one row per catalog index reporting
+/// validation status. Compatible with the previous engine-level
+/// `integrity_check` API: empty `errors` list maps to "ok"; otherwise the
+/// status column carries the comma-joined validation messages.
+fn pragma_redline_index_check_rows(conn: &Connection) -> Result<Vec<Vec<SqlValue>>> {
+    let result = conn.engine().integrity_check_per_index()?;
+    Ok(result
+        .into_iter()
+        .map(|(name, errors)| {
+            let status = if errors.is_empty() {
+                Arc::<str>::from("ok")
+            } else {
+                Arc::<str>::from(errors.join(", ").as_str())
+            };
+            vec![
+                SqlValue::Text(Arc::from(name.as_str())),
+                SqlValue::Text(status),
+            ]
+        })
+        .collect())
+}
+
+/// `PRAGMA redline_full_check`: run the full equivalence check and emit one
+/// row per relation summarising heap/index counts plus aggregate page-level
+/// counters. The `details` column carries any per-relation or top-level
+/// error strings (semicolon-joined) so callers can surface both the
+/// numeric mismatch and the underlying message in a single SELECT.
+fn pragma_redline_full_check_rows(conn: &Connection) -> Result<Vec<Vec<SqlValue>>> {
+    let report = conn.engine().integrity_check_full()?;
+    let mut rows = Vec::with_capacity(report.relations.len());
+    for relation in &report.relations {
+        let entry_total: i64 = relation.indexes.iter().map(|i| i.entry_count as i64).sum();
+        let heap_minus: i64 = relation
+            .indexes
+            .iter()
+            .map(|i| i.heap_minus_index as i64)
+            .sum();
+        let index_minus: i64 = relation
+            .indexes
+            .iter()
+            .map(|i| i.index_minus_heap as i64)
+            .sum();
+        let mut details: Vec<String> = relation.errors.clone();
+        for ix in &relation.indexes {
+            for err in &ix.structural_errors {
+                details.push(format!("{}: {}", ix.index_name, err));
+            }
+            for err in &ix.errors {
+                details.push(format!("{}: {}", ix.index_name, err));
+            }
+        }
+        let status = if relation.errors.is_empty()
+            && heap_minus == 0
+            && index_minus == 0
+            && relation
+                .indexes
+                .iter()
+                .all(|i| i.structural_errors.is_empty() && i.errors.is_empty())
+        {
+            "ok"
+        } else {
+            "errors"
+        };
+        rows.push(vec![
+            SqlValue::Text(Arc::from(relation.relation_name.as_str())),
+            SqlValue::Text(Arc::from(status)),
+            SqlValue::Integer(relation.heap_row_count as i64),
+            SqlValue::Integer(entry_total),
+            SqlValue::Integer(heap_minus),
+            SqlValue::Integer(index_minus),
+            SqlValue::Integer(report.page_csum_failures.len() as i64),
+            SqlValue::Integer(report.lsn_monotonicity_violations.len() as i64),
+            SqlValue::Text(Arc::from(details.join("; ").as_str())),
+        ]);
+    }
+    if rows.is_empty() {
+        // Surface aggregate page-level signals even when the schema has no
+        // user tables yet, so callers can still consume a single deterministic
+        // row with the page checksum / LSN violation counters.
+        let status = if report.is_clean() { "ok" } else { "errors" };
+        rows.push(vec![
+            SqlValue::Text(Arc::from("(database)")),
+            SqlValue::Text(Arc::from(status)),
+            SqlValue::Integer(0),
+            SqlValue::Integer(0),
+            SqlValue::Integer(0),
+            SqlValue::Integer(0),
+            SqlValue::Integer(report.page_csum_failures.len() as i64),
+            SqlValue::Integer(report.lsn_monotonicity_violations.len() as i64),
+            SqlValue::Text(Arc::from(report.errors.join("; ").as_str())),
+        ]);
+    }
+    Ok(rows)
 }
 
 fn render_default_value(value: Option<&OwnedValue>) -> SqlValue {

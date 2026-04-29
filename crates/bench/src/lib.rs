@@ -1,4 +1,5 @@
 pub mod certify;
+pub mod checksum;
 mod compat;
 pub mod config;
 mod engine;
