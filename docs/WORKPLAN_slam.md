@@ -70,6 +70,38 @@ Post-fusion proof:
 Wave 2 artifact SHA-256:
 - `target/bench/wave2-recovery.json` — `58568ff50625e2e57508ba0584263924162cc39fe59f0f8db8604d3a70fb96a8`
 
+## Phase 9 Wave 3 Fusion (Lane B)
+
+Lane B landed on top of `wave2-fused` and tagged `wave3-fused`. Five commits merged via `--no-ff`:
+
+- `36c81fc phase:9/lane-b/insert: index maintenance on INSERT path with NULL parity`
+- `0eb1716 phase:9/lane-b/update: indexed-column change routing`
+- `9d27e3d phase:9/lane-b/delete: index entry removal on DELETE`
+- `3cbdb92 phase:9/lane-b/conflict: INSERT OR REPLACE/IGNORE routing through indexes`
+- `6b293bb phase:9/lane-b/tests: 6 new sql_smoke tests + recovery atomicity`
+
+`execute_insert` / `execute_update` / `execute_delete` now drive `BtreeIndex::insert_tx` / delete-mark for every catalog index on the affected table. SQLite NULL-uniqueness honored: when any unique-key component is NULL the duplicate check is skipped. New `crates/sql/src/exec/index_dml.rs` (178 LOC) holds the index-maintenance helpers; `crates/sql/src/exec/tail.rs::collect_unique_conflicts` rewritten to query the physical index instead of scanning the heap. INSERT OR REPLACE / IGNORE now route through the index-detected duplicate.
+
+Six new tests in `crates/sql/tests/sql_smoke.rs::lane_b`:
+- `single_column_unique_index_rejects_duplicate_insert`
+- `multi_column_unique_index_skips_check_when_any_part_null`
+- `insert_or_replace_replaces_on_unique_conflict`
+- `update_to_indexed_column_moves_index_entry`
+- `delete_removes_index_entry`
+- `recovery_after_crash_mid_insert_with_index_half_written`
+
+Post-fusion proof:
+- `cargo fmt --check` — green
+- `./scripts/check_file_sizes.sh` — green (largest active file `index/mod.rs` 1441 LOC, then `tail.rs` ≈1264, `exec.rs` 1495)
+- `cargo check --workspace --locked` — green
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
+- `cargo test --workspace --quiet --locked` — `187 passed (29 suites, 4.06s)`
+- `cargo test -p redlinedb-sql --quiet --locked` — 32 passed (was 26)
+- `cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7 --out target/bench/wave3-compat.json` — `{"files":3,"cases":40,"failures":[]}`
+
+Wave 3 artifact SHA-256:
+- `target/bench/wave3-compat.json` — `ee812460f3f08b55b323b6bc63c461f99551177b4db64b7dd106289179f0f91e`
+
 ## Verified Proof
 
 These commands passed in the current workspace:
