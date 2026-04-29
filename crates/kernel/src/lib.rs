@@ -6,6 +6,8 @@
 pub mod catalog;
 pub mod engine;
 pub mod error;
+#[macro_use]
+pub mod failpoints;
 pub mod format;
 pub mod heap;
 pub mod index;
@@ -15,3 +17,10 @@ pub mod txn;
 pub mod wal;
 
 pub use error::{Error, Result};
+
+/// Internal re-export of the `fail` crate so the [`fail_point!`] macro can
+/// resolve `fail::fail_point!` from any caller in the kernel without
+/// requiring downstream crates to depend on `fail` directly.
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub use fail as __fail_reexport;
