@@ -8,8 +8,10 @@
 //! algorithm modules (RobustPrune, Vamana builder, beam search, the
 //! `DiskAnnIndex` public API) follow in subsequent commits.
 
+mod prune;
 mod sectors;
 
+pub use prune::robust_prune;
 pub use sectors::{SECTOR_SIZE, SectorError, SectorLayout, decode_node, encode_node};
 
 /// Stable identifier for a vector row stored in the graph. Carries the
@@ -46,10 +48,8 @@ impl Default for DiskAnnParams {
 
 /// Scalar-only L2-squared fallback shared by builder and searcher. When Lane
 /// V1 lands, callers should switch to `crate::vector::distance::l2_squared`
-/// and this helper can be deleted. Currently unused (consumed by the
-/// algorithm modules that land in subsequent commits on this lane).
+/// and this helper can be deleted.
 // TODO(lane-v1-cleanup): replace with `crate::vector::distance::l2_squared`.
-#[allow(dead_code)]
 pub(crate) mod distance {
     /// Squared L2 distance — sufficient for ranking; we never need the
     /// square root because monotonicity is preserved.
