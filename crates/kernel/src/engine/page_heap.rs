@@ -749,6 +749,33 @@ impl PageBackedHeap {
         Ok(rows)
     }
 
+    /// Walk the relation's row directory and return every row that is
+    /// visible to `snapshot`. Lane INT consumes this for the heap/index
+    /// equivalence check: every row returned here MUST resolve to an index
+    /// entry on every catalog index over the relation. Rows that are
+    /// invisible (uncommitted or shadowed by a later version), tombstoned,
+    /// or whose head has been concurrently vacuumed are silently skipped —
+    /// they are not part of the durable visible state.
+    pub fn iter_visible_rows_for_relation(
+        &self,
+        tx_status: &ConcurrentTxStatus,
+        snapshot: &crate::txn::Snapshot,
+        rel_id: RelId,
+    ) -> Result<Vec<(RowId, Vec<u8>)>> {
+        // Lane E failpoint: armed before the integrity checker iterates the
+        // heap so a future failpoint case can exercise crash-during-check.
+        crate::fail_point!("integrity::heap::visible");
+        let entries = self.relation_entries(rel_id)?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (row_id, _ptr) in entries {
+            let payload = self.get_for_relation(tx_status, snapshot, None, rel_id, row_id)?;
+            if let Some(payload) = payload {
+                out.push((row_id, payload));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn relation_rowids(&self, rel_id: RelId) -> Result<Vec<RowId>> {
         let mut rows = Vec::new();
         for shard in &self.relation_row_dir {

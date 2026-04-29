@@ -111,6 +111,17 @@ pub struct IndexValidationReport {
     pub errors: Vec<&'static str>,
 }
 
+/// Live (non-dead) leaf entry surfaced by [`BtreeIndex::iter_all_entries`].
+/// Lane INT consumes this to cross-check every index entry against the heap
+/// row directory; the integrity checker has no business inspecting tombstones
+/// (those represent rolled-back or vacuumed deletions, not durable state).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub logical_key: Vec<u8>,
+    pub row: IndexRowRef,
+    pub leaf_page_id: PageId,
+}
+
 #[derive(Debug, Default)]
 pub struct UniqueKeyLockTable {
     shards: Vec<Mutex<HashMap<Vec<u8>, UniqueKeyLockState>>>,
@@ -791,6 +802,88 @@ impl BtreeIndex {
         };
         self.validate_page(meta.root_page_id, meta.root_level, &mut report)?;
         Ok(report)
+    }
+
+    /// Walk every live leaf entry in physical-key order. Lane INT uses this
+    /// to dump the index for a heap/index equivalence check. The walk:
+    ///
+    /// 1. Descends from the meta root to the leftmost leaf (following
+    ///    `header.left` on each internal page).
+    /// 2. Reads each leaf, emits its non-`dead` `Entry::Leaf` rows, then
+    ///    follows the `header.right` sibling pointer.
+    ///
+    /// The result is materialised into a `Vec<IndexEntry>` rather than a
+    /// streaming iterator because `BufferPool::pin` returns RAII guards;
+    /// keeping a guard live across an iterator boundary would tangle
+    /// lifetimes for callers. For paper-grade integrity checks the index
+    /// fits in O(N) memory anyway — this is a one-shot diagnostic.
+    pub fn iter_all_entries(&self) -> Result<Vec<IndexEntry>> {
+        // Lane E failpoint: armed before the integrity checker dumps the
+        // tree so the failpoint matrix can later exercise crash-during-check
+        // semantics without taking a structural lock or recording any new
+        // page images.
+        crate::fail_point!("integrity::index::dump");
+        let meta = self.meta()?;
+        let mut leaf_id = self.leftmost_leaf(meta.root_page_id)?;
+        let mut out = Vec::new();
+        loop {
+            let guard = self.inner.buffer.pin(leaf_id)?;
+            let (next, entries) = guard.with_page(|page| {
+                let header = Self::read_page_header(page)?;
+                if header.kind != PAGE_LEAF_KIND {
+                    return Err(Error::CorruptPage(
+                        "iter_all_entries: expected leaf in chain",
+                    ));
+                }
+                let entries = self.read_entries(page)?;
+                Ok((header.right, entries))
+            })?;
+            for entry in entries {
+                if let Entry::Leaf {
+                    logical_key,
+                    row,
+                    dead,
+                    ..
+                } = entry
+                {
+                    if dead {
+                        continue;
+                    }
+                    out.push(IndexEntry {
+                        logical_key,
+                        row,
+                        leaf_page_id: leaf_id,
+                    });
+                }
+            }
+            match next {
+                Some(next_id) if next_id != leaf_id => leaf_id = next_id,
+                _ => return Ok(out),
+            }
+        }
+    }
+
+    fn leftmost_leaf(&self, page_id: PageId) -> Result<PageId> {
+        let guard = self.inner.buffer.pin(page_id)?;
+        let next = guard.with_page(|page| {
+            let header = Self::read_page_header(page)?;
+            if header.kind == PAGE_LEAF_KIND {
+                return Ok(None);
+            }
+            if header.kind == PAGE_INTERNAL_KIND {
+                let child = header
+                    .left
+                    .ok_or(Error::CorruptPage("internal page missing leftmost child"))?;
+                return Ok(Some(child));
+            }
+            Err(Error::CorruptPage(
+                "leftmost_leaf: unexpected page kind in tree",
+            ))
+        })?;
+        match next {
+            Some(child) => self.leftmost_leaf(child),
+            None => Ok(page_id),
+        }
     }
 
     pub fn descriptor(&self) -> IndexDescriptor {

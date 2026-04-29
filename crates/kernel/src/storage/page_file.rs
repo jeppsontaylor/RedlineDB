@@ -67,6 +67,24 @@ impl<Fs: FileSystem> PageFile<Fs> {
         Page::from_bytes(bytes)
     }
 
+    /// Lane INT: read the on-disk bytes for a page without invoking
+    /// [`Page::from_bytes`]'s checksum validation. Used by the integrity
+    /// checker to recompute expected vs got CRC32 when the regular load
+    /// path returns [`crate::Error::InvalidChecksum`].
+    pub fn read_page_bytes_unchecked(&self, page_id: PageId) -> Result<Vec<u8>> {
+        if page_id.0 == 0 {
+            return Err(Error::CorruptPage("page id zero is invalid"));
+        }
+        let offset = self.offset(page_id)?;
+        let mut bytes = vec![0; self.page_size];
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| Error::CorruptPage("page file mutex poisoned"))?;
+        file.read_exact_at(offset, &mut bytes)?;
+        Ok(bytes)
+    }
+
     pub fn write_page(&self, page: &Page) -> Result<()> {
         if page.as_bytes().len() != self.page_size {
             return Err(Error::BufferTooSmall {
