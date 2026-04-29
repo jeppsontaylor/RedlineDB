@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="#status"><img src="https://img.shields.io/badge/tests-243%20passing-brightgreen" alt="tests"></a>
+  <a href="#status"><img src="https://img.shields.io/badge/tests-691%20passing-brightgreen" alt="tests"></a>
   <a href="#bench-headlines"><img src="https://img.shields.io/badge/xbabe1%20cert-1728%2F1728%20%E2%9C%93-brightgreen" alt="cert"></a>
   <a href="#crash-and-failpoint-certification"><img src="https://img.shields.io/badge/recovery-36%2F36%20%E2%9C%93-brightgreen" alt="recovery"></a>
   <a href="#crash-and-failpoint-certification"><img src="https://img.shields.io/badge/failpoint-24%2F24%20%E2%9C%93-brightgreen" alt="failpoint"></a>
