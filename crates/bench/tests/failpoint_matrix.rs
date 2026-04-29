@@ -91,6 +91,12 @@ fn matrix_toml_cases_target_only_known_failpoints() {
 /// The expected outcome is `lost_acked_commits == 0`: with strict
 /// durability the engine must republish the CSN watermark from the
 /// WAL when the database is reopened.
+///
+/// `kill_after_n_hits = 1` fires on the first commit, so the child
+/// dies BEFORE any ack row is written. `expect_zero_acks = true`
+/// opts the case into the "zero-ack is OK" branch of the lane-fp
+/// gate; without it the new gate (correctly) flags the case as a
+/// vacuous-oracle false pass.
 #[test]
 fn end_to_end_commit_publish_recovers_zero_lost_acked() {
     // Use an isolated tempdir so concurrent tests cannot poison each
@@ -111,6 +117,8 @@ action = "panic"
 durabilities = ["strict"]
 rows = 16
 kill_after_n_hits = [1]
+expect_child_exit = "non-zero"
+expect_zero_acks = true
 "#,
     )
     .unwrap();

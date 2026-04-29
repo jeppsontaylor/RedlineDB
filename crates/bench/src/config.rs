@@ -388,9 +388,12 @@ pub struct FailpointMatrixCase {
     /// Failpoint name registered in the kernel (e.g.
     /// `engine::commit::before_publish`).
     pub failpoint: String,
-    /// One of `panic`, `return`, `abort`, or any literal `fail` crate
-    /// action string. The harness translates the high-level keywords
-    /// into safe `fail::cfg` directives.
+    /// Any literal `fail` crate action string: `panic`, `return`,
+    /// `return(value)`, `off`, `print(msg)`, `pause`, `sleep(N)`,
+    /// `yield`, plus optional `K%` (frequency) and `K*` (count)
+    /// prefixes. The kernel `failpoints::cfg` wrapper validates this
+    /// against the fail grammar; unknown tokens (e.g. `abort`) are
+    /// rejected loudly instead of silently turning into a no-op.
     pub action: String,
     #[serde(default = "default_failpoint_durabilities")]
     pub durabilities: Vec<DurabilityKind>,
@@ -398,6 +401,42 @@ pub struct FailpointMatrixCase {
     pub rows: usize,
     #[serde(default = "default_failpoint_kill_after_n_hits")]
     pub kill_after_n_hits: Vec<u64>,
+    /// Whether the case is allowed to report `acked == 0`. Default is
+    /// false: a case with zero acknowledged commits is suspicious
+    /// because the gate-oracle is then vacuous (zero ack rows
+    /// trivially recover). Cases that legitimately expect zero acks
+    /// (e.g. failpoints that fire before the very first commit's ack
+    /// row is written) opt in by setting this to `true`.
+    #[serde(default)]
+    pub expect_zero_acks: bool,
+    /// Expected exit-status class for the child process. The runner
+    /// gates on this so a misconfigured action that causes the child
+    /// to exit cleanly (instead of dying as expected) flips the case
+    /// to `passed = false`. Defaults to `non-zero` because the
+    /// canonical lane-fp scenarios are kill cases.
+    #[serde(default)]
+    pub expect_child_exit: ExpectExit,
+}
+
+/// Expected child-process exit-status class for a failpoint matrix
+/// case.
+///
+/// - `NonZero` — the failpoint kills the child via panic / abort and
+///   the parent must observe a non-zero exit code or signal-death.
+/// - `Zero` — the failpoint short-circuits via `return` and the child
+///   returns from the workload cleanly. The `wal-fsync-skipped` case
+///   is the canonical example: `return` makes `wal::flush` skip the
+///   fsync but the workload otherwise completes normally.
+/// - `Any` — opt-out for legacy / experimental cases. Avoid in new
+///   cases; the whole point of lane-fp is to remove the previous
+///   trivial-pass behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExpectExit {
+    #[default]
+    NonZero,
+    Zero,
+    Any,
 }
 
 impl CompareConfig {

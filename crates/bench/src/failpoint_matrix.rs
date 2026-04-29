@@ -28,8 +28,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    DurabilityKind, EngineKind, FailpointChildArgs, FailpointMatrixArgs, FailpointMatrixCase,
-    FailpointMatrixConfig,
+    DurabilityKind, EngineKind, ExpectExit, FailpointChildArgs, FailpointMatrixArgs,
+    FailpointMatrixCase, FailpointMatrixConfig,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,10 +49,22 @@ pub struct FailpointMatrixRun {
     pub durability: DurabilityKind,
     pub kill_after_n_hits: u64,
     pub child_status: String,
+    /// Numeric exit code captured from the child's `Command::status`.
+    /// `None` when the child died from an unhandled signal (e.g.
+    /// SIGABRT from the panic-hook abort) and the OS therefore did
+    /// not produce an exit code. The gate uses this together with the
+    /// case's `expect_child_exit` to decide whether the death was the
+    /// expected one.
+    #[serde(default)]
+    pub child_exit_status: Option<i32>,
     pub acknowledged: usize,
     pub recovered: usize,
     pub lost_acked_commits: i64,
     pub passed: bool,
+    /// Plain-English explanation of why the case passed or failed.
+    /// Surfaced in the per-case JSON so a falling case is debuggable
+    /// from the report alone, without reproducing the run.
+    pub pass_reason: String,
 }
 
 pub fn run(args: &FailpointMatrixArgs) -> Result<FailpointMatrixReport> {
@@ -110,11 +122,13 @@ pub fn run(args: &FailpointMatrixArgs) -> Result<FailpointMatrixReport> {
                     failed += 1;
                 }
                 eprintln!(
-                    "failpoint-matrix:   -> {} acked={} recovered={} lost={}",
+                    "failpoint-matrix:   -> {} acked={} recovered={} lost={} exit={:?} reason={}",
                     if run.passed { "PASS" } else { "FAIL" },
                     run.acknowledged,
                     run.recovered,
-                    run.lost_acked_commits
+                    run.lost_acked_commits,
+                    run.child_exit_status,
+                    run.pass_reason,
                 );
                 runs.push(run);
                 completed += 1;
@@ -319,7 +333,24 @@ fn run_case(
         }
     };
     let lost = acknowledged as i64 - recovered as i64;
-    let passed = lost <= 0;
+    let lost_clamped = lost.max(0);
+
+    let child_exit_status = status.code();
+    let exit_ok = matches_expected_exit(case.expect_child_exit, &status);
+    let acks_ok = acknowledged > 0 || case.expect_zero_acks;
+    let no_lost = lost_clamped == 0;
+
+    let (passed, pass_reason) = build_verdict(
+        case,
+        exit_ok,
+        acks_ok,
+        no_lost,
+        acknowledged,
+        recovered,
+        lost_clamped,
+        child_exit_status,
+        status.success(),
+    );
 
     Ok(FailpointMatrixRun {
         case: case.name.clone(),
@@ -328,12 +359,71 @@ fn run_case(
         engine,
         durability,
         kill_after_n_hits,
-        child_status: format_status(status.code(), status.success()),
+        child_status: format_status(child_exit_status, status.success()),
+        child_exit_status,
         acknowledged,
         recovered,
-        lost_acked_commits: lost.max(0),
+        lost_acked_commits: lost_clamped,
         passed,
+        pass_reason,
     })
+}
+
+fn matches_expected_exit(expect: ExpectExit, status: &std::process::ExitStatus) -> bool {
+    match expect {
+        ExpectExit::Any => true,
+        ExpectExit::Zero => status.success(),
+        // Non-zero covers both an exit code != 0 and signal-deaths
+        // (e.g. SIGABRT from the panic hook), where `code()` returns
+        // None. A successful exit (code 0) does NOT count as the
+        // expected death.
+        ExpectExit::NonZero => !status.success(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_verdict(
+    case: &FailpointMatrixCase,
+    exit_ok: bool,
+    acks_ok: bool,
+    no_lost: bool,
+    acknowledged: usize,
+    recovered: usize,
+    lost: i64,
+    child_exit_status: Option<i32>,
+    success: bool,
+) -> (bool, String) {
+    let passed = exit_ok && acks_ok && no_lost;
+    let mut failures: Vec<String> = Vec::new();
+    if !exit_ok {
+        let observed = format_status(child_exit_status, success);
+        failures.push(format!(
+            "child exit {observed} did not match expect_child_exit={:?}",
+            case.expect_child_exit
+        ));
+    }
+    if !acks_ok {
+        failures.push(format!(
+            "acknowledged=0 with expect_zero_acks=false (oracle would be vacuous; \
+             set expect_zero_acks=true if the failpoint legitimately fires before \
+             any commit acks)",
+        ));
+    }
+    if !no_lost {
+        failures.push(format!(
+            "lost_acked_commits={lost} (acknowledged={acknowledged} recovered={recovered})"
+        ));
+    }
+    let reason = if passed {
+        format!(
+            "exit matched {:?}, acknowledged={acknowledged} (>=1 or expect_zero_acks), \
+             lost_acked_commits=0",
+            case.expect_child_exit
+        )
+    } else {
+        format!("verdict=FAIL: {}", failures.join("; "))
+    };
+    (passed, reason)
 }
 
 fn verify_recovered(durability: DurabilityKind, db_dir: &Path) -> Result<usize> {
