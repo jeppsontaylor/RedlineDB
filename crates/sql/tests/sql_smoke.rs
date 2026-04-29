@@ -908,3 +908,252 @@ fn inner_join_and_grouped_aggregate_work() {
     assert_eq!(grouped.column_i64(2).expect("sum"), 21);
     assert_eq!(grouped.step().expect("grouped done"), Step::Done);
 }
+
+// ---------------------------------------------------------------------------
+// Lane B: physical-index DML maintenance
+//
+// These tests assert that SQL INSERT/UPDATE/DELETE keep the kernel B-tree in
+// sync with the heap. We probe the B-tree directly via
+// `Engine::index_handle` to guarantee the entries actually moved (and were
+// not just enforced by the legacy O(N) scan).
+// ---------------------------------------------------------------------------
+
+mod lane_b {
+    use super::*;
+    use redlinedb_kernel::catalog::{
+        EncodedIndexKey, IndexDef, IndexKeySource, OwnedValue, SortDir, encode_index_key,
+    };
+
+    /// Build the same encoded index key bytes that the SQL exec layer
+    /// produces, so the test can probe the physical B-tree directly.
+    fn build_index_key_for_test(index: &IndexDef, values: &[OwnedValue]) -> Vec<u8> {
+        let mut dirs: Vec<SortDir> = Vec::with_capacity(index.keys.len());
+        let mut owned_refs: Vec<&OwnedValue> = Vec::with_capacity(index.keys.len());
+        for key in &index.keys {
+            let IndexKeySource::Column { attnum } = key.source;
+            owned_refs.push(values.get(attnum as usize).unwrap_or(&OwnedValue::Null));
+            dirs.push(key.sort_dir);
+        }
+        let value_refs: Vec<_> = owned_refs.iter().map(|v| v.as_ref()).collect();
+        let mut buf = Vec::new();
+        let EncodedIndexKey { bytes, .. } = encode_index_key(&value_refs, &dirs, &mut buf);
+        bytes
+    }
+
+    fn lookup_index_def(
+        conn: &redlinedb_sql::Connection,
+        schema: &str,
+        name: &str,
+    ) -> std::sync::Arc<IndexDef> {
+        let snapshot = conn.engine_for_tests().schema_snapshot();
+        let _ = schema;
+        snapshot
+            .indexes
+            .iter()
+            .find(|idx| idx.name.eq_ignore_ascii_case(name))
+            .cloned()
+            .unwrap_or_else(|| panic!("index `{name}` missing from snapshot"))
+    }
+
+    fn assert_index_has_key(
+        conn: &redlinedb_sql::Connection,
+        index_name: &str,
+        values: &[OwnedValue],
+    ) {
+        let index = lookup_index_def(conn, "main", index_name);
+        let bytes = build_index_key_for_test(&index, values);
+        let handle = conn
+            .engine_for_tests()
+            .index_handle(index.index_id)
+            .unwrap_or_else(|| panic!("no physical handle for index `{index_name}`"));
+        let rows = handle.point_lookup(&bytes).expect("point_lookup");
+        assert!(
+            !rows.is_empty(),
+            "expected index `{index_name}` to contain key for {values:?}"
+        );
+    }
+
+    fn assert_index_missing_key(
+        conn: &redlinedb_sql::Connection,
+        index_name: &str,
+        values: &[OwnedValue],
+    ) {
+        let index = lookup_index_def(conn, "main", index_name);
+        let bytes = build_index_key_for_test(&index, values);
+        let handle = conn
+            .engine_for_tests()
+            .index_handle(index.index_id)
+            .unwrap_or_else(|| panic!("no physical handle for index `{index_name}`"));
+        let rows = handle.point_lookup(&bytes).expect("point_lookup");
+        assert!(
+            rows.is_empty(),
+            "expected index `{index_name}` to NOT contain key for {values:?}, got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn single_column_unique_index_rejects_duplicate_insert() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE UNIQUE INDEX t_a_uq ON t(a)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (1, 'one')")
+            .expect("first insert");
+        let err = conn
+            .execute("INSERT INTO t VALUES (1, 'duplicate')")
+            .expect_err("duplicate must error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("UNIQUE") || msg.contains("Constraint"),
+            "expected unique-violation error, got {msg}"
+        );
+        // Index should still report the original key (and only that rowid).
+        assert_index_has_key(&conn, "t_a_uq", &[OwnedValue::Integer(1)]);
+        // The non-conflicting insert path should also succeed and be indexed.
+        conn.execute("INSERT INTO t VALUES (2, 'two')")
+            .expect("second insert");
+        assert_index_has_key(&conn, "t_a_uq", &[OwnedValue::Integer(2)]);
+    }
+
+    #[test]
+    fn multi_column_unique_index_skips_check_when_any_part_null() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b INTEGER, c TEXT)")
+            .expect("create");
+        conn.execute("CREATE UNIQUE INDEX t_ab_uq ON t(a, b)")
+            .expect("create index");
+        // Two rows with NULL in one component — both must succeed (SQLite
+        // NULL parity: NULL is never a duplicate).
+        conn.execute("INSERT INTO t(a, b, c) VALUES (1, NULL, 'x')")
+            .expect("insert null b 1");
+        conn.execute("INSERT INTO t(a, b, c) VALUES (1, NULL, 'y')")
+            .expect("insert null b 2");
+        conn.execute("INSERT INTO t(a, b, c) VALUES (NULL, 5, 'z')")
+            .expect("insert null a");
+        // Two non-null tuples — duplicates of (1,1) must error.
+        conn.execute("INSERT INTO t(a, b, c) VALUES (1, 1, 'first')")
+            .expect("first non-null");
+        let err = conn
+            .execute("INSERT INTO t(a, b, c) VALUES (1, 1, 'second')")
+            .expect_err("duplicate must error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("UNIQUE") || msg.contains("Constraint"),
+            "expected unique-violation error, got {msg}"
+        );
+        // The non-null pair is in the index; NULL-bearing entries also get
+        // indexed but are not subject to the unique check.
+        assert_index_has_key(
+            &conn,
+            "t_ab_uq",
+            &[OwnedValue::Integer(1), OwnedValue::Integer(1)],
+        );
+    }
+
+    #[test]
+    fn insert_or_replace_replaces_on_unique_conflict() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE UNIQUE INDEX t_a_uq ON t(a)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (1, 'first')")
+            .expect("first insert");
+        // INSERT OR REPLACE must succeed and overwrite the existing row.
+        conn.execute("INSERT OR REPLACE INTO t VALUES (1, 'second')")
+            .expect("replace must succeed");
+        let mut stmt = conn
+            .prepare("SELECT b FROM t WHERE a = 1")
+            .expect("prepare");
+        assert_eq!(stmt.step().expect("step"), Step::Row);
+        assert_eq!(stmt.column_text(0).expect("b"), "second");
+        assert_eq!(stmt.step().expect("done"), Step::Done);
+        // Index still has the unique key (1) — Lane B re-inserted it after
+        // delete-marking the old entry.
+        assert_index_has_key(&conn, "t_a_uq", &[OwnedValue::Integer(1)]);
+    }
+
+    #[test]
+    fn update_to_indexed_column_moves_index_entry() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_a_idx ON t(a)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (10, 'ten')")
+            .expect("insert");
+        assert_index_has_key(&conn, "t_a_idx", &[OwnedValue::Integer(10)]);
+        // Move the row's indexed-column value from 10 -> 20.
+        conn.execute("UPDATE t SET a = 20 WHERE b = 'ten'")
+            .expect("update");
+        // Old key delete-marked, new key inserted.
+        assert_index_missing_key(&conn, "t_a_idx", &[OwnedValue::Integer(10)]);
+        assert_index_has_key(&conn, "t_a_idx", &[OwnedValue::Integer(20)]);
+    }
+
+    #[test]
+    fn delete_removes_index_entry() {
+        let (_dir, conn) = open_database();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+            .expect("create");
+        conn.execute("CREATE INDEX t_a_idx ON t(a)")
+            .expect("create index");
+        conn.execute("INSERT INTO t VALUES (7, 'seven')")
+            .expect("insert");
+        assert_index_has_key(&conn, "t_a_idx", &[OwnedValue::Integer(7)]);
+        conn.execute("DELETE FROM t WHERE a = 7").expect("delete");
+        assert_index_missing_key(&conn, "t_a_idx", &[OwnedValue::Integer(7)]);
+    }
+
+    #[test]
+    fn recovery_after_crash_mid_insert_with_index_half_written() {
+        // Simulate a crash mid-insert: open a writer, INSERT inside an
+        // explicit transaction, and DROP the connection without
+        // committing. The kernel WAL contains no commit record for that
+        // tx, so recovery must reject both the heap row AND the index
+        // entry — atomicity at "either both or neither".
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("recovery.db");
+        {
+            let db = Database::create(&path, DbOptions::default()).expect("create");
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(a INTEGER, b TEXT)")
+                .expect("create");
+            conn.execute("CREATE UNIQUE INDEX t_a_uq ON t(a)")
+                .expect("create index");
+            // Sanity: a committed insert should be visible after reopen,
+            // so we plant one before the kill window.
+            conn.execute("INSERT INTO t VALUES (1, 'committed')")
+                .expect("commit-row");
+            // Now begin a tx and INSERT but never commit. Drop the conn
+            // without rolling back to mirror an abrupt crash.
+            conn.begin(redlinedb_sql::BeginMode::Deferred)
+                .expect("begin");
+            conn.execute("INSERT INTO t VALUES (2, 'killed')")
+                .expect("insert");
+            // Drop without commit — uncommitted state must not survive.
+        }
+        // Reopen the database. The kernel replays the WAL up to the
+        // last commit; the second tx is uncommitted, so neither the
+        // heap row nor the index entry must persist.
+        let db = Database::open(&path, DbOptions::default()).expect("reopen");
+        let conn = db.connect();
+        // Heap side: only the committed row is visible.
+        let mut stmt = conn
+            .prepare("SELECT a, b FROM t ORDER BY a")
+            .expect("prepare");
+        let mut rows = Vec::new();
+        while let Step::Row = stmt.step().expect("step") {
+            rows.push((
+                stmt.column_i64(0).expect("a"),
+                stmt.column_text(1).expect("b").to_owned(),
+            ));
+        }
+        assert_eq!(rows, vec![(1, "committed".to_owned())]);
+        // Index side: the committed key is present, the uncommitted key
+        // is absent — atomicity of (heap, index) holds across recovery.
+        assert_index_has_key(&conn, "t_a_uq", &[OwnedValue::Integer(1)]);
+        assert_index_missing_key(&conn, "t_a_uq", &[OwnedValue::Integer(2)]);
+    }
+}

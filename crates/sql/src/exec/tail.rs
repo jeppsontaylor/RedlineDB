@@ -712,8 +712,7 @@ fn collect_unique_conflicts(
             // share `unique_locks()` continue to serialize against this
             // key. The dual locking is harmless and matches what the
             // legacy fallback below does.
-            let sql_lock_key =
-                unique_key_bytes(table.table_id.0, index.index_id.0, &key_values)?;
+            let sql_lock_key = unique_key_bytes(table.table_id.0, index.index_id.0, &key_values)?;
             let sql_guard = conn.unique_locks().lock(sql_lock_key, tx.id().0)?;
             session.unique_guards.push(sql_guard);
             continue;
