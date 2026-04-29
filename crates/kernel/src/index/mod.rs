@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use smallvec::SmallVec;
@@ -241,6 +242,20 @@ struct IndexInner {
     unique_locks: Arc<UniqueKeyLockTable>,
     wal: Option<Arc<WalCoordinator>>,
     structure_lock: Mutex<()>,
+    /// Lifetime counter of leaf pages pinned by `range_scan`. Updated even
+    /// when the feature gate is off so `BtreeIndex::stats()` is callable
+    /// in any build, then consumed by Lane KH P1 #6 tests to assert the
+    /// scan terminates as soon as the next leaf's first key falls outside
+    /// the requested upper bound.
+    range_scan_leaves_visited: AtomicU64,
+}
+
+/// Per-index runtime counters surfaced for tests and observability.
+/// Currently only `range_scan_leaves_visited` is wired; future waves can
+/// extend this with point-lookup chain length, split counts, etc.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexStats {
+    pub range_scan_leaves_visited: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -314,6 +329,7 @@ impl BtreeIndex {
                 unique_locks: Arc::new(UniqueKeyLockTable::new(128)),
                 wal,
                 structure_lock: Mutex::new(()),
+                range_scan_leaves_visited: AtomicU64::new(0),
             }),
         })
     }
@@ -340,6 +356,7 @@ impl BtreeIndex {
                 unique_locks: Arc::new(UniqueKeyLockTable::new(128)),
                 wal,
                 structure_lock: Mutex::new(()),
+                range_scan_leaves_visited: AtomicU64::new(0),
             }),
         };
         index.validate()?;
@@ -701,8 +718,12 @@ impl BtreeIndex {
         let mut leaf_id = self.find_leaf(self.meta()?.root_page_id, start)?;
         loop {
             let guard = self.inner.buffer.pin(leaf_id)?;
-            let next = guard.with_page(|page| {
+            self.inner
+                .range_scan_leaves_visited
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            let (next, last_logical_key) = guard.with_page(|page| {
                 let header = Self::read_page_header(page)?;
+                let mut last_key: Option<Vec<u8>> = None;
                 for entry in self.read_entries(page)? {
                     if let Entry::Leaf {
                         logical_key,
@@ -717,10 +738,27 @@ impl BtreeIndex {
                         if logical_key.as_slice() >= start && logical_key.as_slice() < end {
                             out.push(row);
                         }
+                        last_key = Some(logical_key);
                     }
                 }
-                Ok(header.right)
+                Ok((header.right, last_key))
             })?;
+            // Wave 7 P1 #6: terminate the leaf walk as soon as the leaf
+            // we just scanned has a logical key already at or past the
+            // upper bound. Without this, a `WHERE k BETWEEN 5 AND 10`
+            // over a 100K-entry index loaded every leaf to the end of
+            // the chain — O(N) instead of O(log N + result_size). The
+            // entry-level `< end` filter still trims partial overlap on
+            // the boundary leaf; this short-circuit only skips
+            // *subsequent* leaves whose every key would fail the
+            // filter. `Bound::Unbounded` callers pass a sentinel `end`
+            // (e.g. `[0xff; 32]`) that can never be reached, so they
+            // keep the legacy walk-to-end behavior.
+            if let Some(last) = last_logical_key.as_deref()
+                && last >= end
+            {
+                break;
+            }
             match next {
                 Some(next_id) => {
                     leaf_id = next_id;
@@ -729,6 +767,19 @@ impl BtreeIndex {
             }
         }
         Ok(out)
+    }
+
+    /// Returns a snapshot of per-index runtime counters. Lane KH P1 #6
+    /// tests use `range_scan_leaves_visited` to assert the early-exit
+    /// path is hit; recovery and benches can sample this for
+    /// observability.
+    pub fn stats(&self) -> IndexStats {
+        IndexStats {
+            range_scan_leaves_visited: self
+                .inner
+                .range_scan_leaves_visited
+                .load(AtomicOrdering::Relaxed),
+        }
     }
 
     pub fn validate(&self) -> Result<IndexValidationReport> {
