@@ -128,7 +128,6 @@ pub(crate) fn maintain_indexes_on_insert(
 
 /// Delete-mark every index entry corresponding to `old_values` at `rowid`.
 /// Used by DELETE and by UPDATE when the key or rowid changes.
-#[allow(dead_code)] // wired up in /lane-b/delete and /lane-b/conflict commits
 pub(crate) fn maintain_indexes_on_delete(
     engine: &Engine,
     tx: &Txn,

@@ -460,8 +460,20 @@ pub(crate) fn execute_delete(
                     bindings,
                 )?);
             }
+            // Reload the row to make sure we delete-mark the right index
+            // entries; the heap state may have moved since plan time.
+            let live = load_table_row_by_rowid(conn.engine(), tx, &plan.table, row.rowid)?
+                .map(|fresh| fresh.values)
+                .unwrap_or_else(|| row.values.clone());
             conn.engine()
                 .delete_for_relation(tx, plan.table.relation_id, row.rowid)?;
+            crate::exec::index_dml::maintain_indexes_on_delete(
+                conn.engine(),
+                tx,
+                &plan.table,
+                &live,
+                row.rowid,
+            )?;
             count += 1;
         }
         Ok(build_dml_execution_result(
