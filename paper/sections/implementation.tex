@@ -19,30 +19,32 @@ review and depends on no \texttt{unsafe} idioms in user code paths.
 \subsection{Lines of Code}
 Table~\ref{tab:loc} reports the active source breakdown by crate. The
 counts come from \texttt{find crates -name '*.rs' -not -path
-'*/tests/*'} in the repository. The total active source is
-34{,}999 lines; the all-tests-included total is 42{,}304. For
-comparison, SQLite ships an amalgamation of approximately 250{,}000
-lines of C~\cite{sqlite_footprint}.
+'*/tests/*'} in the repository at \texttt{phase10-wave2-fused}. The
+total active source is 47{,}565 lines (a +12{,}566 increase over
+phase-9 driven primarily by the kernel-side integrity / JSON / vector /
+HNSW / DiskANN modules and the SQL-side JSON1, vectorized executor,
+collation, datetime, and REGEXP additions). For comparison, SQLite
+ships an amalgamation of approximately 250{,}000 lines of
+C~\cite{sqlite_footprint}.
 
 \begin{table}[t]
 \centering
-\caption{Active Rust source LOC vs SQLite reference~\cite{sqlite_footprint}}
+\caption{Active Rust source LOC at \texttt{phase10-wave2-fused} vs SQLite reference~\cite{sqlite_footprint}}
 \label{tab:loc}
 \renewcommand{\arraystretch}{1.05}
-\begin{tabular}{@{}lr@{}}
+\begin{tabular}{@{}lrr@{}}
 \toprule
-\textbf{Component} & \textbf{LOC} \\
+\textbf{Component} & \textbf{phase-9} & \textbf{phase-10} \\
 \midrule
-\texttt{redlinedb-kernel} (storage, WAL, B-tree, MVCC) & 12{,}883 \\
-\texttt{redlinedb-sql} (parser, planner, executor) & 11{,}615 \\
-\texttt{redlinedb} (public Rust facade) & 2{,}975 \\
-\texttt{redlinedb-ffi} (C ABI shim) & 1{,}478 \\
-\texttt{redlinedb-bench} (benchmark harness) & 5{,}144 \\
+\texttt{redlinedb-kernel} (storage, WAL, MVCC, integrity, JSONB, vector) & 12{,}883 & 20{,}365 \\
+\texttt{redlinedb-sql} (parser, planner, vectorized executor, JSON1) & 11{,}615 & 16{,}850 \\
+\texttt{redlinedb} (public Rust facade) & 2{,}975 & 2{,}977 \\
+\texttt{redlinedb-ffi} (C ABI shim) & 1{,}478 & 1{,}890 \\
+\texttt{redlinedb-bench} (benchmark harness) & 5{,}144 & 5{,}483 \\
 \midrule
-\textbf{RedlineDB total active source} & \textbf{34{,}999} \\
-RedlineDB total including tests & 42{,}304 \\
+\textbf{RedlineDB total active source} & \textbf{34{,}999} & \textbf{47{,}565} \\
 \midrule
-SQLite amalgamation (C) reference & $\approx$250{,}000 \\
+SQLite amalgamation (C) reference & \multicolumn{2}{r}{$\approx$250{,}000} \\
 \bottomrule
 \end{tabular}
 \end{table}
