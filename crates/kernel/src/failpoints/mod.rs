@@ -166,7 +166,10 @@ mod tests {
     #[test]
     fn validate_action_rejects_abort() {
         let err = validate_action("abort").expect_err("abort must be rejected");
-        assert!(err.contains("abort"), "error must name the bad token: {err}");
+        assert!(
+            err.contains("abort"),
+            "error must name the bad token: {err}"
+        );
     }
 
     #[test]
