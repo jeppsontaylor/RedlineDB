@@ -23,6 +23,28 @@ Post-split proof:
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
 - `cargo test --workspace --quiet --locked` — `174 passed (28 suites, 3.62s)`
 
+## Phase 9 Wave 1 Fusion (G + D + F)
+
+Three lanes landed on top of `phase9-baseline` (1d0561c) and tagged `wave1-fused`:
+
+- Lane G — Docker / proof-lane integration (3 commits): `1c934d1`, `321e89f`, `7f10bb9`. Added `strace` to Dockerfile, replaced `compare` with `certify` across `agent/proof-lanes.toml`, `agent/test-map.json`, `justfile`; added `phase9-failpoint-matrix` placeholder lane; pointed compat lanes at `crates/bench/compat` (recursive); `xbabe1_run.sh` exports `REDLINEDB_BENCH_IMAGE_DIGEST`.
+- Lane D — Failpoint infrastructure (1 commit): `2e104c6`. Added `fail` crate as optional dep gated on the new `failpoints` feature in `crates/kernel/Cargo.toml`; `crates/kernel/src/failpoints/{mod,macros}.rs` provide `fail_point!` (no-op when feature off); smoke test `crates/kernel/tests/failpoint_smoke.rs`.
+- Lane F — Bench telemetry (3 commits): `0a3879d`, `50fec7c`, `af7d490`. Added `crates/bench/src/{process_metrics,strace_capture}.rs`; extended `RunRecord.process_metrics`; SQLite PRAGMA snapshot + validation; extended `CertificationManifest` with `pragmas`, `pragma_validation`, `checksums`, `strace_reason`, `strace_syscall_counts`, `process_metrics_per_run`.
+
+Post-fusion proof:
+- `cargo fmt --check` — green
+- `./scripts/check_file_sizes.sh` — green
+- `cargo check --workspace --locked` — green
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
+- `cargo test --workspace --quiet --locked` — `178 passed (29 suites, 3.78s)` (174 baseline + 4 new bench tests)
+- `cargo run -p redlinedb-bench -- certify --config crates/bench/bench/smoke.toml --out-dir target/bench/wave1-certify --seed 7 --repetitions 1 --warmup 0` — exit 0
+
+Wave 1 artifact SHA-256 (target/bench/wave1-certify/):
+- `manifest.json` — `f125341e8d3392e45cba745becc451e05075ee99375304b4ed299a6bbae390c2`
+- `runs.jsonl` — `37ef9fac7fbdcb609509ef006d4fe232c99faaa5f6f8124f57ed953c58432ae2`
+- `summary.csv` — `facef8706bf05ba469819e55814761a0d177aec969ab4b0f0ebdf0251d970081`
+- `report.md` — `c50aef81e4315047728b5801e460bde64dacc7b03bc58c159bbba15bb0cea24a`
+
 ## Verified Proof
 
 These commands passed in the current workspace:
