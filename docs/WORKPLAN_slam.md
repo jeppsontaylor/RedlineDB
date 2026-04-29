@@ -567,21 +567,70 @@ Wave-2-fused proof matrix:
 Phase 10 closing tags so far: `phase10-baseline`, `phase10-wave1-partial`,
 `phase10-wave2-fused`.
 
-### Phase 10D — bench + xbabe1 cert (in flight)
+### Phase 10D — xbabe1 cert (`phase10-xbabe1-certified`)
 
-Live xbabe1 certification of `phase10-wave2-fused` running in background.
-`cargo run -p redlinedb-bench --release -- certify --config
-crates/bench/bench/certification.toml --out-dir target/bench/xbabe1/
-phase10-cert --seed 7 --repetitions 5 --warmup 1`.
+The Wave-2-fused tree was synced to xbabe1 and the bin-packing parallel
+certify scheduler ran the full matrix at the same row counts as
+phase-9. Run command (from repo root):
 
-Subsequent items pending after the cert returns artifacts:
-- new workloads: json-path-extract / -update, vector-flat-search,
-  vector-ann-search, vector-ann-search-disk, commit-storm-batched
-  (large-sort-spill already registered by VE)
-- certification-v2.toml referencing the new workloads
-- second xbabe1 run with v2 config
-- Phase 10E paper rebuild
-- Phase 10F final cleanup + `phase10-fusion-green` tag
+```
+./scripts/bench/xbabe1_sync.sh
+./scripts/bench/xbabe1_run.sh cargo run -p redlinedb-bench --release \
+  -- certify --config crates/bench/bench/certification.toml \
+  --out-dir target/bench/xbabe1/phase10-cert \
+  --seed 7 --repetitions 5 --warmup 1
+./scripts/bench/xbabe1_fetch.sh phase10-cert
+```
+
+Tag: `phase10-xbabe1-certified`.
+
+Manifest (`target/bench/xbabe1/phase10-cert/manifest.json`) carries:
+- `git_sha`: `7c10410219ea1dad0f2a0ecf232e6e44ebe15618`
+- `git_dirty`: `false`
+- SQLite `pragmas` (journal_mode=wal, synchronous=2, cache_size=-32768,
+  busy_timeout=5000, foreign_keys=1, page_size=4096) and
+  `pragma_validation: "ok"`
+- `with_strace: false` (the headline matrix excludes strace overhead)
+- Per-run SHA-256 checksums via the new `DatasetChecksum` (Lane INT,
+  audit P1-12 fix); replaces phase-9's `MAX(k)` / `COUNT(*)` placeholder
+
+Phase 10 cert artifact SHA-256:
+- `target/bench/xbabe1/phase10-cert/manifest.json` — `dfb092a6562f1de8b344567a0d6267add2738750558c1658088bc170b19d3432`
+- `target/bench/xbabe1/phase10-cert/runs.jsonl` — `00652c5c7a040304ac3562a79ade9f8e1a8e2c9bc00ff3e4432644bcea527679`
+- `target/bench/xbabe1/phase10-cert/summary.csv` — `ec6ce9304a1a7f2c80bc8ebcd5580f4740992253a895272db521b704928a1e4d`
+- `target/bench/xbabe1/phase10-cert/report.md` — `93a620590dd852db41eaf0c8743204f7adb28be466d6d1a3247250f49798f638`
+- `target/bench/xbabe1/phase10-cert/report.json` — `3260d32e6668123ce885fd1d85ea148275e4f004c786f82431ac0b71de5c92cb`
+- `target/bench/xbabe1/phase10-cert/ratio.csv` — `88aaab912686f44d48cdfc6d171e7fe427718ee540557bca933bf73fafc6ccc9`
+
+#### Headline phase-10 results (64-thread, strict durability)
+
+| Workload | Phase-9 ratio | Phase-10 ratio | Delta |
+|---|---:|---:|---|
+| point-read-pk | 0.99× (parity) | 0.99× | flat |
+| writers-disjoint | 8.32× | **15.89×** | nearly doubled |
+| mixed-95-5 | 7.92× | **14.74×** | nearly doubled |
+| mixed-80-20 | 8.01× | **15.21×** | nearly doubled |
+| mixed-50-50 | 7.90× | **15.55×** | nearly doubled |
+| hot-row-update | 0.21× | 0.44× | doubled (still trails) |
+| secondary-index-range | 0.012× | 0.048× | 4× improvement (still trails) |
+| secondary-index-read | n/a | 0.13× | new headline |
+
+The MVCC index format (Lane INT-adjacent kernel work) and group-commit
+telemetry instrumentation (Lane GC) appear to have lifted contended
+write throughput by ~2×. Hot-row-update is still SQLite's territory but
+the gap shrunk from 5× to 2×.
+
+### Phase 10E onward — pending
+
+After xbabe1 cert returned:
+- Phase 10E — paper section refresh + new figs (fig6 JSON, fig7
+  vector recall, fig8 group-commit batching) + PDF rebuild + paper-v2
+  tag.
+- Phase 10F — final proof matrix + `phase10-fusion-green` tag.
+
+Bench expansion (cert-v2 with json/vector/commit-storm workloads) is
+deferred to phase 11 — the lane code shipped, the workloads themselves
+need bench-side wiring (see `docs/PHASE10_HANDOFF.md`).
 
 ## Verified Proof
 
