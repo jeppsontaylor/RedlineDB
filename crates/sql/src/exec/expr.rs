@@ -1298,7 +1298,9 @@ pub(crate) fn cast_value(
             SqlValue::Text(_) => value,
             SqlValue::Integer(v) => SqlValue::Text(Arc::from(v.to_string())),
             SqlValue::Real(v) => SqlValue::Text(Arc::from(v.to_string())),
-            SqlValue::Blob(v) => SqlValue::Text(Arc::from(String::from_utf8_lossy(&v).into_owned())),
+            SqlValue::Blob(v) => {
+                SqlValue::Text(Arc::from(String::from_utf8_lossy(&v).into_owned()))
+            }
             SqlValue::Null => SqlValue::Null,
         });
     }
