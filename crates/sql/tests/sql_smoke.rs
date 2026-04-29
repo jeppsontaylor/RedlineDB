@@ -1304,10 +1304,7 @@ mod lane_b {
 
             // Exactly one must succeed; the other must surface the unique
             // violation. Either ordering is acceptable.
-            let successes = [&result_a, &result_b]
-                .iter()
-                .filter(|r| r.is_ok())
-                .count();
+            let successes = [&result_a, &result_b].iter().filter(|r| r.is_ok()).count();
             assert_eq!(
                 successes, 1,
                 "run {run}: exactly one writer must win; got A={result_a:?} B={result_b:?}"

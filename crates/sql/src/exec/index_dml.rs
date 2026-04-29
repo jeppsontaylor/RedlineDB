@@ -54,20 +54,12 @@ impl IndexUndoOp {
     /// still live, so a failure here surfaces as a rollback error.
     pub fn replay_inverse(&self, engine: &Engine, tx: &Txn) -> Result<()> {
         match self {
-            IndexUndoOp::Insert {
-                index_id,
-                key,
-                row,
-            } => {
+            IndexUndoOp::Insert { index_id, key, row } => {
                 if let Some(handle) = engine.index_handle(*index_id) {
                     handle.delete_mark_tx(tx.id(), key, *row)?;
                 }
             }
-            IndexUndoOp::DeleteMark {
-                index_id,
-                key,
-                row,
-            } => {
+            IndexUndoOp::DeleteMark { index_id, key, row } => {
                 if let Some(handle) = engine.index_handle(*index_id) {
                     handle.undelete_mark_tx(tx.id(), key, *row)?;
                 }
