@@ -150,6 +150,21 @@ SQL compatibility passes / total & 40 / 40 \\
 \end{tabular}
 \end{table}
 
+\subsection{Reading the Scaling Curves}
+Three patterns are visible across Figs.~\ref{fig:thruput}--\ref{fig:eff}.
+First, on the workloads where the SQLite WAL writer is the
+bottleneck (the four mixed and writers-disjoint cells), RedlineDB
+keeps scaling roughly proportionally to the thread count up to 64
+threads, while SQLite saturates near 4--8 threads and the additional
+contenders queue. Second, on the read-only workload (point-read-pk),
+both engines saturate the host's available memory bandwidth at 64
+threads and converge to within 1\%. Third, the 128-thread column
+shows the cost of over-subscription on a 128-vCPU host where the
+benchmark itself competes with the runtime for cores; throughput
+falls for both engines, but RedlineDB's p99 falls less, which
+suggests the row-lock manager queues more gracefully than the
+SQLite single-writer queue under saturation.
+
 \subsection{Where SQLite Still Wins}
 The two losses in Table~\ref{tab:headline} are real. On
 \texttt{hot-row-update} (every contender targets a single row),

@@ -66,3 +66,17 @@ RedlineDB targets. The cases exercise CREATE/SELECT/INSERT/UPDATE/
 DELETE/INDEX/TRANSACTION semantics, NULL handling, and the
 five-class type affinity rules where they remain user-visible.
 Pass count: 40/40.
+
+\subsection{Threats to Validity}
+The single-host caveat is real: every number in this paper comes
+from one machine. We mitigate it by reporting the host fingerprint
+verbatim and by tagging the certification commit so any reader with
+similar hardware can rerun. The SQLite version we compare against is
+the one bundled by \texttt{rusqlite} 0.37, not a hand-built
+amalgamation, so we are measuring the shipping
+ecosystem~\cite{rusqlite} rather than a custom build. We do not
+benchmark against libSQL~\cite{libsql} or DuckDB~\cite{raasveldt2019duckdb}
+in this submission; libSQL's WAL contract is the same as upstream
+SQLite by construction, and DuckDB's design center is column-store
+analytics rather than OLTP, so neither is the right comparison
+target for the specific concurrency-cliff hypothesis we test.

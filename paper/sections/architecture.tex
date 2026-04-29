@@ -33,11 +33,18 @@ The page heap is a slotted-page store with a 16~KiB page size. Each
 page carries a header, a slot directory, and a tuple region; a tuple
 slot stores either a live tuple, a forwarding pointer (when an update
 grows past the in-place slot), or a tombstone gated by an MVCC
-visibility CSN. Free space within a page is reclaimed via vacuuming
-during the next compaction pass. The on-disk footprint is reported
-through a recursive walker (the bench harness uses \texttt{walkdir}
-to sum every byte under the database directory, including WAL
-segments, catalog snapshots, and the rolled-archive segment store).
+visibility CSN. The slotted layout~\cite{bayer1972btree} gives us
+in-page rearrangement without rewriting external pointers: an update
+that fits the existing slot writes in place, while one that does not
+allocates a fresh slot on the same or a sibling page and leaves a
+forwarding pointer behind. Free space within a page is reclaimed via
+vacuuming during the next compaction pass. The on-disk footprint is
+reported through a recursive walker (the bench harness uses
+\texttt{walkdir} to sum every byte under the database directory,
+including WAL segments, catalog snapshots, and the rolled-archive
+segment store) so that any size regression caused by leaked pages,
+orphaned WAL segments, or stale snapshots shows up as a delta on the
+next certification run.
 
 \subsection{MVCC and Version Chains}
 Each row carries a per-row version chain keyed by the writing
@@ -86,11 +93,20 @@ live transaction, so undo never has to reconstruct a deleted entry.
 
 \subsection{Concurrency: Row Locks, Snapshots, Begin Modes}
 A \texttt{RowLockManager} serializes writers contending on the same
-row using relation-aware keys (the lock key is
-$(\mathrm{table\_id}, \mathrm{row\_id})$, never just $\mathrm{row\_id}$).
+row using relation-aware keys: the lock key is
+$(\mathrm{table\_id}, \mathrm{row\_id})$, never just $\mathrm{row\_id}$, so
+that two tables with overlapping rowid spaces never share a lock. The
+manager is hierarchically organized in the spirit of Gray's
+granularity-of-locks framework~\cite{gray1976granularity}; row locks
+are the only granule at runtime, but the design space leaves room
+for table-granule extensions when DDL serializes across writers.
 The lock supports a configurable busy timeout that mirrors SQLite's
 \texttt{busy\_timeout} semantics: a contender waits up to the timeout
-before returning a \texttt{BUSY}-class error. The
+before returning a \texttt{BUSY}-class error. The harness records
+\texttt{BUSY}, \texttt{LOCKED}, and \texttt{TIMEOUT} as separate
+counters per run so that a workload's contention shape can be read
+off the certification output directly rather than inferred from a
+combined error rate. The
 \texttt{BeginMode} enum exposes \texttt{Deferred}, \texttt{Immediate},
 and \texttt{Exclusive} starts, again matching SQLite's
 \texttt{BEGIN}/\texttt{BEGIN IMMEDIATE}/\texttt{BEGIN EXCLUSIVE}

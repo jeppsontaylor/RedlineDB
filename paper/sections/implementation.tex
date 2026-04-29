@@ -97,7 +97,11 @@ replays the inverse of each entry against the live index handle:
 \texttt{DeleteMark} by \texttt{undelete\_mark\_tx}. Without this log,
 a rolled-back \texttt{DELETE} would hide committed rows from indexed
 reads, and a rolled-back \texttt{INSERT} could leak a stale
-unique-conflict witness.
+unique-conflict witness. The undo log lives in transaction-local
+memory and is dropped on commit success; a long-running write
+transaction therefore pays a per-mutation memory cost proportional
+to its index-touch count, which we have not found to dominate any
+realistic workload.
 
 \subsection{Planner Gate}
 The planner's index-access matcher refuses to advertise an index path
