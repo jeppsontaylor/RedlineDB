@@ -11,6 +11,7 @@ pub mod failpoints;
 pub mod format;
 pub mod heap;
 pub mod index;
+pub mod integrity;
 pub mod io;
 pub mod storage;
 pub mod txn;

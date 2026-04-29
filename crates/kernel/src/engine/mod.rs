@@ -563,12 +563,12 @@ impl Engine {
             }
             let _detail =
                 arg.unwrap_or_else(|| "engine::commit::before_publish injected fault".to_string());
-            return Ok(self.finish_commit(
+            Ok(self.finish_commit(
                 &mut tx,
                 csn,
                 _pending_schema_for_closure.clone(),
                 CommitOutcome::MaybeCommitted,
-            ));
+            ))
         });
         Ok(self.finish_commit(&mut tx, csn, pending_schema, CommitOutcome::Committed(csn)))
     }
@@ -867,6 +867,72 @@ impl Engine {
             .lock()
             .map(|checkpoint| *checkpoint)
             .map_err(|_| Error::CorruptPage("checkpoint mutex poisoned"))
+    }
+
+    /// Lane INT: structural validation across every catalog index handle,
+    /// returning the per-index `errors` lists for the
+    /// `redline_index_check` PRAGMA. Equivalent to the previous
+    /// `integrity_check()` stub but actually walks every B-tree.
+    pub fn integrity_check(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let snapshot = self.catalog.current();
+        let handles = self
+            .index_handles
+            .lock()
+            .map_err(|_| Error::CorruptPage("engine index handles mutex poisoned"))?;
+        let mut out = Vec::new();
+        for index in &snapshot.indexes {
+            let Some(btree) = handles.get(&index.index_id) else {
+                continue;
+            };
+            let validation = btree.validate()?;
+            let errors = validation
+                .errors
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect::<Vec<_>>();
+            out.push((index.name.to_string(), errors));
+        }
+        Ok(out)
+    }
+
+    /// Lane INT: full heap/index/page equivalence check. Returns the
+    /// structured [`crate::integrity::IntegrityReport`] consumed by the
+    /// `redline_full_check` PRAGMA and the bench certification harness.
+    pub fn integrity_check_full(&self) -> Result<crate::integrity::IntegrityReport> {
+        crate::integrity::run_full(self)
+    }
+
+    pub(crate) fn buffer_for_integrity(&self) -> &Arc<BufferPool> {
+        &self.buffer
+    }
+
+    pub(crate) fn heap_for_integrity(&self) -> &PageBackedHeap {
+        &self.heap
+    }
+
+    pub(crate) fn txs_for_integrity(&self) -> &ConcurrentTxStatus {
+        &self.txs
+    }
+
+    pub(crate) fn txs_snapshot_for_integrity(&self) -> crate::txn::Snapshot {
+        self.txs.snapshot()
+    }
+
+    pub(crate) fn read_raw_page_bytes_for_integrity(
+        &self,
+        page_id: crate::format::PageId,
+    ) -> Result<Vec<u8>> {
+        self.buffer.read_page_bytes_unchecked(page_id)
+    }
+
+    pub(crate) fn index_handles_for_integrity(
+        &self,
+    ) -> Result<HashMap<CatalogIndexId, Arc<BtreeIndex>>> {
+        let handles = self
+            .index_handles
+            .lock()
+            .map_err(|_| Error::CorruptPage("engine index handles mutex poisoned"))?;
+        Ok(handles.clone())
     }
 
     fn refresh_read_committed(&self, tx: &mut Txn) {
