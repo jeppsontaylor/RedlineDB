@@ -263,6 +263,12 @@ pub enum WorkloadKind {
     Mixed95Read5Write,
     Mixed80Read20Write,
     Mixed50Read50Write,
+    /// Lane BH P1 #7: binary-search the engine for its maximum
+    /// stable concurrent-connection count. The workload manages
+    /// its own connection pool — the harness's `--threads` arg is
+    /// ignored. Output is a single record with
+    /// `engine_stats.max_stable_connections` populated.
+    ConnectionLimit,
 }
 
 impl WorkloadKind {
@@ -283,6 +289,7 @@ impl WorkloadKind {
             Self::Mixed95Read5Write => "mixed95-read5-write",
             Self::Mixed80Read20Write => "mixed80-read20-write",
             Self::Mixed50Read50Write => "mixed50-read50-write",
+            Self::ConnectionLimit => "connection-limit",
         }
     }
 }

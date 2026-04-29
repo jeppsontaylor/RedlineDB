@@ -133,6 +133,13 @@ impl BenchEngine for SqliteEngine {
                 "journal_mode": journal_mode,
                 "synchronous": synchronous,
             }),
+            // Lane BH P1 #7: SQLite does not expose internal sync
+            // counters; bench harness leaves these `None` so the
+            // process-level path (strace summary on Linux) is the
+            // authoritative source for SQLite rows.
+            fsyncs_issued: None,
+            fdatasyncs_issued: None,
+            pwrites_issued: None,
         })
     }
 

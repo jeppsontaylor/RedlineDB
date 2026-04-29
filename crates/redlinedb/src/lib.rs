@@ -212,6 +212,13 @@ impl Database {
                 written_lsn: stats.wal_written_lsn.0,
                 durable_lsn: stats.wal_durable_lsn.0,
                 retained_bytes,
+                // Lane BH P1 #7: forward kernel WAL coordinator
+                // syscall counters so the bench harness no longer
+                // has to leave `process_metrics.fsync_count` etc.
+                // as `None` on the macOS / no-strace paths.
+                fsyncs_issued: stats.wal_sync_counters.fsyncs_issued,
+                fdatasyncs_issued: stats.wal_sync_counters.fdatasyncs_issued,
+                pwrites_issued: stats.wal_sync_counters.pwrites_issued,
             },
             checkpoint: CheckpointBenchStats {
                 generation: stats.checkpoint.map(|control| control.generation),

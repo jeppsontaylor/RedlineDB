@@ -27,9 +27,19 @@ pub fn run_once(spec: &RunSpec) -> Result<RunRecord> {
     engine.setup_schema()?;
     if !matches!(
         spec.workload,
-        WorkloadKind::SingleRowInsert | WorkloadKind::BatchedInsert100
+        WorkloadKind::SingleRowInsert
+            | WorkloadKind::BatchedInsert100
+            | WorkloadKind::ConnectionLimit
     ) {
         engine.seed_kv(spec.rows)?;
+    }
+    // Lane BH P1 #7: connection-limit is a self-managed workload —
+    // it owns its connection pool, runs its own binary search, and
+    // reports the resulting `max_stable_connections` via
+    // `engine_stats`. The default per-thread runner is bypassed.
+    if matches!(spec.workload, WorkloadKind::ConnectionLimit) {
+        engine.seed_kv(spec.rows)?;
+        return run_connection_limit(engine.as_ref(), spec);
     }
     let started = Instant::now();
     let metrics = run_workload(engine.as_ref(), spec)?;
@@ -37,7 +47,22 @@ pub fn run_once(spec: &RunSpec) -> Result<RunRecord> {
     let snapshot = engine.snapshot()?;
     let checksum = engine.checksum()?;
     let elapsed = started.elapsed();
-    let process = process_metrics::collect_self();
+    let mut process = process_metrics::collect_self();
+    // Lane BH P1 #7: when the engine surfaced its own kernel-level
+    // syscall counters (Redline does, SQLite does not), prefer
+    // those over the strace/getrusage-derived host fields. This is
+    // why the certify manifest can now report non-`None`
+    // fsync/pwrite tallies on Redline rows even on macOS where
+    // strace is unavailable.
+    if snapshot.fsyncs_issued.is_some() {
+        process.fsync_count = snapshot.fsyncs_issued;
+    }
+    if snapshot.fdatasyncs_issued.is_some() {
+        process.fdatasync_count = snapshot.fdatasyncs_issued;
+    }
+    if snapshot.pwrites_issued.is_some() {
+        process.pwrite_count = snapshot.pwrites_issued;
+    }
     Ok(RunRecord {
         run_id: crate::report::next_run_id(spec.engine, spec.workload),
         engine: spec.engine,
@@ -112,6 +137,13 @@ fn run_workload(engine: &dyn BenchEngine, spec: &RunSpec) -> Result<Metrics> {
                         }
                         WorkloadKind::Mixed50Read50Write => {
                             mixed_ratio(&mut *conn, worker, spec.threads, spec.rows, &mut rng, 50)
+                        }
+                        // Lane BH P1 #7: connection-limit is dispatched
+                        // via `run_connection_limit` before this loop
+                        // is reached; the arm is unreachable in
+                        // practice but keeps the match exhaustive.
+                        WorkloadKind::ConnectionLimit => {
+                            unreachable!("connection-limit is handled by run_connection_limit")
                         }
                     };
                     match result {
@@ -255,6 +287,181 @@ fn mixed_ratio(
 
 fn blob_for(seed: usize) -> Vec<u8> {
     format!("value-{seed:08}").into_bytes()
+}
+
+/// Lane BH P1 #7: probe the engine for the maximum number of
+/// concurrent connections it serves stably under a 1s point-read
+/// burst.
+///
+/// Algorithm: establish a 1-connection baseline, capture its p99,
+/// then binary-search [low, high] over connection counts. A
+/// candidate `n` is "stable" iff during 1 second of point-reads
+/// across `n` worker threads:
+///   - error rate is at most 5%
+///   - locked / busy / timeout ratio is at most 50%
+///   - p99 stays within 100x of the baseline p99
+///
+/// Loop terminates once the binary-search window narrows to
+/// within 8 connections.
+///
+/// Output is a single [`RunRecord`] whose `engine_stats` contains
+/// `{"max_stable_connections": <usize>, "baseline_p99_us": <u64>}`
+/// so downstream consumers can plot the limit per engine without
+/// touching the workload-specific output schema.
+fn run_connection_limit(engine: &dyn BenchEngine, spec: &RunSpec) -> Result<RunRecord> {
+    use std::time::Duration;
+
+    // Baseline: a single connection, 1s of point-reads.
+    let baseline_metrics = run_connection_burst(engine, spec, 1, Duration::from_secs(1))?;
+    let baseline_p99 = baseline_metrics.latency.p99_us.max(1);
+
+    let mut low: usize = 1;
+    let mut high: usize = 64;
+    let mut best_stable = 1;
+    let mut last_metrics = baseline_metrics.clone();
+    let mut last_n = 1;
+    let stop_window = 8;
+
+    while high.saturating_sub(low) > stop_window {
+        let mid = (low + high) / 2;
+        let candidate = run_connection_burst(engine, spec, mid, Duration::from_secs(1))?;
+        last_metrics = candidate.clone();
+        last_n = mid;
+        let total = (candidate.operations + candidate.failures).max(1);
+        let error_rate = candidate.failures as f64 / total as f64;
+        let busy_ratio =
+            (candidate.busy_errors + candidate.locked_errors + candidate.timeout_errors) as f64
+                / total as f64;
+        let p99_blowup = candidate.latency.p99_us as f64 / baseline_p99 as f64;
+        let stable = error_rate <= 0.05 && busy_ratio <= 0.50 && p99_blowup <= 100.0;
+        if stable {
+            best_stable = mid;
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+
+    let started = Instant::now();
+    // Use the captured "last probe" metrics as the run's metrics
+    // so latency/throughput on the record reflect the final probe
+    // (not just the baseline). The most-load probe is the
+    // representative datapoint for telemetry.
+    let elapsed = started.elapsed().max(Duration::from_millis(1));
+    let snapshot = engine.snapshot()?;
+    let checksum = engine.checksum()?;
+    let mut process = process_metrics::collect_self();
+    if snapshot.fsyncs_issued.is_some() {
+        process.fsync_count = snapshot.fsyncs_issued;
+    }
+    if snapshot.fdatasyncs_issued.is_some() {
+        process.fdatasync_count = snapshot.fdatasyncs_issued;
+    }
+    if snapshot.pwrites_issued.is_some() {
+        process.pwrite_count = snapshot.pwrites_issued;
+    }
+
+    let mut engine_stats = match snapshot.engine_stats {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    engine_stats.insert(
+        "max_stable_connections".to_owned(),
+        serde_json::json!(best_stable),
+    );
+    engine_stats.insert(
+        "baseline_p99_us".to_owned(),
+        serde_json::json!(baseline_p99),
+    );
+    engine_stats.insert("last_probe_n".to_owned(), serde_json::json!(last_n));
+
+    Ok(RunRecord {
+        run_id: crate::report::next_run_id(spec.engine, spec.workload),
+        engine: spec.engine,
+        workload: spec.workload,
+        durability: spec.durability,
+        threads: best_stable,
+        seed: spec.seed,
+        cache_bytes: spec.cache_bytes,
+        environment: crate::report::collect_environment(),
+        metrics: MetricsSummary {
+            operations: last_metrics.operations,
+            failures: last_metrics.failures,
+            busy_errors: last_metrics.busy_errors + last_metrics.locked_errors,
+            locked_errors: last_metrics.locked_errors,
+            timeout_errors: last_metrics.timeout_errors,
+            elapsed_ms: elapsed.as_millis() as u64,
+            throughput_ops_per_sec: throughput(last_metrics.operations, elapsed),
+            latency: last_metrics.latency,
+        },
+        checksum,
+        data_bytes: snapshot.data_bytes,
+        wal_bytes: snapshot.wal_bytes,
+        engine_stats: serde_json::Value::Object(engine_stats),
+        process_metrics: Some(process),
+    })
+}
+
+/// Pre-aggregated metrics shape used by the connection-limit probe.
+#[derive(Debug, Clone)]
+struct ProbeMetrics {
+    operations: u64,
+    failures: u64,
+    busy_errors: u64,
+    locked_errors: u64,
+    timeout_errors: u64,
+    latency: crate::report::LatencySummary,
+}
+
+/// Run a 1-second point-read burst across `n` worker threads and
+/// summarize per-class error counts plus the latency histogram.
+fn run_connection_burst(
+    engine: &dyn BenchEngine,
+    spec: &RunSpec,
+    n: usize,
+    duration: std::time::Duration,
+) -> Result<ProbeMetrics> {
+    let n = n.max(1);
+    let barrier = Arc::new(Barrier::new(n));
+    let deadline = Instant::now() + duration;
+    let mut merged = Metrics::new();
+    let scope_result = crossbeam_utils::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(n);
+        for worker in 0..n {
+            let barrier = Arc::clone(&barrier);
+            handles.push(scope.spawn(move |_| {
+                let mut conn = engine.connect(worker)?;
+                let mut rng = ChaCha8Rng::seed_from_u64(spec.seed ^ worker as u64);
+                barrier.wait();
+                let mut metrics = Metrics::new();
+                while Instant::now() < deadline {
+                    let start = Instant::now();
+                    let result = point_read(&mut *conn, spec.rows, &mut rng);
+                    match result {
+                        Ok(()) => metrics.record_success(start.elapsed()),
+                        Err(err) => metrics.record_failure(classify_failure(&err)),
+                    }
+                }
+                Ok::<Metrics, anyhow::Error>(metrics)
+            }));
+        }
+        for handle in handles {
+            merged.merge(&handle.join().expect("worker panicked")?);
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    match scope_result {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!("worker thread panicked"),
+    }
+    Ok(ProbeMetrics {
+        operations: merged.operations(),
+        failures: merged.failures(),
+        busy_errors: merged.busy_errors(),
+        locked_errors: merged.locked_errors(),
+        timeout_errors: merged.timeout_errors(),
+        latency: merged.latency(),
+    })
 }
 
 /// Classify an error string into one of the four [`FailureKind`]

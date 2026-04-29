@@ -197,6 +197,17 @@ pub struct WalBenchStats {
     pub written_lsn: u64,
     pub durable_lsn: u64,
     pub retained_bytes: u64,
+    /// Lane BH P1 #7: durability syscall counters surfaced from
+    /// the kernel's WAL coordinator. Bench harnesses copy these
+    /// onto `ProcessMetrics` so `summary.csv` and the run record
+    /// no longer report `None` for the Linux-only counters when a
+    /// Redline engine is in play.
+    #[serde(default)]
+    pub fsyncs_issued: u64,
+    #[serde(default)]
+    pub fdatasyncs_issued: u64,
+    #[serde(default)]
+    pub pwrites_issued: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]

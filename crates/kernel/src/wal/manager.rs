@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -44,6 +45,60 @@ pub struct WalAppend {
     pub end_lsn: Lsn,
 }
 
+/// Lane BH P1 #7: per-coordinator counters for the durability syscalls.
+///
+/// Bumped by `WalManager` at the precise sites where the kernel
+/// actually issues a `pwrite`/`fdatasync`/`fsync`-equivalent. Exposed
+/// via [`WalCoordinator::sync_counters_snapshot`] for downstream
+/// telemetry (the bench harness reads this through
+/// `Database::benchmark_stats` so the certify manifest's
+/// `fsync_count` / `fdatasync_count` / `pwrite_count` fields are no
+/// longer always `None` on Redline rows).
+///
+/// Counters are intentionally per-coordinator (not global) so two
+/// concurrent benchmark engines in the same process do not pollute
+/// one another's metrics.
+#[derive(Debug, Default)]
+pub struct WalSyncCounters {
+    fsyncs_issued: AtomicU64,
+    fdatasyncs_issued: AtomicU64,
+    pwrites_issued: AtomicU64,
+}
+
+impl WalSyncCounters {
+    pub fn snapshot(&self) -> WalSyncCountersSnapshot {
+        WalSyncCountersSnapshot {
+            fsyncs_issued: self.fsyncs_issued.load(AtomicOrdering::Relaxed),
+            fdatasyncs_issued: self.fdatasyncs_issued.load(AtomicOrdering::Relaxed),
+            pwrites_issued: self.pwrites_issued.load(AtomicOrdering::Relaxed),
+        }
+    }
+
+    fn bump_fdatasync(&self) {
+        self.fdatasyncs_issued.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn bump_pwrite(&self) {
+        self.pwrites_issued.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Currently the WAL writer only invokes `sync_data`
+    /// (fdatasync), but the public counter is exposed so future
+    /// full-fsync sites have a place to land without breaking the
+    /// snapshot wire format.
+    #[allow(dead_code)]
+    fn bump_fsync(&self) {
+        self.fsyncs_issued.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalSyncCountersSnapshot {
+    pub fsyncs_issued: u64,
+    pub fdatasyncs_issued: u64,
+    pub pwrites_issued: u64,
+}
+
 #[derive(Debug)]
 pub struct WalManager<Fs: FileSystem = StdFileSystem> {
     dir: PathBuf,
@@ -55,6 +110,11 @@ pub struct WalManager<Fs: FileSystem = StdFileSystem> {
     written_lsn: Lsn,
     durable_lsn: Lsn,
     prev_lsn: Lsn,
+    /// Lane BH P1 #7: optional pointer to the coordinator's shared
+    /// sync counters; left `None` for raw `WalManager` use (e.g.
+    /// recovery scans) and populated when `WalCoordinator::new`
+    /// hands ownership of the manager to the writer thread.
+    sync_counters: Option<Arc<WalSyncCounters>>,
 }
 
 impl WalManager<StdFileSystem> {
@@ -102,6 +162,8 @@ pub struct WalCoordinator {
     writer: Mutex<Option<JoinHandle<()>>>,
     config: WalConfig,
     dir: PathBuf,
+    /// Lane BH P1 #7: shared counters bumped by the writer thread.
+    sync_counters: Arc<WalSyncCounters>,
 }
 
 #[derive(Debug)]
@@ -141,7 +203,7 @@ impl WalCoordinator {
         Self::new(dir, wal, config)
     }
 
-    fn new(dir: PathBuf, wal: WalManager, config: WalConfig) -> Result<Self> {
+    fn new(dir: PathBuf, mut wal: WalManager, config: WalConfig) -> Result<Self> {
         let reserved_lsn = wal.written_lsn();
         let prev_lsn = wal.prev_lsn;
         let durable_lsn = wal.durable_lsn();
@@ -158,6 +220,11 @@ impl WalCoordinator {
             }),
             cvar: Condvar::new(),
         });
+        // Lane BH P1 #7: hand the manager an `Arc<WalSyncCounters>`
+        // before it moves into the writer thread; the coordinator
+        // keeps a clone for `sync_counters_snapshot`.
+        let sync_counters = Arc::new(WalSyncCounters::default());
+        wal.sync_counters = Some(Arc::clone(&sync_counters));
         let writer_shared = Arc::clone(&shared);
         let writer_config = config.clone();
         let writer = thread::Builder::new()
@@ -168,6 +235,7 @@ impl WalCoordinator {
             writer: Mutex::new(Some(writer)),
             config,
             dir,
+            sync_counters,
         })
     }
 
@@ -272,6 +340,13 @@ impl WalCoordinator {
             .lock()
             .map(|state| state.durable_lsn)
             .map_err(|_| Error::CorruptWal("wal coordinator mutex poisoned"))
+    }
+
+    /// Lane BH P1 #7: durability syscall counters captured by the
+    /// WAL writer thread. Cheap (relaxed atomic loads) so callers
+    /// can sample without holding the coordinator state lock.
+    pub fn sync_counters_snapshot(&self) -> WalSyncCountersSnapshot {
+        self.sync_counters.snapshot()
     }
 
     pub fn prune_segments_below_checkpoint_lsn(&self, checkpoint_lsn: Lsn) -> Result<usize> {
@@ -630,6 +705,7 @@ impl<Fs: FileSystem> WalManager<Fs> {
             written_lsn: Lsn::ZERO,
             durable_lsn: Lsn::ZERO,
             prev_lsn: Lsn::ZERO,
+            sync_counters: None,
         })
     }
 
@@ -662,6 +738,7 @@ impl<Fs: FileSystem> WalManager<Fs> {
             written_lsn,
             durable_lsn: Lsn::ZERO,
             prev_lsn,
+            sync_counters: None,
         })
     }
 
@@ -704,6 +781,13 @@ impl<Fs: FileSystem> WalManager<Fs> {
         let written = self.written_lsn;
         crate::fail_point!("wal::flush", |_| { Ok(written) });
         self.active_file.sync_data()?;
+        // Lane BH P1 #7: count fdatasync calls so the bench harness
+        // can surface them on Redline rows. The bump only fires when
+        // the manager is owned by a `WalCoordinator` (raw recovery
+        // scans leave the counter `None`).
+        if let Some(counters) = &self.sync_counters {
+            counters.bump_fdatasync();
+        }
         self.durable_lsn = self.written_lsn;
         Ok(self.durable_lsn)
     }
@@ -747,6 +831,12 @@ impl<Fs: FileSystem> WalManager<Fs> {
         }
 
         self.active_file.write_all_at(self.active_offset, encoded)?;
+        // Lane BH P1 #7: count the pwrite-equivalent before bumping
+        // the offset; the bench harness reads this through
+        // `WalCoordinator::sync_counters_snapshot`.
+        if let Some(counters) = &self.sync_counters {
+            counters.bump_pwrite();
+        }
         self.active_offset += encoded.len() as u64;
         self.written_lsn = append.end_lsn;
         self.prev_lsn = append.start_lsn;
@@ -755,6 +845,12 @@ impl<Fs: FileSystem> WalManager<Fs> {
 
     fn rotate_segment(&mut self) -> Result<()> {
         self.active_file.sync_data()?;
+        // Lane BH P1 #7: rotation also performs an fdatasync to
+        // make the trailing block durable before swapping segment
+        // files; counted alongside the commit-path fdatasync.
+        if let Some(counters) = &self.sync_counters {
+            counters.bump_fdatasync();
+        }
         self.active_segment += 1;
         self.active_offset = 0;
         self.active_file = self
