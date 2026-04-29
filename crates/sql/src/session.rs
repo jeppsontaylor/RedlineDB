@@ -8,12 +8,45 @@ use redlinedb_kernel::format::RowId;
 use redlinedb_kernel::index::UniqueKeyGuard as KernelUniqueKeyGuard;
 
 use crate::exec::index_dml::IndexUndoOp;
+use crate::value::SqlValue;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BeginMode {
     Deferred,
     Immediate,
     Exclusive,
+}
+
+/// One entry in the per-transaction redo journal.
+///
+/// We capture the SQL text plus a 1-based-indexed binding vector so that on
+/// `ROLLBACK TO sp` we can drop the kernel transaction wholesale and replay
+/// the journal up to the savepoint's prefix length. Entries are only
+/// recorded for non-readonly statements that succeeded (i.e. were applied to
+/// the kernel tx) — pure SELECT / PRAGMA reads don't perturb the persistent
+/// state and would only bloat replay.
+#[derive(Debug, Clone)]
+pub struct JournalEntry {
+    pub sql: String,
+    /// 1-based bindings (slot 0 unused) matching `Statement::bindings`. Empty
+    /// for statements driven through `Connection::execute(sql)` directly.
+    pub bindings: Vec<Option<SqlValue>>,
+}
+
+/// A savepoint frame captures the journal length and counter snapshot at the
+/// moment `SAVEPOINT name` ran. Multiple frames may share a name (SQLite
+/// allows shadowing); `RELEASE`/`ROLLBACK TO` pick the most recent match.
+#[derive(Debug, Clone)]
+pub struct SavepointFrame {
+    pub name: String,
+    pub journal_len: usize,
+    pub changes: usize,
+    pub total_changes: usize,
+    pub last_insert_rowid: Option<i64>,
+    /// True if this savepoint implicitly opened the surrounding transaction.
+    /// When the last frame popped was implicit, RELEASE that frame commits
+    /// the underlying tx (matching SQLite's autocommit-style semantics).
+    pub implicit_tx: bool,
 }
 
 #[derive(Debug, Default)]
@@ -36,6 +69,13 @@ pub struct SessionState {
     /// pushes one [`IndexUndoOp`]; on rollback we replay the inverse, on
     /// commit we just drop the log.
     pub index_undo: Vec<IndexUndoOp>,
+    /// Per-tx replay journal — see `JournalEntry`. Cleared on commit/rollback.
+    pub journal: Vec<JournalEntry>,
+    /// Savepoint stack. Cleared on commit/rollback.
+    pub savepoints: Vec<SavepointFrame>,
+    /// True while the journal is being replayed; suppresses re-recording so
+    /// replay does not feed itself.
+    pub replay_in_progress: bool,
 }
 
 impl SessionState {
@@ -50,6 +90,15 @@ impl SessionState {
         self.unique_guards.clear();
         self.kernel_unique_guards.clear();
         self.index_undo.clear();
+        self.journal.clear();
+        self.savepoints.clear();
+        self.replay_in_progress = false;
+    }
+
+    /// Reset journal + savepoint stack at a transaction boundary.
+    pub fn clear_savepoints(&mut self) {
+        self.journal.clear();
+        self.savepoints.clear();
     }
 }
 
