@@ -912,17 +912,37 @@ pub(super) fn insert_row_with_resolution(
         Some(crate::statement::InsertConflict::Sqlite(
             crate::statement::ConflictAlgorithm::Replace,
         )) => {
+            // INSERT OR REPLACE: delete each conflicting heap row (and
+            // its index entries) before inserting the new tuple.
             let mut deleted = std::collections::HashSet::new();
             for conflict in &conflicts {
                 if deleted.insert(conflict.rowid) {
+                    let old_row =
+                        load_table_row_by_rowid(conn.engine(), tx, table, conflict.rowid)?;
                     conn.engine()
                         .delete_for_relation(tx, table.relation_id, conflict.rowid)?;
+                    if let Some(old_row) = old_row {
+                        crate::exec::index_dml::maintain_indexes_on_delete(
+                            conn.engine(),
+                            tx,
+                            table,
+                            &old_row.values,
+                            conflict.rowid,
+                        )?;
+                    }
                 }
             }
             let rowid = choose_rowid_for_insert(conn.engine(), table, values)?;
             let payload = encode_sql_row(table.table_id.0, values)?;
             conn.engine()
                 .insert_for_relation(tx, table.relation_id, rowid, payload)?;
+            crate::exec::index_dml::maintain_indexes_on_insert(
+                conn.engine(),
+                tx,
+                table,
+                values,
+                rowid,
+            )?;
             session.last_insert_rowid = Some(rowid.0 as i64);
             Ok(InsertOutcome::Inserted {
                 rowid,
