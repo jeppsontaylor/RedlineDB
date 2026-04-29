@@ -563,12 +563,12 @@ impl Engine {
             }
             let _detail =
                 arg.unwrap_or_else(|| "engine::commit::before_publish injected fault".to_string());
-            return Ok(self.finish_commit(
+            Ok(self.finish_commit(
                 &mut tx,
                 csn,
                 _pending_schema_for_closure.clone(),
                 CommitOutcome::MaybeCommitted,
-            ));
+            ))
         });
         Ok(self.finish_commit(&mut tx, csn, pending_schema, CommitOutcome::Committed(csn)))
     }

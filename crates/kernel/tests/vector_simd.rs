@@ -43,10 +43,7 @@ fn simd_l2_matches_scalar_across_1000_vectors() {
         let b = rand_vec(128, seed.wrapping_add(1));
         let s = l2_distance_scalar(&a, &b);
         let v = l2_distance(&a, &b);
-        assert!(
-            agree_within(s, v, 1e-6),
-            "seed={seed} scalar={s} simd={v}"
-        );
+        assert!(agree_within(s, v, 1e-6), "seed={seed} scalar={s} simd={v}");
     }
 }
 
@@ -57,10 +54,7 @@ fn simd_cosine_matches_scalar_across_1000_vectors() {
         let b = rand_vec(384, seed.wrapping_add(1));
         let s = cosine_distance_scalar(&a, &b);
         let v = cosine_distance(&a, &b);
-        assert!(
-            agree_within(s, v, 1e-6),
-            "seed={seed} scalar={s} simd={v}"
-        );
+        assert!(agree_within(s, v, 1e-6), "seed={seed} scalar={s} simd={v}");
     }
 }
 
@@ -77,10 +71,7 @@ fn simd_ip_matches_scalar_across_1000_vectors() {
         let s = inner_product_scalar(&a, &b);
         let v = inner_product(&a, &b);
         let abs = (s - v).abs();
-        assert!(
-            abs < 5e-6,
-            "seed={seed} scalar={s} simd={v} abs_diff={abs}"
-        );
+        assert!(abs < 5e-6, "seed={seed} scalar={s} simd={v} abs_diff={abs}");
     }
 }
 
@@ -200,8 +191,8 @@ fn flat_top_k_picks_nearest_under_l2() {
 fn flat_top_k_picks_nearest_under_cosine() {
     let query = vec![1.0_f32, 0.0];
     let candidates: Vec<(&'static str, Vec<f32>)> = vec![
-        ("parallel", vec![2.0_f32, 0.0]),    // distance ~ 0
-        ("orthogonal", vec![0.0_f32, 1.0]),  // distance ~ 1
+        ("parallel", vec![2.0_f32, 0.0]),      // distance ~ 0
+        ("orthogonal", vec![0.0_f32, 1.0]),    // distance ~ 1
         ("antiparallel", vec![-1.0_f32, 0.0]), // distance ~ 2
     ];
     let hits = flat_top_k(&query, VectorMetric::Cosine, 2, candidates).unwrap();

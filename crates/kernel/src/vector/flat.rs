@@ -81,11 +81,11 @@ where
         let distance = metric.distance(query, &vector)?;
         if heap.len() < k {
             heap.push(HeapEntry { distance, payload });
-        } else if let Some(top) = heap.peek() {
-            if distance < top.distance {
-                heap.pop();
-                heap.push(HeapEntry { distance, payload });
-            }
+        } else if let Some(top) = heap.peek()
+            && distance < top.distance
+        {
+            heap.pop();
+            heap.push(HeapEntry { distance, payload });
         }
     }
     let mut out: Vec<FlatScanHit<P>> = heap

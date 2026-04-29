@@ -107,10 +107,10 @@ pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn l2_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
 
     let len = a.len();
     let lanes = 8;
@@ -138,10 +138,10 @@ unsafe fn l2_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn cosine_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
 
     let len = a.len();
     let lanes = 8;
@@ -179,10 +179,10 @@ unsafe fn cosine_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn inner_product_avx2(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
 
     let len = a.len();
     let lanes = 8;
