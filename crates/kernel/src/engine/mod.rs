@@ -487,6 +487,11 @@ impl Engine {
             return Err(err);
         }
 
+        // Lane E failpoint: THE critical hook - WAL fsync has acked but the
+        // CSN has not been published yet. Crashing here lets harnesses prove
+        // recovery republishes the committed CSN watermark from the WAL even
+        // though no in-memory observer ever saw the commit.
+        crate::fail_point!("engine::commit::before_publish");
         self.txs.publish_commit(tx.id(), csn);
 
         if let Some(snapshot) = pending_schema {
@@ -753,6 +758,10 @@ impl Engine {
         })?;
         self.catalog_store
             .save_atomic(self.catalog.current().as_ref())?;
+        // Lane E failpoint: armed before the new control-file generation lands
+        // on disk. A crash here forces recovery to fall back to the previous
+        // generation, exercising the dual-control-file protocol.
+        crate::fail_point!("engine::checkpoint");
         let next = self
             .control
             .write_next(*checkpoint, durable_lsn, page_count)?;
