@@ -70,5 +70,11 @@
     "redlinedb-ffi": "rtk cargo test -p redlinedb-ffi --quiet --locked",
     "redlinedb-cli": "rtk cargo test -p redlinedb-cli --quiet --locked",
     "redlinedb-server": "rtk cargo test -p redlinedb-server --quiet --locked"
+  },
+  "phase10": {
+    "lane-ve": {
+      "unit": "rtk cargo test -p redlinedb-sql --lib --quiet --locked exec::vec",
+      "integration": "rtk cargo test -p redlinedb-sql --test phase10_ve --quiet --locked"
+    }
   }
 }
