@@ -145,9 +145,126 @@ git SHA, the Docker image digest, the host fingerprint (CPU model,
 core count, kernel, file system), the SQLite PRAGMA snapshot used in
 the benchmark, and per-output checksums. The repository tags each
 certified run: \texttt{phase9-baseline}, \texttt{phase9-zlbap1-final},
-\texttt{wave7-fused}, \texttt{phase9-xbabe1-certified} are the
-externally-visible markers in the public history. The PRAGMA
+\texttt{wave7-fused}, \texttt{phase9-xbabe1-certified}, and the
+phase-10 markers \texttt{phase10-baseline},
+\texttt{phase10-wave1-partial}, \texttt{phase10-wave2-fused},
+\texttt{phase10-xbabe1-certified}, \texttt{phase10-fusion-green} are
+the externally-visible markers in the public history. The PRAGMA
 snapshot is recorded so that a reader who reproduces the run can
 verify they are exercising SQLite under the same durability settings
 we did (\texttt{journal\_mode=WAL}, \texttt{synchronous=FULL} for
 strict cells, \texttt{synchronous=NORMAL} for relaxed cells).
+
+\subsection{Phase 10: Long-Range Capabilities}
+The phase-10 closure adds several capabilities the paper's first
+release deferred to future work. Each landed under the same
+parallel-agent + integrator-fusion discipline as the earlier
+proof lanes, with one branch per lane and a single integrator running
+the full proof matrix at each fusion point.
+
+\textbf{Index MVCC.} Index entries now carry per-entry
+\texttt{(create\_tx, delete\_tx)} tags rather than a boolean dead flag.
+Visibility is checked via \texttt{point\_lookup\_visible} and
+\texttt{range\_scan\_visible}, which take both a
+\texttt{ConcurrentTxStatus} and a \texttt{Snapshot} so concurrent
+readers and writers see consistent index contents without an
+SQL-side undo log. The format version was bumped to v2 with a
+v1$\rightarrow$v2 migration on \texttt{Engine::open}.
+
+\textbf{Commit outcome.} \texttt{CommitOutcome::MaybeCommitted} flows
+through the engine and the SQL executor so a post-fsync failure can
+be surfaced to the caller as ``maybe committed,'' rather than as an
+ordinary rollback that the application might retry against a state
+that has already become durable.
+
+\textbf{Heap/index integrity checker.}
+\texttt{kernel/src/integrity/} provides a full equivalence check:
+visible-row heap walk, full index tree dump, heap$\leftrightarrow$index
+cross-check, page-checksum verification, and LSN monotonicity audit.
+The result is a structured \texttt{IntegrityReport} per relation,
+exposed via \texttt{PRAGMA redline\_index\_check} and
+\texttt{PRAGMA redline\_full\_check}.
+
+\textbf{Group-commit telemetry.} The WAL writer thread already
+batched commits across waiters; phase-10 adds a 16-bucket batch-size
+histogram (p50/p95/p99/max) on \texttt{WalSyncCounters}, an opt-in
+per-core lane coordinator (default 1 lane), and a stub for a semantic
+counter combiner gated behind \texttt{WalConfig::semantic\_combiner}.
+
+\textbf{Vectorized executor and spillable sort.}
+\texttt{sql/src/exec/vec/} adds selection vectors, a top-K min-heap
+(emitted by the planner whenever \texttt{ORDER BY $\dots$ LIMIT $k$}
+with $k\le 64$), hash aggregation with a spill lane, and an external
+merge-sort that switches to disk runs when
+\texttt{QueryMemoryBroker::work\_mem\_bytes} is exceeded. The new
+bench workload \texttt{large-sort-spill} forces the spill path so
+the harness validates the memory ceiling end to end.
+
+\textbf{JSON.} The kernel ships a binary JSONB format
+(\texttt{magic 0x96}, format-v1, type tags 0x00..0x08, LEB128
+varints, zig-zag i64 encoding) plus a compiled JSON-path bytecode
+with SIMD key compare. The SQL surface delivers SQLite JSON1
+compatibility for \texttt{json}, \texttt{json\_array},
+\texttt{json\_array\_length}, \texttt{json\_object},
+\texttt{json\_extract}, \texttt{json\_set}, \texttt{json\_insert},
+\texttt{json\_replace}, \texttt{json\_remove}, \texttt{json\_patch}
+(RFC 7396), \texttt{json\_type}, \texttt{json\_valid},
+\texttt{json\_quote}, \texttt{json\_minify}, the \texttt{->}
+(JSON-text) and \texttt{->>} (SQL-value) operators, and SQLite's
+shorthand path syntax (bare ident $\rightarrow$ \texttt{\$.ident},
+bare integer $\rightarrow$ \texttt{\$[N]}). A 1000-iteration
+round-trip fuzz validates the wire format against
+\texttt{serde\_json::Value} ground truth.
+
+\textbf{Vector search.} A native VECTOR column carries
+dimension-checked \texttt{f32} arrays through the existing Blob
+storage class (no new \texttt{SqlValue} variant). Distance kernels
+expose L2, Cosine, and InnerProduct via runtime-dispatched
+AVX2/NEON/scalar SIMD. The exact flat-scan operator computes top-$k$
+in one pass; \texttt{<=>} (cosine) flows through the existing
+binary-op path. An HNSW
+index~\cite{malkov2018hnsw} (M=32, ef\_construction=200) achieves
+recall@10 = 0.95 at ef\_search=64 on a 10k-vector 128-d Gaussian
+synthetic dataset; a DiskANN-style Vamana
+graph~\cite{subramanya2019diskann} (R=64, $\alpha$=1.2) achieves
+recall@10 = 0.99 on a 10k-vector 32-d synthetic dataset, with the
+4\,KiB sector layout designed in for future mmap-resident search.
+
+\textbf{SQLite surface.} SAVEPOINT / RELEASE / ROLLBACK TO are
+implemented via journal-and-replay on the SQL layer (no kernel-side
+partial rollback hook is needed for the supported test matrix).
+Multi-statement parsing returns the unconsumed remainder so the FFI
+\texttt{sqlite3\_prepare\_v2} can populate \texttt{pzTail}; the
+\texttt{sqlite3\_exec} path walks all statements and stops at the
+first failing one with an \texttt{errmsg} owned by \texttt{CString}
+and freed via \texttt{sqlite3\_free}. The conflict matrix
+(\texttt{INSERT OR ABORT/FAIL/IGNORE/REPLACE/ROLLBACK}) routes through
+a single \texttt{apply\_conflict\_resolution} helper across NOT NULL,
+CHECK, UNIQUE, and PK constraints. Wrong-result fixes against
+SQLite's documented behavior cover \texttt{SELECT ALL},
+\texttt{NOT IN NULL}, NULL concatenation, divide / modulo by zero
+returning NULL, scalar-function NULL propagation, CAST
+truncation/prefix-parse, GLOB bracket / range / negation, and
+ORDER BY honoring keys after GROUP BY / DISTINCT. New full-execution
+features include REGEXP, the SQLite date/time function family
+(\texttt{date}, \texttt{time}, \texttt{datetime}, \texttt{julianday},
+\texttt{strftime}, \texttt{unixepoch} + modifiers), and the BINARY /
+NOCASE / RTRIM collations. Foreign keys, ALTER TABLE DROP COLUMN,
+partial / expression indexes, CTEs, CREATE VIEW, CREATE TRIGGER,
+window functions, and generated columns parse cleanly and surface
+structured ``not yet implemented'' errors at execute time so the
+SQLite-compatibility surface is honest about what executes versus
+what merely parses.
+
+\textbf{Bench checksums.} Phase-9 used \texttt{MAX(k)} and
+\texttt{COUNT(*)} as placeholder checksums, which an external audit
+correctly flagged as not actually checksums. Phase-10 replaces them
+with \texttt{DatasetChecksum}: \texttt{(row\_count, key\_xor,
+payload\_hash)} folded across all rows, where \texttt{row\_hash} is
+a deterministic XXH3-style fold of the row bytes and \texttt{key\_xor}
+is order-independent. \texttt{DatasetChecksum::merge} is associative
+so two re-runs of the same workload at the same seed produce
+identical manifest checksums.
+
+The phase-10 test matrix runs to 691 passing tests (vs.\ 241 at the
+phase-9 wave-7 baseline; +450 phase-10 tests).
