@@ -537,7 +537,10 @@ fn run_large_sort_spill(engine: &dyn BenchEngine, spec: &RunSpec) -> Result<RunR
             &[],
         )?;
         conn.execute("DELETE FROM sortable", &[])?;
-        let target_rows = spec.rows.max(200_000);
+        // Honor `--rows` so callers can run smoke-tests; only when the
+        // CLI's default (512) is used do we bump to the documented
+        // paper-grade 200_000.
+        let target_rows = if spec.rows == 512 { 200_000 } else { spec.rows };
         let mut rng = ChaCha8Rng::seed_from_u64(spec.seed);
         conn.begin_immediate()?;
         for id in 0..target_rows {
