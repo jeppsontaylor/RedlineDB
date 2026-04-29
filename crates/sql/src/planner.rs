@@ -887,7 +887,12 @@ fn wrap_ordering(
             _ => None,
         })
         .unwrap_or(usize::MAX);
-    let kind = if limit_small != usize::MAX {
+    // Lane VE: a small `LIMIT` lets the executor use the fixed-size top-K
+    // heap instead of a full sort. The threshold matches
+    // `vec::TOPK_LIMIT_THRESHOLD` to keep planner-vs-executor decisions in
+    // lockstep.
+    let kind = if limit_small != usize::MAX && limit_small <= crate::exec::vec::TOPK_LIMIT_THRESHOLD
+    {
         PhysicalKind::TopN
     } else {
         PhysicalKind::Sort
