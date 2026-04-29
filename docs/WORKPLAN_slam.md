@@ -317,6 +317,58 @@ Wave 7 artifact SHA-256:
 - `target/bench/wave7-certify-smoke/summary.csv` — `a45c5f6827ffe6be09ff6d7744f477100f268fd62313d4a216aca118e74f34d8`
 - `target/bench/wave7-certify-smoke/report.md` — `d5c2f66e0f089f97ce8650cc173d5e12129b1e9ea8001a0b0530294ec4c167e6`
 
+## xbabe1 Certification (Phase 9 closing artifact)
+
+The Wave 7 fused tree was synced to xbabe1 and the bin-packing parallel certify scheduler ran the full matrix at the restored row counts. Total: **1728 child runs** (8 workloads × 2 durabilities × 8 thread levels × 5 reps + 1 warmup × 2 engines, plus the connection-limit sweep across thread fan-outs), **0 failures** end-to-end. Tag: `phase9-xbabe1-certified`.
+
+Run command (from repo root):
+```
+./scripts/bench/xbabe1_run.sh cargo run -p redlinedb-bench --release -- certify \
+  --config crates/bench/bench/certification.toml \
+  --out-dir target/bench/xbabe1/certification \
+  --seed 7 --repetitions 5 --warmup 1
+./scripts/bench/xbabe1_fetch.sh certification
+```
+
+Wall-clock: **~58 minutes** on the 128-core xbabe1 host (00:43 → 01:42). The Wave 7 Lane BH parallel scheduler is the difference between this run and the pre-Wave-7 serial harness which would have taken multi-day at the same scope.
+
+Manifest (`target/bench/xbabe1/certification/manifest.json`) carries:
+- `git_sha`: `4a96b57fd672d2a039f43f01e0cb2548fdbe327a`
+- `git_dirty`: `false`
+- `git_short`: `4a96b57`
+- Docker image digest (RepoDigest from xbabe1)
+- Host CPU/RAM/FS via `collect_environment` plus the populated env passthrough
+- SQLite `pragmas` (journal_mode=wal, synchronous=2, cache_size=-32768, busy_timeout=5000, foreign_keys=1, page_size=4096) and `pragma_validation: "ok"`
+- Per-run SHA-256 checksums (engine × workload × durability × threads keyspace) so re-runs are byte-comparable
+- `with_strace: false` (strace ran in a separate sampling pass; the headline matrix excludes its overhead)
+- `process_metrics_per_run` populated (`fdatasync_count` and `pwrite_count` non-`None` for Redline rows)
+
+Artifact SHA-256:
+- `target/bench/xbabe1/certification/manifest.json` — `a1d9aa942c8b0bc65167518605b8b702ff042291fdc8cda1c1b8a53ffae58b06`
+- `target/bench/xbabe1/certification/runs.jsonl` — `9fee1bd1d2fa8370674b243accfd6e911b99f69b2441ee0681126181673bcc7e`
+- `target/bench/xbabe1/certification/summary.csv` — `17b4e196be5377edabcfbd0228f63840104b8376c09e5fc462bd8eb07823a9b8`
+- `target/bench/xbabe1/certification/report.md` — `5202823f82458e6b65c41a673669d4f6b8c6c139d68458b9232ce5acad7c6e19`
+- `target/bench/xbabe1/certification/report.json` — `1ba9a12facb4134cd222d21c8a9ad123342d3bd6c0906286f54fd3f0e24b4a38`
+
+### Headline xbabe1 results (mean of 5 reps, strict durability)
+
+| Workload | Threads | Redline qps | SQLite qps | Ratio |
+|---|---:|---:|---:|---:|
+| writers-disjoint | 64 | 656 | 79 | **8.32×** |
+| mixed-80-20 | 64 | 3,270 | 408 | **8.01×** |
+| mixed-95-5 | 64 | 13,037 | 1,646 | **7.92×** |
+| mixed-50-50 | 64 | 1,283 | 162 | **7.90×** |
+| point-read-pk | 4 | 14,716 | 1,959 | **7.51×** |
+| mixed-95-5 | 32 | 8,578 | 1,361 | **6.30×** |
+| point-read-pk | 128 | 52,478 | 48,056 | **1.09×** (parity) |
+| point-read-pk | 64 | 122,049 | 122,689 | 0.99× (parity) |
+| hot-row-update | 64 | 17 | 79 | 0.21× (Redline trails) |
+| secondary-index-range | 64 | 1,363 | 118,416 | 0.012× (Redline trails) |
+
+### Phase 9 closing tags
+
+- `phase9-baseline`, `wave1-fused`, `wave2-fused`, `wave3-fused`, `wave4-fused`, `wave5-fused`, `phase9-fusion-green`, `wave6-fused`, `phase9-fusion-green-v2`, `wave7-fused`, `phase9-fusion-green-v3`, `phase9-xbabe1-certified`.
+
 ## Verified Proof
 
 These commands passed in the current workspace:
