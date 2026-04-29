@@ -673,17 +673,70 @@ Phase 10 closing tags:
 - `phase10-xbabe1-certified` — full xbabe1 cert at git_sha 7c10410
 - `phase10-fusion-green` — final cleanup + proof matrix
 
+### Phase 10G — cert-v3 (`phase10-fusion-green` advanced)
+
+After tagging the original `phase10-fusion-green`, a follow-on
+fusion landed (`phase10/cert-v3`) wiring the six deferred bench
+workloads, exposing the WAL group-commit telemetry through the
+public facade, and plumbing collation through the VE spillable-sort
+path. The fusion-green tag was advanced forward to this state.
+
+In-flight commit `phase10/cert-v3: bench expansion + telemetry
+passthrough + collation in spill` adds:
+
+- `crates/bench/src/workload.rs` (+722 LOC) — `json-path-extract`,
+  `json-path-update`, `vector-flat-search`, `vector-ann-search`,
+  `vector-ann-search-disk`, `commit-storm-batched` (the seventh
+  workload `large-sort-spill` already landed via Lane VE). Plus
+  per-workload setup for HNSW + DiskANN.
+- `crates/bench/src/config.rs` — `WorkloadKind` enum extended.
+- `crates/bench/bench/certification-phase10-v3{,-smoke,-stress}.toml`
+  — three new bench configs.
+- `crates/redlinedb/src/{lib,options}.rs` — `WalBenchStats` gains
+  `group_commits_issued` / `batch_bytes_sum` / `batch_record_count_sum`
+  / `batch_p50` / `p95` / `p99` / `max` so bench harness can record
+  group-commit telemetry per run.
+- `crates/sql/src/exec.rs` — collation plumbed through the VE
+  spillable-sort path.
+- `crates/sql/tests/phase10_sqld_collation.rs::nocase_collation_in_order_by`
+  — `#[ignore]` removed.
+- `paper/sections/evaluation.tex` — new ``Phase 10 Feature Lanes''
+  subsection wiring fig6/7/8.
+- `paper/scripts/build_figs.py` — fig6/7/8 generators.
+
+Cert-v3 local smoke (`phase10-v3-smoke`):
+- `cargo run -p redlinedb-bench --release -- certify --config
+  crates/bench/bench/certification-phase10-v3-smoke.toml --out-dir
+  target/bench/phase10-v3-smoke --seed 7 --repetitions 1 --warmup 0`
+  — exit 0
+- `target/bench/phase10-v3-smoke/manifest.json` — `402a1101ee761fbb768482e70680da3e2ccd37c95ba3d0dd3e64dd656c6fff34`
+- `target/bench/phase10-v3-smoke/runs.jsonl` — `7d30c70d705e80197c216357c956ed0532e89b906f4a99092991c38e0b169499`
+- `target/bench/phase10-v3-smoke/summary.csv` — `1ff04f4fea04e794d96131b5c0b2b8c2fefea15c53d8dc10243a92609be37393`
+- `target/bench/phase10-v3-smoke/report.md` — `8a24881ec3a0c2a0e94fa4a9437079f54049a365cb14058d22a369541255e5df`
+
+Test count: **694 passing, 2 ignored** (was 691 at the original
+phase10-fusion-green; +3 cert-v3 tests + the unignored collation test).
+
 ### Deferred to phase 11
 
-Bench expansion (cert-v2 with json/vector/commit-storm workloads) is
-deferred — the lane code shipped, the workloads themselves need
-bench-side wiring (`crates/bench/src/workload.rs::run_workload`
-dispatch + per-workload helper functions). The existing
-`large-sort-spill` workload landed via Lane VE and is included in
-`certification.toml` candidate sets. See `docs/PHASE10_HANDOFF.md`
-for the full deferred list (DiskANN mmap, HNSW M=16 recall tuning,
-semantic combiner, VE collation in spill, SQL-D Tier 2/3 execution,
-JSON aggregates, exec.rs split).
+- xbabe1 cert-v3 full run (only the local smoke has been certified;
+  remote run is ready via `cargo run -p redlinedb-bench --release
+  -- certify --config crates/bench/bench/certification-phase10-v3.toml
+  --out-dir target/bench/xbabe1/phase10-v3 --seed 7 --repetitions 5
+  --warmup 1`)
+- DiskANN mmap-resident search (Lane V3 sector layout designed in;
+  in-memory today)
+- HNSW recall@10 ≥ 0.95 at M=16 (current impl needs M=32)
+- Semantic counter combiner full implementation (stub-with-`unimplemented!()`
+  gated behind `WalConfig::semantic_combiner`)
+- SQL-D Tier 2/3 execution (FK enforcement, triggers, views, CTEs,
+  recursive CTEs, window functions, generated columns — parser-only
+  today)
+- JSON aggregates (`json_group_array`, `json_group_object`,
+  `json_each`, `json_tree` — need exec / parser changes outside
+  Lane J1 scope)
+- `crates/sql/src/exec.rs` split (currently 1963/2000 LOC; any
+  phase-11 edit should plan a split first)
 
 ## Verified Proof
 
