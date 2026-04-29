@@ -616,25 +616,36 @@ fn collect_unique_conflicts(
     values: &[SqlValue],
     skip_rowid: Option<RowId>,
 ) -> Result<Vec<UniqueConflict>> {
-    let rows = collect_table_rows(conn.engine(), tx, table)?;
+    // Lane B: the physical-index probe replaces the O(N) heap scan when the
+    // index has been allocated by Lane A. The fallback path (no
+    // `meta_page_id`) preserves the original O(N) behavior so legacy
+    // databases without physical indexes still enforce UNIQUE.
+    //
+    // SQLite enforces UNIQUE on every unique index — both inline UNIQUE
+    // constraints (which create a backing index AND a Constraint row) and
+    // standalone `CREATE UNIQUE INDEX` statements (which only create the
+    // index). We therefore enumerate `table.indexes` and only fall back to
+    // the constraints list to recover the original constraint name when a
+    // matching one exists.
     let mut conflicts = Vec::new();
-    for constraint in &table.constraints {
-        if constraint.kind != ConstraintKind::Unique
-            && constraint.kind != ConstraintKind::PrimaryKey
-        {
+    let mut legacy_indexes: Vec<&redlinedb_kernel::catalog::IndexDef> = Vec::new();
+    for index in &table.indexes {
+        if !index.unique && !index.primary {
             continue;
         }
-        let index = match constraint.index_id {
-            Some(index_id) => table
-                .indexes
-                .iter()
-                .find(|index| index.index_id == index_id)
-                .ok_or(Error::UnsupportedSql(
-                    "constraint references missing index".to_owned(),
-                ))?,
-            None => continue,
-        };
-        let key_values = index
+        let constraint_name = table
+            .constraints
+            .iter()
+            .find(|c| {
+                (c.kind == ConstraintKind::Unique || c.kind == ConstraintKind::PrimaryKey)
+                    && c.index_id == Some(index.index_id)
+            })
+            .and_then(|c| c.name.as_deref().map(Arc::<str>::from))
+            .or_else(|| Some(Arc::from(index.name.as_ref())));
+        // SQLite NULL parity: a NULL anywhere in the unique-key tuple
+        // disables the conflict check entirely. We compute this once from
+        // the SQL-side values so both index and legacy paths agree.
+        let key_values: Vec<SqlValue> = index
             .keys
             .iter()
             .map(|key| {
@@ -643,7 +654,61 @@ fn collect_unique_conflicts(
                     .cloned()
                     .unwrap_or(SqlValue::Null)
             })
-            .collect::<Vec<_>>();
+            .collect();
+        if key_values
+            .iter()
+            .any(|value| matches!(value, SqlValue::Null))
+        {
+            continue;
+        }
+        if let Some(handle) = crate::exec::index_dml::open_index_handle(conn.engine(), index) {
+            let key = crate::exec::index_dml::build_index_key(index, values);
+            let (_guard, hit) =
+                crate::exec::index_dml::probe_unique_for_conflict(&handle, tx, skip_rowid, &key)?;
+            if let Some(rowid) = hit {
+                conflicts.push(UniqueConflict {
+                    rowid,
+                    constraint_name: constraint_name.clone(),
+                    key_ordinals: index.keys.iter().map(|key| key.ordinal as usize).collect(),
+                });
+            }
+            // The kernel `UniqueKeyGuard` lifetime is tied to the
+            // `BtreeIndex` Arc and not stored in the SQL session; once we
+            // return, the kernel guard drops, releasing the per-key
+            // lock. The kernel performs the actual write under its own
+            // structure_lock during `insert_tx`, so a brief gap here is
+            // safe — any racing writer would acquire the same kernel
+            // guard before its own probe.
+            //
+            // We still take a SQL-side guard so legacy callers that
+            // share `unique_locks()` continue to serialize against this
+            // key. The dual locking is harmless and matches what the
+            // legacy fallback below does.
+            let sql_lock_key =
+                unique_key_bytes(table.table_id.0, index.index_id.0, &key_values)?;
+            let sql_guard = conn.unique_locks().lock(sql_lock_key, tx.id().0)?;
+            session.unique_guards.push(sql_guard);
+            continue;
+        }
+        legacy_indexes.push(index);
+    }
+
+    // Legacy O(N) heap scan for any indexes Lane A did not allocate yet.
+    if legacy_indexes.is_empty() {
+        return Ok(conflicts);
+    }
+    let rows = collect_table_rows(conn.engine(), tx, table)?;
+    for index in legacy_indexes {
+        let key_values: Vec<SqlValue> = index
+            .keys
+            .iter()
+            .map(|key| {
+                values
+                    .get(key.ordinal as usize)
+                    .cloned()
+                    .unwrap_or(SqlValue::Null)
+            })
+            .collect();
         if key_values
             .iter()
             .any(|value| matches!(value, SqlValue::Null))
@@ -657,7 +722,7 @@ fn collect_unique_conflicts(
             if skip_rowid == Some(row.rowid) {
                 continue;
             }
-            let other = index
+            let other: Vec<SqlValue> = index
                 .keys
                 .iter()
                 .map(|key| {
@@ -666,15 +731,17 @@ fn collect_unique_conflicts(
                         .cloned()
                         .unwrap_or(SqlValue::Null)
                 })
-                .collect::<Vec<_>>();
+                .collect();
             if key_values_equal(&key_values, &other) {
+                let constraint_name = table
+                    .constraints
+                    .iter()
+                    .find(|c| c.index_id == Some(index.index_id))
+                    .and_then(|c| c.name.as_deref().map(Arc::<str>::from))
+                    .or_else(|| Some(Arc::from(index.name.as_ref())));
                 conflicts.push(UniqueConflict {
                     rowid: row.rowid,
-                    constraint_name: constraint
-                        .name
-                        .as_deref()
-                        .map(Arc::<str>::from)
-                        .or_else(|| Some(Arc::from(index.name.as_ref()))),
+                    constraint_name,
                     key_ordinals: index.keys.iter().map(|key| key.ordinal as usize).collect(),
                 });
                 break;
@@ -779,9 +846,20 @@ pub(super) fn insert_row_with_resolution(
     apply_constraints(table, values)?;
     let conflicts = collect_unique_conflicts(conn, session, tx, table, values, None)?;
     if conflicts.is_empty() {
+        // Order: index unique-conflict check (already done above) ->
+        // heap insert -> index inserts. If the heap insert succeeds but
+        // the index insert fails, the kernel rolls back the whole tx so
+        // recovery either replays both or neither.
         let payload = encode_sql_row(table.table_id.0, values)?;
         conn.engine()
             .insert_for_relation(tx, table.relation_id, rowid, payload)?;
+        crate::exec::index_dml::maintain_indexes_on_insert(
+            conn.engine(),
+            tx,
+            table,
+            values,
+            rowid,
+        )?;
         session.last_insert_rowid = Some(rowid.0 as i64);
         return Ok(InsertOutcome::Inserted {
             rowid,
