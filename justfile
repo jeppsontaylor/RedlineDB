@@ -27,8 +27,11 @@ phase8-smoke:
 
 phase9-smoke:
   rtk cargo test -p redlinedb-bench --quiet --locked
-  rtk cargo run -p redlinedb-bench -- compare --config crates/bench/bench/smoke.toml --out target/bench/smoke.jsonl --report target/bench/smoke.md --seed 7
-  rtk cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat/slt --seed 7
+  rtk cargo run -p redlinedb-bench -- certify --config crates/bench/bench/smoke.toml --out-dir target/bench/certify-smoke --seed 7 --repetitions 1 --warmup 0
+  rtk cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7
+
+phase9-certify:
+  rtk cargo run -p redlinedb-bench -- certify --config crates/bench/bench/certification.toml --out-dir target/bench/certify-certification --seed 7 --repetitions 5 --warmup 1
 
 security:
   rtk cargo audit

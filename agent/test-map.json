@@ -19,14 +19,14 @@
   ],
   "phase9-smoke": [
     "rtk cargo test -p redlinedb-bench --quiet --locked",
-    "rtk cargo run -p redlinedb-bench -- compare --config crates/bench/bench/smoke.toml --out target/bench/smoke.jsonl --report target/bench/smoke.md --seed 7",
+    "rtk cargo run -p redlinedb-bench -- certify --config crates/bench/bench/smoke.toml --out-dir target/bench/certify-smoke --seed 7 --repetitions 1 --warmup 0",
     "rtk cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7"
   ],
   "phase9-compat-full": [
     "rtk cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7 --out target/bench/compat-full.json"
   ],
   "phase9-certification": [
-    "rtk cargo run -p redlinedb-bench -- compare --config crates/bench/bench/certification.toml --out target/bench/certification.jsonl --report target/bench/certification.md --seed 7"
+    "rtk cargo run -p redlinedb-bench -- certify --config crates/bench/bench/certification.toml --out-dir target/bench/certify-certification --seed 7 --repetitions 5 --warmup 1"
   ],
   "phase9-docker-smoke": [
     "./scripts/bench/xbabe1_sync.sh",
@@ -35,9 +35,12 @@
   "phase9-recovery-matrix": [
     "rtk cargo run -p redlinedb-bench -- recover-matrix --config crates/bench/bench/recovery-matrix.toml --out target/bench/recovery-matrix.json --seed 7"
   ],
+  "phase9-failpoint-matrix": [
+    "rtk cargo run -p redlinedb-bench -- failpoint-matrix --config crates/bench/bench/failpoint-matrix.toml --out target/bench/failpoint-matrix.json --seed 7"
+  ],
   "phase9-xbabe1-certification": [
     "./scripts/bench/xbabe1_sync.sh",
-    "./scripts/bench/xbabe1_run.sh rtk cargo run -p redlinedb-bench -- compare --config crates/bench/bench/certification.toml --out target/bench/xbabe1/certification.jsonl --report target/bench/xbabe1/certification.md --seed 7",
+    "./scripts/bench/xbabe1_run.sh rtk cargo run -p redlinedb-bench -- certify --config crates/bench/bench/certification.toml --out-dir target/bench/xbabe1/certification --seed 7 --repetitions 5 --warmup 1",
     "./scripts/bench/xbabe1_fetch.sh certification"
   ],
   "security-local": [
