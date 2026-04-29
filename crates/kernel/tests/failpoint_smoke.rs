@@ -51,6 +51,24 @@ fn fail_point_macro_no_op_when_unset() {
     );
 }
 
+/// Lane FP reviewer-finding: `cfg("name", "abort")` must return `Err`
+/// at the kernel boundary. The `fail` crate grammar does not include
+/// `abort` and the previous `cfg` wrapper forwarded the action
+/// verbatim, which silently dropped the configuration and caused the
+/// bench failpoint-matrix to false-pass cases that targeted `abort`.
+/// Validation now rejects unknown tasks before they reach `fail::cfg`.
+#[test]
+fn cfg_rejects_abort() {
+    let scenario = fail::FailScenario::setup();
+    let err = failpoints::cfg("test::abort", "abort")
+        .expect_err("abort is not a fail-crate action; cfg must reject it");
+    assert!(
+        err.to_lowercase().contains("abort"),
+        "error message must name the unsupported token verbatim, got: {err}"
+    );
+    drop(scenario);
+}
+
 /// Lane E smoke: arm `engine::commit::before_publish` with `panic` and
 /// confirm a kernel `Engine::commit` invocation actually triggers the
 /// hook. We do not exercise recovery here because the unit-test scope

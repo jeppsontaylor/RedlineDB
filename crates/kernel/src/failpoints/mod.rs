@@ -42,11 +42,21 @@ pub fn init() {}
 
 /// Configure a named failpoint with one of the registry actions.
 ///
-/// Accepted actions match the `fail` crate grammar: `panic`, `return(value)`,
-/// `off`, `sleep(N)`, `pause`, `print`, `yield`, plus optional `K%`,
-/// `K*action`, and `name->action` chaining.
+/// Accepted actions match the `fail` crate grammar: `panic`, `return`,
+/// `return(value)`, `off`, `print`, `print(msg)`, `pause`, `sleep(N)`,
+/// `yield`, plus optional `K%action` (frequency) and `K*action` (count)
+/// prefixes which compose with each other (e.g. `25%5*panic`).
+///
+/// We pre-validate `action` against the same grammar before forwarding
+/// to `fail::cfg`. Without this, unknown tokens like `abort` are
+/// silently rejected by the `fail` crate and the bench harness happily
+/// reports a false pass when `acked == recovered == 0`. Fail-loud at
+/// the configuration boundary so the bench-runner sees the error
+/// immediately and the per-case json report records the misconfigured
+/// action instead of an empty success.
 #[cfg(feature = "failpoints")]
 pub fn cfg(name: &str, action: &str) -> Result<(), String> {
+    validate_action(action)?;
     fail::cfg(name, action)
 }
 
@@ -54,4 +64,126 @@ pub fn cfg(name: &str, action: &str) -> Result<(), String> {
 #[cfg(not(feature = "failpoints"))]
 pub fn cfg(_name: &str, _action: &str) -> Result<(), String> {
     Ok(())
+}
+
+/// Validate an action string against the `fail` 0.5.x grammar.
+///
+/// Grammar (matching `fail::Action::from_str`):
+///
+/// ```text
+/// action := [freq% ][count* ]task[(args)]
+/// task   := off | return | sleep | panic | print | pause | yield | delay
+/// ```
+///
+/// Returns `Err` with a message naming the offending token when the
+/// task keyword is unrecognised, the optional frequency / count prefix
+/// fails to parse, or parentheses are unbalanced. The error string
+/// includes the unsupported token verbatim so callers (e.g. the bench
+/// failpoint matrix runner) can surface it in the per-case report.
+#[cfg(feature = "failpoints")]
+fn validate_action(action: &str) -> Result<(), String> {
+    let trimmed = action.trim();
+    if trimmed.is_empty() {
+        return Err("empty failpoint action".to_owned());
+    }
+
+    // Strip optional `(args)` suffix. The fail crate accepts `task(arg)`
+    // for `return`, `sleep`, `print`, and `delay`. We do not validate
+    // the args content here: that mirrors the fail crate, which only
+    // re-parses args lazily inside the matching task arm.
+    let mut remain = trimmed;
+    if let Some(open) = remain.find('(') {
+        let suffix = &remain[open..];
+        if !suffix.ends_with(')') {
+            return Err(format!(
+                "failpoint action {action:?} has unbalanced parentheses"
+            ));
+        }
+        remain = &remain[..open];
+    }
+
+    // Strip optional `freq%` prefix. Frequency must parse as f32.
+    if let Some(percent) = remain.find('%') {
+        let (head, rest) = remain.split_at(percent);
+        let rest = &rest[1..]; // skip the `%`
+        head.parse::<f32>().map_err(|err| {
+            format!("failpoint action {action:?} has invalid frequency {head:?}: {err}")
+        })?;
+        remain = rest;
+    }
+
+    // Strip optional `count*` prefix. Count must parse as usize.
+    if let Some(star) = remain.find('*') {
+        let (head, rest) = remain.split_at(star);
+        let rest = &rest[1..]; // skip the `*`
+        head.parse::<usize>().map_err(|err| {
+            format!("failpoint action {action:?} has invalid count {head:?}: {err}")
+        })?;
+        remain = rest;
+    }
+
+    let task = remain.trim();
+    match task {
+        "off" | "return" | "sleep" | "panic" | "print" | "pause" | "yield" | "delay" => Ok(()),
+        other => Err(format!(
+            "failpoint action {action:?} has unsupported task token {other:?}; \
+             expected one of off|return|sleep|panic|print|pause|yield|delay"
+        )),
+    }
+}
+
+#[cfg(all(test, feature = "failpoints"))]
+mod tests {
+    use super::validate_action;
+
+    #[test]
+    fn validate_action_accepts_known_tasks() {
+        for action in [
+            "panic",
+            "return",
+            "return(value)",
+            "off",
+            "print",
+            "print(hello)",
+            "pause",
+            "sleep(10)",
+            "yield",
+            "delay(5)",
+        ] {
+            validate_action(action).unwrap_or_else(|err| {
+                panic!("expected {action:?} to validate: {err}");
+            });
+        }
+    }
+
+    #[test]
+    fn validate_action_accepts_count_and_frequency_prefixes() {
+        validate_action("5*panic").expect("count prefix");
+        validate_action("50%panic").expect("frequency prefix");
+        validate_action("50%5*panic").expect("frequency+count prefix");
+    }
+
+    #[test]
+    fn validate_action_rejects_abort() {
+        let err = validate_action("abort").expect_err("abort must be rejected");
+        assert!(err.contains("abort"), "error must name the bad token: {err}");
+    }
+
+    #[test]
+    fn validate_action_rejects_empty() {
+        validate_action("").expect_err("empty is rejected");
+        validate_action("   ").expect_err("blank is rejected");
+    }
+
+    #[test]
+    fn validate_action_rejects_bad_count() {
+        let err = validate_action("xx*panic").expect_err("non-numeric count");
+        assert!(err.contains("count"), "error must mention count: {err}");
+    }
+
+    #[test]
+    fn validate_action_rejects_unbalanced_parens() {
+        let err = validate_action("sleep(10").expect_err("unbalanced parens");
+        assert!(err.contains("parentheses"), "error mentions parens: {err}");
+    }
 }
