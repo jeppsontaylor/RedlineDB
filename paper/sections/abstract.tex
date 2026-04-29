@@ -1,4 +1,27 @@
 \begin{abstract}
-% Phase D skeleton placeholder. Replaced in the intro pass.
-TBD.
+SQLite is the most-deployed database engine on Earth, but its
+single-writer write-ahead log imposes a hard concurrency ceiling that
+the rest of the data tier has long since outgrown. We rebuilt SQLite's
+API contract from scratch in safe Rust and measured what it costs to
+keep the contract while removing the cliff. RedlineDB exposes the
+\texttt{sqlite3.h} C ABI and a native \texttt{rldb\_*} surface from
+roughly 35 KLOC of safe Rust active source---approximately one-seventh
+of the SQLite amalgamation's roughly 250 KLOC of C---and replaces the
+single-writer WAL with a multi-version concurrency control kernel,
+B-link-style index lifecycle, and a group-commit WAL coordinator. On a
+128-vCPU host we ran 1{,}280 measured benchmark child runs across
+8 workloads, 2 durability modes, 8 thread levels, and 5 repetitions per
+cell, against SQLite 3.x bundled by \texttt{rusqlite}. RedlineDB
+delivers 7.9--8.3$\times$ throughput on mixed and writers-disjoint
+OLTP at 64 threads, holds parity at the 64-thread point-read peak
+(0.99$\times$), and trails on two contention-bound workloads
+(hot-row update at 0.21$\times$, secondary-index range scan at
+0.012$\times$) which we discuss honestly. A deterministic crash
+oracle observed 0 lost-acked-commits across 24 fail-point scenarios;
+the recovery matrix passed 36/36 cases and the SQL compatibility
+matrix passed 40/40. We contribute (i) a safe-Rust MVCC kernel with
+B-link concurrent indexing, (ii) a SQLite-compatible C ABI shim, (iii)
+a deterministic crash certification protocol, (iv) a reproducible
+bin-packed parallel benchmark harness, and (v) the resulting empirical
+scaling profile.
 \end{abstract}
