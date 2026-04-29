@@ -288,12 +288,26 @@ fn with_write_tx<T>(
             let result = f(session, &mut tx);
             match result {
                 Ok(value) => {
-                    let commit_result = conn.engine().commit(tx);
-                    session.index_undo.clear();
-                    session.kernel_unique_guards.clear();
-                    session.unique_guards.clear();
-                    commit_result?;
-                    Ok(value)
+                    // Wave 7 P0 #3: do NOT clear `index_undo` until the
+                    // engine commit reports success. SQL DML has already
+                    // mutated physical index pages via `insert_tx`/
+                    // `delete_mark_tx`; if the WAL fsync (or a
+                    // failpoint-injected fault) makes commit fail, we still
+                    // need the inverse log to repair the leaf pages.
+                    match conn.engine().commit(tx) {
+                        Ok(_) => {
+                            session.index_undo.clear();
+                            session.kernel_unique_guards.clear();
+                            session.unique_guards.clear();
+                            Ok(value)
+                        }
+                        Err(err) => {
+                            replay_index_undo_after_commit_failure(conn.engine(), session);
+                            session.kernel_unique_guards.clear();
+                            session.unique_guards.clear();
+                            Err(err.into())
+                        }
+                    }
                 }
                 Err(err) => {
                     // SQL DML mutates physical index pages immediately
@@ -331,6 +345,37 @@ pub(crate) fn replay_index_undo(
         // delete_mark(A) must un-delete_mark(A) first, then delete-mark(A).
         let _ = op.replay_inverse(engine, tx);
     }
+}
+
+/// Wave 7 P0 #3: run after `engine.commit` returns `Err`. The original tx
+/// has already been consumed and aborted by the kernel, but SQL-side
+/// `insert_tx`/`delete_mark_tx` calls still left mutated bytes on the leaf
+/// pages. We open a fresh tx, replay the inverses against it, and commit
+/// that repair tx so the index pages are durably restored to a state
+/// consistent with the heap (which the kernel rollback already undid). On
+/// any error during the repair we still drain the log — leaving stale
+/// inverses queued for a later commit would silently corrupt indexes.
+pub(crate) fn replay_index_undo_after_commit_failure(
+    engine: &redlinedb_kernel::engine::Engine,
+    session: &mut SessionState,
+) {
+    let ops = std::mem::take(&mut session.index_undo);
+    if ops.is_empty() {
+        return;
+    }
+    let Ok(repair_tx) = engine.begin(Isolation::Snapshot) else {
+        return;
+    };
+    for op in ops.iter().rev() {
+        // Replay inverses in reverse order: a tx that did insert(A) then
+        // delete_mark(A) must un-delete_mark(A) first, then delete-mark(A).
+        let _ = op.replay_inverse(engine, &repair_tx);
+    }
+    // Best-effort: if the repair commit fails we cannot do better here.
+    // The caller is already on the error path and will surface the
+    // original failure; in-memory leaf bytes are still in the intended
+    // inverse state.
+    let _ = engine.commit(repair_tx);
 }
 
 pub(crate) fn finalize_runtime(conn: &Connection, runtime: &mut RuntimeState) -> Result<()> {
