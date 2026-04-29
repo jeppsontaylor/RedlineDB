@@ -620,17 +620,70 @@ telemetry instrumentation (Lane GC) appear to have lifted contended
 write throughput by ~2×. Hot-row-update is still SQLite's territory but
 the gap shrunk from 5× to 2×.
 
-### Phase 10E onward — pending
+### Phase 10E — paper rebuild
 
-After xbabe1 cert returned:
-- Phase 10E — paper section refresh + new figs (fig6 JSON, fig7
-  vector recall, fig8 group-commit batching) + PDF rebuild + paper-v2
-  tag.
-- Phase 10F — final proof matrix + `phase10-fusion-green` tag.
+- `paper/sections/abstract.tex` — refreshed with phase-10 capabilities
+  narrative; LOC bumped 35K → 48K.
+- `paper/sections/introduction.tex` — added a 6th contribution bullet
+  enumerating phase-10 closure.
+- `paper/sections/implementation.tex` — added the
+  ``Phase 10: Long-Range Capabilities'' subsection; updated Table 1
+  (LOC) to a two-column phase-9 vs phase-10 compare.
+- `paper/sections/evaluation.tex` — Table~\ref{tab:headline}
+  refreshed with phase-10 ratios; cert\_totals table gains
+  phase-10 test count + LOC.
+- `paper/refs/refs.bib` — added `malkov2018hnsw` and
+  `subramanya2019diskann`.
+- `paper/main.pdf` rebuilt — 11 pages, SHA-256
+  `8830fc18318d623ecbae5e6a484146241986e1d8bb112c5916daf2b54a9d3767`.
+
+The data-dependent figures (fig6 JSON, fig7 vector recall, fig8
+group-commit batching) require new bench workloads that are still
+deferred to phase 11; the existing fig1–fig5 are unchanged from
+phase-9 (same data path) and re-render automatically from
+`paper/data/perf_aggregates.csv`.
+
+### Phase 10F — final cleanup (`phase10-fusion-green`)
+
+Final proof matrix on `phase10-wave2-fused` + the cleanup commits
+that landed in 10E and 10F:
+
+- `cargo fmt --check` — green
+- `./scripts/check_file_sizes.sh` — green (5 active warnings, none
+  over the 2000-LOC cap; sql_smoke.rs split into
+  `phase10_smoke_extras.rs` to honor the cap)
+- `cargo check --workspace --locked` — green
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — green
+- `cargo test --workspace --quiet --locked` — `691 passed, 3 ignored`
+  (56 suites)
+- `cargo run -p redlinedb-bench -- compat --engine both --test-dir crates/bench/compat --seed 7` — `40/40 cases, 0 failures`
+- `cargo run -p redlinedb-bench -- recover-matrix --config crates/bench/bench/recovery-matrix.toml --out target/bench/phase10-recovery.json --seed 7` — exit 0, 36/36 PASS
+- `cargo run -p redlinedb-bench -- failpoint-matrix --config crates/bench/bench/failpoint-matrix.toml --out target/bench/phase10-failpoint.json --seed 7` — exit 0, 24/24 cases `lost_acked_commits: 0`
+- `cargo run -p redlinedb-bench -- certify --config crates/bench/bench/smoke.toml --out-dir target/bench/phase10-fusion-green-smoke --seed 7 --repetitions 1 --warmup 0` — exit 0; manifest carries DatasetChecksum
+
+Phase 10F artifact SHA-256:
+- `target/bench/phase10-recovery.json` — `386e6f555983d0069dcb0a33d47b2dfdbe9dbf6b6900c8b69813364ae33ceb06`
+- `target/bench/phase10-failpoint.json` — `c7f99fe1636dae52d398a4aad34b241295a6555cd9c7994746e4b18b14a9534b`
+- `target/bench/phase10-fusion-green-smoke/manifest.json` — `d4fadfd8abb9bc71ba26708cd3ef1a4529afd2678139d8c7ccec9b2646756651`
+
+Phase 10 closing tags:
+- `phase10-baseline` — fusion of in-flight diff
+- `phase10-wave1-partial` — 5/6 wave-1 lanes fused (VE held)
+- `phase10-wave2-fused` — all 12 lanes fused
+- `phase10-xbabe1-certified` — full xbabe1 cert at git_sha 7c10410
+- `phase10-fusion-green` — final cleanup + proof matrix
+
+### Deferred to phase 11
 
 Bench expansion (cert-v2 with json/vector/commit-storm workloads) is
-deferred to phase 11 — the lane code shipped, the workloads themselves
-need bench-side wiring (see `docs/PHASE10_HANDOFF.md`).
+deferred — the lane code shipped, the workloads themselves need
+bench-side wiring (`crates/bench/src/workload.rs::run_workload`
+dispatch + per-workload helper functions). The existing
+`large-sort-spill` workload landed via Lane VE and is included in
+`certification.toml` candidate sets. See `docs/PHASE10_HANDOFF.md`
+for the full deferred list (DiskANN mmap, HNSW M=16 recall tuning,
+semantic combiner, VE collation in spill, SQL-D Tier 2/3 execution,
+JSON aggregates, exec.rs split).
 
 ## Verified Proof
 
