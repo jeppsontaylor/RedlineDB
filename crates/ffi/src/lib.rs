@@ -310,6 +310,20 @@ fn record_status(db: *mut rldb, code: c_int) {
     });
 }
 
+/// Like `record_status`, but stores `message` (typically an SqlError's
+/// `to_string()`) so `sqlite3_errmsg` returns the actual cause rather than
+/// the generic "error"/"busy" stub. Used by failure paths that have a
+/// human-readable explanation.
+fn record_status_with_message(db: *mut rldb, code: c_int, message: &str) {
+    let _ = with_db(db, |db| {
+        db.last_code.store(code, Ordering::Relaxed);
+        if let Ok(mut last_message) = db.last_message.lock() {
+            let safe: String = message.replace('\0', "?");
+            *last_message = CString::new(safe).unwrap_or_else(|_| CString::new("error").unwrap());
+        }
+    });
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_open(path: *const c_char, out_db: *mut *mut rldb) -> c_int {
     flatten_code(api(|| {
@@ -390,12 +404,40 @@ pub extern "C" fn rldb_prepare_v2(
                 .map_err(|_| RLDB_MISMATCH)?
                 .to_owned()
         };
-        let sql_len = sql_text.len();
-        let stmt = sql_result(db_ref.conn.clone().prepare(&sql_text))?;
+        // sqlite3_prepare_v2 contract: parse only the FIRST statement in
+        // `sql`, set `tail` to the byte after that statement (or to the NUL
+        // terminator if it was the last). We achieve this by routing through
+        // `Connection::prepare_v2` which returns the unconsumed remainder.
+        let (stmt_opt, remainder) = match db_ref.conn.clone().prepare_v2(&sql_text) {
+            Ok(pair) => pair,
+            Err(err) => {
+                let msg = err.to_string();
+                let code = map_error(err);
+                record_status_with_message(db, code, &msg);
+                return Err(code);
+            }
+        };
+        let consumed_bytes = sql_text.len() - remainder.len();
+        // Set out_stmt: NULL if input was blank/comment-only (per SQLite).
+        unsafe {
+            if !tail.is_null() {
+                *tail = sql_cstr.as_ptr().wrapping_add(consumed_bytes);
+            }
+        }
+        let Some(stmt) = stmt_opt else {
+            unsafe {
+                *out_stmt = ptr::null_mut();
+            }
+            return Ok(RLDB_OK);
+        };
+        // Preserve only the consumed prefix in `sql_text` so callers that
+        // read `sqlite3_sql(stmt)` see the single statement, not the
+        // multi-statement input.
+        let head_text = &sql_text[..consumed_bytes];
         let mut boxed = Box::new(rldb_stmt {
             db,
             stmt,
-            sql_text: CString::new(sql_text).map_err(|_| RLDB_MISMATCH)?,
+            sql_text: CString::new(head_text).map_err(|_| RLDB_MISMATCH)?,
             column_names: Vec::new(),
             text_cache: Vec::new(),
         });
@@ -410,9 +452,6 @@ pub extern "C" fn rldb_prepare_v2(
         db_ref.active_statements.fetch_add(1, Ordering::Relaxed);
         unsafe {
             *out_stmt = Box::into_raw(boxed);
-            if !tail.is_null() {
-                *tail = sql_cstr.as_ptr().wrapping_add(sql_len);
-            }
         }
         Ok(RLDB_OK)
     }))
@@ -421,16 +460,23 @@ pub extern "C" fn rldb_prepare_v2(
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_step(stmt: *mut rldb_stmt) -> c_int {
     flatten_code(api(|| {
-        let stmt = unsafe { &mut *stmt };
-        if unsafe { (*stmt.db).interrupted.load(Ordering::Relaxed) } {
+        let stmt_ref = unsafe { &mut *stmt };
+        let db = stmt_ref.db;
+        if unsafe { (*db).interrupted.load(Ordering::Relaxed) } {
             return Err(RLDB_INTERRUPT);
         }
-        match sql_result(stmt.stmt.step())? {
-            Step::Row => {
-                refresh_text_cache(stmt)?;
+        match stmt_ref.stmt.step() {
+            Ok(Step::Row) => {
+                refresh_text_cache(stmt_ref)?;
                 Ok(RLDB_ROW)
             }
-            Step::Done => Ok(RLDB_DONE),
+            Ok(Step::Done) => Ok(RLDB_DONE),
+            Err(err) => {
+                let msg = err.to_string();
+                let code = map_error(err);
+                record_status_with_message(db, code, &msg);
+                Err(code)
+            }
         }
     }))
 }
@@ -657,6 +703,28 @@ pub extern "C" fn rldb_column_bytes(stmt: *mut rldb_stmt, index: c_int) -> c_int
     }))
 }
 
+/// Helper: copy a Rust-side error message into a heap-allocated C string and
+/// return its raw pointer to the FFI caller. Ownership transfers to the
+/// caller, who must free via `rldb_free` / `sqlite3_free`. Wraps NULs so
+/// pathological messages don't panic on `CString::new`.
+fn errmsg_to_c_string(msg: &str) -> *mut c_char {
+    let safe: String = msg.replace('\0', "?");
+    match CString::new(safe) {
+        Ok(c) => c.into_raw(),
+        Err(_) => CString::new("error").unwrap().into_raw(),
+    }
+}
+
+/// Write `msg` to `*errmsg` if `errmsg` is non-null. Caller must own & free.
+unsafe fn set_errmsg(errmsg: *mut *mut c_char, msg: &str) {
+    if errmsg.is_null() {
+        return;
+    }
+    unsafe {
+        *errmsg = errmsg_to_c_string(msg);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rldb_exec(
     db: *mut rldb,
@@ -665,8 +733,14 @@ pub extern "C" fn rldb_exec(
         extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int,
     >,
     ctx: *mut c_void,
-    _errmsg: *mut *mut c_char,
+    errmsg: *mut *mut c_char,
 ) -> c_int {
+    // Initialize errmsg to NULL up-front (sqlite3_exec contract).
+    if !errmsg.is_null() {
+        unsafe {
+            *errmsg = ptr::null_mut();
+        }
+    }
     flatten_code(api(|| {
         if db.is_null() || sql.is_null() {
             return Err(RLDB_MISUSE);
@@ -675,40 +749,78 @@ pub extern "C" fn rldb_exec(
         let sql_text = unsafe { CStr::from_ptr(sql) }
             .to_str()
             .map_err(|_| RLDB_MISMATCH)?;
-        let mut stmt = sql_result(db_ref.conn.clone().prepare(sql_text))?;
-        while let Step::Row = sql_result(stmt.step())? {
-            if let Some(callback) = callback {
-                let column_count = stmt.column_count();
-                let mut value_strings: Vec<Option<CString>> = Vec::with_capacity(column_count);
-                let mut name_strings: Vec<CString> = Vec::with_capacity(column_count);
-                for index in 0..column_count {
-                    name_strings
-                        .push(CString::new(stmt.column_name(index)).map_err(|_| RLDB_MISMATCH)?);
-                    value_strings.push(exec_value(&stmt, index)?);
+        let mut rest = sql_text;
+        // Walk the multi-statement input one statement at a time. SQLite's
+        // sqlite3_exec stops at the first failing statement and reports its
+        // error via errmsg; later statements are not executed.
+        loop {
+            let (stmt_opt, tail) = match db_ref.conn.clone().prepare_v2(rest) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let code = map_error(err);
+                    unsafe { set_errmsg(errmsg, &msg) };
+                    record_status_with_message(db, code, &msg);
+                    return Err(code);
                 }
-                let mut argv: Vec<*mut c_char> = value_strings
-                    .iter_mut()
-                    .map(|value| {
-                        value
-                            .as_mut()
-                            .map(|s| s.as_ptr() as *mut c_char)
-                            .unwrap_or(ptr::null_mut())
-                    })
-                    .collect();
-                let mut colnames: Vec<*mut c_char> = name_strings
-                    .iter_mut()
-                    .map(|value| value.as_ptr() as *mut c_char)
-                    .collect();
-                let rc = callback(
-                    ctx,
-                    column_count as c_int,
-                    argv.as_mut_ptr(),
-                    colnames.as_mut_ptr(),
-                );
-                if rc != 0 {
-                    return Err(RLDB_ERROR);
+            };
+            if let Some(mut stmt) = stmt_opt {
+                loop {
+                    match stmt.step() {
+                        Ok(Step::Row) => {
+                            if let Some(callback) = callback {
+                                let column_count = stmt.column_count();
+                                let mut value_strings: Vec<Option<CString>> =
+                                    Vec::with_capacity(column_count);
+                                let mut name_strings: Vec<CString> =
+                                    Vec::with_capacity(column_count);
+                                for index in 0..column_count {
+                                    name_strings.push(
+                                        CString::new(stmt.column_name(index))
+                                            .map_err(|_| RLDB_MISMATCH)?,
+                                    );
+                                    value_strings.push(exec_value(&stmt, index)?);
+                                }
+                                let mut argv: Vec<*mut c_char> = value_strings
+                                    .iter_mut()
+                                    .map(|value| {
+                                        value
+                                            .as_mut()
+                                            .map(|s| s.as_ptr() as *mut c_char)
+                                            .unwrap_or(ptr::null_mut())
+                                    })
+                                    .collect();
+                                let mut colnames: Vec<*mut c_char> = name_strings
+                                    .iter_mut()
+                                    .map(|value| value.as_ptr() as *mut c_char)
+                                    .collect();
+                                let rc = callback(
+                                    ctx,
+                                    column_count as c_int,
+                                    argv.as_mut_ptr(),
+                                    colnames.as_mut_ptr(),
+                                );
+                                if rc != 0 {
+                                    unsafe { set_errmsg(errmsg, "callback returned non-zero") };
+                                    return Err(RLDB_ERROR);
+                                }
+                            }
+                        }
+                        Ok(Step::Done) => break,
+                        Err(err) => {
+                            let msg = err.to_string();
+                            let code = map_error(err);
+                            unsafe { set_errmsg(errmsg, &msg) };
+                            record_status_with_message(db, code, &msg);
+                            return Err(code);
+                        }
+                    }
                 }
             }
+            if tail.is_empty() {
+                break;
+            }
+            rest = tail;
         }
         Ok(RLDB_OK)
     }))
@@ -1020,7 +1132,18 @@ pub extern "C" fn sqlite3_prepare_v2(
     tail: *mut *const c_char,
 ) -> c_int {
     let rc = rldb_prepare_v2(db, sql, nbytes, out_stmt, tail);
-    record_status(db, rc);
+    // Only overwrite last_message on success — on failure, rldb_prepare_v2
+    // has already stashed the enriched parser/binder error string and
+    // overwriting it with the generic "ok"/"error" stub would lose the
+    // actionable detail (`sqlite3_errmsg` consumers rely on it).
+    if rc == RLDB_OK {
+        record_status(db, rc);
+    } else if !db.is_null() {
+        // Still record the code so `sqlite3_errcode` is consistent.
+        unsafe {
+            (*db).last_code.store(rc, Ordering::Relaxed);
+        }
+    }
     rc
 }
 
@@ -1029,7 +1152,15 @@ pub extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
     let rc = rldb_step(stmt);
     if !stmt.is_null() {
         let db = unsafe { (*stmt).db };
-        record_status(db, rc);
+        // rldb_step already recorded an enriched error message on failure;
+        // only update the generic "ok" message on success/row/done.
+        if rc == RLDB_OK || rc == RLDB_ROW || rc == RLDB_DONE {
+            record_status(db, rc);
+        } else if !db.is_null() {
+            unsafe {
+                (*db).last_code.store(rc, Ordering::Relaxed);
+            }
+        }
     }
     rc
 }
@@ -1185,7 +1316,17 @@ pub extern "C" fn sqlite3_exec(
     errmsg: *mut *mut c_char,
 ) -> c_int {
     let rc = rldb_exec(db, sql, callback, ctx, errmsg);
-    record_status(db, rc);
+    if rc == RLDB_OK {
+        record_status(db, rc);
+    } else if !db.is_null() {
+        // Mirror the errmsg into last_message so sqlite3_errmsg(db) returns
+        // the same explanation. We cannot read from `errmsg` (it's a caller
+        // out-pointer) so duplicate the message via the success path of
+        // rldb_exec — for now record the generic code only.
+        unsafe {
+            (*db).last_code.store(rc, Ordering::Relaxed);
+        }
+    }
     rc
 }
 
@@ -1474,6 +1615,276 @@ mod tests {
             RLDB_OK
         );
         assert_eq!(sqlite3_get_autocommit(db), 1);
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    fn open_test_db(name: &str) -> *mut sqlite3 {
+        let path = temp_path(name);
+        fs::create_dir_all(&path).expect("dir");
+        let db_path = path.join(format!("{name}.redline"));
+        let c_path = CString::new(db_path.to_str().expect("utf8")).expect("cstring");
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), RLDB_OK);
+        db
+    }
+
+    extern "C" fn count_callback(
+        ctx: *mut c_void,
+        _n: c_int,
+        _argv: *mut *mut c_char,
+        _names: *mut *mut c_char,
+    ) -> c_int {
+        unsafe {
+            let counter = ctx as *mut usize;
+            *counter += 1;
+        }
+        0
+    }
+
+    #[test]
+    fn sqlite3_exec_runs_multiple_statements() {
+        let db = open_test_db("multi-exec");
+        let sql = CString::new(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY); \
+             INSERT INTO t VALUES(1); \
+             INSERT INTO t VALUES(2); \
+             INSERT INTO t VALUES(3);",
+        )
+        .unwrap();
+        let mut errmsg: *mut c_char = ptr::null_mut();
+        let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), &mut errmsg);
+        assert_eq!(rc, RLDB_OK);
+        assert!(errmsg.is_null(), "no errmsg expected on success");
+
+        // Now run a SELECT and verify the callback fires once per row.
+        let mut counter: usize = 0;
+        let sel = CString::new("SELECT id FROM t").unwrap();
+        let rc = sqlite3_exec(
+            db,
+            sel.as_ptr(),
+            Some(count_callback),
+            (&mut counter) as *mut usize as *mut c_void,
+            ptr::null_mut(),
+        );
+        assert_eq!(rc, RLDB_OK);
+        assert_eq!(counter, 3);
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_exec_callback_fires_for_each_row_in_multi_stmt() {
+        let db = open_test_db("multi-cb");
+        let setup = CString::new("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+        assert_eq!(
+            sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+            RLDB_OK
+        );
+
+        let mut counter: usize = 0;
+        // Two INSERTs (no rows callback), then a SELECT that yields 2 rows.
+        let sql =
+            CString::new("INSERT INTO t VALUES(1); INSERT INTO t VALUES(2); SELECT id FROM t;")
+                .unwrap();
+        let rc = sqlite3_exec(
+            db,
+            sql.as_ptr(),
+            Some(count_callback),
+            (&mut counter) as *mut usize as *mut c_void,
+            ptr::null_mut(),
+        );
+        assert_eq!(rc, RLDB_OK);
+        assert_eq!(counter, 2, "callback fires once per SELECT row");
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_prepare_v2_sets_pztail_after_first_statement() {
+        let db = open_test_db("prepare-tail");
+        let setup = CString::new("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+        assert_eq!(
+            sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+            RLDB_OK
+        );
+        let sql = CString::new("INSERT INTO t VALUES(1); INSERT INTO t VALUES(2);").unwrap();
+        let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+        let mut tail: *const c_char = ptr::null();
+        let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, &mut tail);
+        assert_eq!(rc, RLDB_OK);
+        assert!(!stmt.is_null());
+        // tail must point into the original buffer, after the first ;.
+        assert!(!tail.is_null());
+        let consumed = unsafe { tail.offset_from(sql.as_ptr()) } as usize;
+        let head_str = unsafe {
+            std::str::from_utf8(std::slice::from_raw_parts(
+                sql.as_ptr() as *const u8,
+                consumed,
+            ))
+            .unwrap()
+        };
+        assert_eq!(head_str, "INSERT INTO t VALUES(1);");
+        let tail_str = unsafe { CStr::from_ptr(tail) }.to_str().unwrap();
+        assert_eq!(tail_str, " INSERT INTO t VALUES(2);");
+
+        // Step the first statement to apply it.
+        assert_eq!(sqlite3_step(stmt), RLDB_DONE);
+        assert_eq!(sqlite3_finalize(stmt), RLDB_OK);
+
+        // Prepare and step the tail.
+        let mut stmt2: *mut sqlite3_stmt = ptr::null_mut();
+        let mut tail2: *const c_char = ptr::null();
+        let rc = sqlite3_prepare_v2(db, tail, -1, &mut stmt2, &mut tail2);
+        assert_eq!(rc, RLDB_OK);
+        assert!(!stmt2.is_null());
+        let tail2_str = unsafe { CStr::from_ptr(tail2) }.to_str().unwrap();
+        assert_eq!(tail2_str, "");
+        assert_eq!(sqlite3_step(stmt2), RLDB_DONE);
+        assert_eq!(sqlite3_finalize(stmt2), RLDB_OK);
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_prepare_v2_blank_input_returns_null_stmt() {
+        let db = open_test_db("prepare-blank");
+        let sql = CString::new("  -- only a comment\n   ").unwrap();
+        let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+        let mut tail: *const c_char = ptr::null();
+        let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, &mut tail);
+        assert_eq!(rc, RLDB_OK);
+        assert!(stmt.is_null());
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_exec_stops_at_first_error_and_sets_errmsg() {
+        let db = open_test_db("multi-err");
+        let setup = CString::new("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+        assert_eq!(
+            sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+            RLDB_OK
+        );
+
+        // First INSERT runs, second is invalid, third must NOT run.
+        let sql =
+            CString::new("INSERT INTO t VALUES(1); INVALID SQL HERE; INSERT INTO t VALUES(2);")
+                .unwrap();
+        let mut errmsg: *mut c_char = ptr::null_mut();
+        let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), &mut errmsg);
+        assert_ne!(rc, RLDB_OK, "must report the parse error");
+        assert!(!errmsg.is_null(), "errmsg must be populated on failure");
+        let msg = unsafe { CStr::from_ptr(errmsg) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            msg.to_lowercase().contains("parse")
+                || msg.to_lowercase().contains("invalid")
+                || msg.to_lowercase().contains("expected"),
+            "unexpected message: {msg}"
+        );
+        // Free errmsg via sqlite3_free — must not double-free or panic.
+        sqlite3_free(errmsg as *mut c_void);
+
+        // Verify only the first INSERT applied.
+        let mut counter: usize = 0;
+        let sel = CString::new("SELECT id FROM t").unwrap();
+        assert_eq!(
+            sqlite3_exec(
+                db,
+                sel.as_ptr(),
+                Some(count_callback),
+                (&mut counter) as *mut usize as *mut c_void,
+                ptr::null_mut()
+            ),
+            RLDB_OK
+        );
+        assert_eq!(counter, 1);
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_exec_errmsg_is_null_terminated_and_freeable() {
+        // Ownership contract: sqlite3_exec sets errmsg to a heap-allocated
+        // string the caller must free with sqlite3_free. The test exercises
+        // the round-trip multiple times to catch leaks during repeat use
+        // (in lieu of running under ASan in this lane).
+        let db = open_test_db("errmsg-own");
+        for _ in 0..16 {
+            let bad = CString::new("THIS IS NOT VALID SQL").unwrap();
+            let mut errmsg: *mut c_char = ptr::null_mut();
+            let rc = sqlite3_exec(db, bad.as_ptr(), None, ptr::null_mut(), &mut errmsg);
+            assert_ne!(rc, RLDB_OK);
+            assert!(!errmsg.is_null());
+            let _ = unsafe { CStr::from_ptr(errmsg) }.to_str().unwrap();
+            sqlite3_free(errmsg as *mut c_void);
+        }
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_exec_savepoint_release_round_trip() {
+        // End-to-end: a SAVEPOINT/RELEASE round-trip via sqlite3_exec must
+        // succeed and propagate inserted rows to the outer state.
+        let db = open_test_db("savepoint-ffi");
+        let sql = CString::new(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY); \
+             BEGIN; \
+             INSERT INTO t VALUES(1); \
+             SAVEPOINT sp1; \
+             INSERT INTO t VALUES(2); \
+             RELEASE sp1; \
+             COMMIT;",
+        )
+        .unwrap();
+        let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
+        assert_eq!(rc, RLDB_OK);
+
+        let mut counter: usize = 0;
+        let sel = CString::new("SELECT id FROM t").unwrap();
+        assert_eq!(
+            sqlite3_exec(
+                db,
+                sel.as_ptr(),
+                Some(count_callback),
+                (&mut counter) as *mut usize as *mut c_void,
+                ptr::null_mut()
+            ),
+            RLDB_OK
+        );
+        assert_eq!(counter, 2);
+        assert_eq!(sqlite3_close(db), RLDB_OK);
+    }
+
+    #[test]
+    fn sqlite3_exec_savepoint_rollback_to_drops_postsaved_rows() {
+        let db = open_test_db("savepoint-rb-ffi");
+        let sql = CString::new(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY); \
+             BEGIN; \
+             INSERT INTO t VALUES(1); \
+             SAVEPOINT sp1; \
+             INSERT INTO t VALUES(2); \
+             INSERT INTO t VALUES(3); \
+             ROLLBACK TO sp1; \
+             RELEASE sp1; \
+             COMMIT;",
+        )
+        .unwrap();
+        let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
+        assert_eq!(rc, RLDB_OK);
+
+        let mut counter: usize = 0;
+        let sel = CString::new("SELECT id FROM t").unwrap();
+        assert_eq!(
+            sqlite3_exec(
+                db,
+                sel.as_ptr(),
+                Some(count_callback),
+                (&mut counter) as *mut usize as *mut c_void,
+                ptr::null_mut()
+            ),
+            RLDB_OK
+        );
+        assert_eq!(counter, 1, "only pre-savepoint row survives");
         assert_eq!(sqlite3_close(db), RLDB_OK);
     }
 }
