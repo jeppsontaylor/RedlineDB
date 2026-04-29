@@ -4,12 +4,27 @@ use hdrhistogram::Histogram;
 
 use crate::report::LatencySummary;
 
+/// Disjoint failure classes recorded by the workload runner. Reviewer
+/// Finding #7 called out that the bench harness was collapsing LOCKED
+/// into BUSY, which hid contention vs. lock-wait pathology in the
+/// telemetry. The classes are intentionally non-overlapping: the
+/// workload classifier picks at most one bucket per error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    Busy,
+    Locked,
+    Timeout,
+    Other,
+}
+
 #[derive(Debug)]
 pub struct Metrics {
     latency: Histogram<u64>,
     operations: u64,
     failures: u64,
     busy_errors: u64,
+    locked_errors: u64,
+    timeout_errors: u64,
 }
 
 impl Metrics {
@@ -19,6 +34,8 @@ impl Metrics {
             operations: 0,
             failures: 0,
             busy_errors: 0,
+            locked_errors: 0,
+            timeout_errors: 0,
         }
     }
 
@@ -28,10 +45,13 @@ impl Metrics {
         let _ = self.latency.record(micros.max(1));
     }
 
-    pub fn record_failure(&mut self, busy: bool) {
+    pub fn record_failure(&mut self, kind: FailureKind) {
         self.failures += 1;
-        if busy {
-            self.busy_errors += 1;
+        match kind {
+            FailureKind::Busy => self.busy_errors += 1,
+            FailureKind::Locked => self.locked_errors += 1,
+            FailureKind::Timeout => self.timeout_errors += 1,
+            FailureKind::Other => {}
         }
     }
 
@@ -45,6 +65,14 @@ impl Metrics {
 
     pub fn busy_errors(&self) -> u64 {
         self.busy_errors
+    }
+
+    pub fn locked_errors(&self) -> u64 {
+        self.locked_errors
+    }
+
+    pub fn timeout_errors(&self) -> u64 {
+        self.timeout_errors
     }
 
     pub fn latency(&self) -> LatencySummary {
@@ -61,6 +89,8 @@ impl Metrics {
         self.operations += other.operations;
         self.failures += other.failures;
         self.busy_errors += other.busy_errors;
+        self.locked_errors += other.locked_errors;
+        self.timeout_errors += other.timeout_errors;
         let _ = self.latency.add(&other.latency);
     }
 }
@@ -79,5 +109,42 @@ mod tests {
         assert!(latency.p50_us >= 10);
         assert!(latency.p999_us >= 30);
         assert_eq!(latency.max_us, 30);
+    }
+
+    #[test]
+    fn metrics_split_busy_locked_timeout() {
+        let mut metrics = Metrics::new();
+        metrics.record_failure(FailureKind::Busy);
+        metrics.record_failure(FailureKind::Busy);
+        metrics.record_failure(FailureKind::Locked);
+        metrics.record_failure(FailureKind::Timeout);
+        metrics.record_failure(FailureKind::Timeout);
+        metrics.record_failure(FailureKind::Timeout);
+        metrics.record_failure(FailureKind::Other);
+
+        assert_eq!(metrics.failures(), 7);
+        assert_eq!(metrics.busy_errors(), 2);
+        assert_eq!(metrics.locked_errors(), 1);
+        assert_eq!(metrics.timeout_errors(), 3);
+        // The "other" failure must not leak into any of the named buckets.
+        assert_eq!(
+            metrics.busy_errors() + metrics.locked_errors() + metrics.timeout_errors(),
+            6
+        );
+    }
+
+    #[test]
+    fn metrics_merge_aggregates_each_counter_independently() {
+        let mut a = Metrics::new();
+        a.record_failure(FailureKind::Busy);
+        a.record_failure(FailureKind::Locked);
+        let mut b = Metrics::new();
+        b.record_failure(FailureKind::Locked);
+        b.record_failure(FailureKind::Timeout);
+        a.merge(&b);
+        assert_eq!(a.failures(), 4);
+        assert_eq!(a.busy_errors(), 1);
+        assert_eq!(a.locked_errors(), 2);
+        assert_eq!(a.timeout_errors(), 1);
     }
 }

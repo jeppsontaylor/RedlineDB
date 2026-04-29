@@ -93,6 +93,25 @@ pub struct CertifyArgs {
     pub repetitions: usize,
     #[arg(long, default_value_t = 0)]
     pub warmup: usize,
+    /// Wrap each per-engine bench child with `strace -c` (Linux only) to
+    /// collect a syscall summary alongside the run. Setting the
+    /// `REDLINEDB_BENCH_WITH_STRACE` environment variable to a non-empty
+    /// value has the same effect; the flag and the env var OR together,
+    /// so either trigger enables capture.
+    #[arg(long, default_value_t = false)]
+    pub with_strace: bool,
+}
+
+impl CertifyArgs {
+    /// True when strace capture should run for this invocation. Either the
+    /// `--with-strace` flag or a non-empty `REDLINEDB_BENCH_WITH_STRACE`
+    /// env var is sufficient — never both required.
+    pub fn strace_enabled(&self) -> bool {
+        self.with_strace
+            || std::env::var_os("REDLINEDB_BENCH_WITH_STRACE")
+                .filter(|value| !value.is_empty())
+                .is_some()
+    }
 }
 
 #[derive(Debug, Clone, Args)]

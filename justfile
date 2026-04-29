@@ -33,6 +33,12 @@ phase9-smoke:
 phase9-certify:
   rtk cargo run -p redlinedb-bench -- certify --config crates/bench/bench/certification.toml --out-dir target/bench/certify-certification --seed 7 --repetitions 5 --warmup 1
 
+# Wave 6 Lane B: strace-instrumented certification (Linux-only). Wraps
+# each per-engine bench child with `strace -c` so the manifest captures
+# aggregate syscall counts.
+phase9-certify-with-strace:
+  rtk cargo run -p redlinedb-bench -- certify --config crates/bench/bench/certification.toml --out-dir target/bench/certify-strace --seed 7 --repetitions 5 --warmup 1 --with-strace
+
 phase9-failpoint-matrix:
   rtk cargo run -p redlinedb-bench -- failpoint-matrix --config crates/bench/bench/failpoint-matrix.toml --out target/bench/failpoint-matrix.json --seed 7
 
