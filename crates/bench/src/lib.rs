@@ -2,6 +2,7 @@ mod certify;
 mod compat;
 pub mod config;
 mod engine;
+pub mod failpoint_matrix;
 mod gates;
 mod metrics;
 pub mod process_metrics;
@@ -46,6 +47,17 @@ pub fn run(cli: Cli) -> Result<()> {
             report::write_json(args.out.as_deref(), &report)?;
         }
         config::Command::RecoverChild(args) => recover::run_child(&args)?,
+        config::Command::FailpointMatrix(args) => {
+            let report = failpoint_matrix::run(&args)?;
+            failpoint_matrix::write_report(&args.out, &report)?;
+            if !report.passed {
+                bail!(
+                    "failpoint-matrix gate failed: {} cases reported lost acked commits",
+                    report.failed_cases
+                );
+            }
+        }
+        config::Command::FailpointChild(args) => failpoint_matrix::run_child(&args)?,
         config::Command::Gates(args) => {
             let records = report::read_jsonl(&args.input)?;
             let summary = gates::evaluate_records(&records);
@@ -92,6 +104,12 @@ pub fn default_recovery_matrix_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("bench")
         .join("recovery-matrix.toml")
+}
+
+pub fn default_failpoint_matrix_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("bench")
+        .join("failpoint-matrix.toml")
 }
 
 pub fn ensure_parent(path: Option<&Path>) -> Result<()> {

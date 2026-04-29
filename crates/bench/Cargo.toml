@@ -14,6 +14,10 @@ libc = "0.2"
 rand = "0.9"
 rand_chacha = "0.9"
 redlinedb = { path = "../redlinedb" }
+# Lane E: bench needs to arm kernel failpoints from inside the
+# `failpoint-matrix` child process. Cargo feature unification ensures the
+# `failpoints` feature also turns on for the kernel inside `redlinedb`.
+redlinedb-kernel = { path = "../kernel", features = ["failpoints"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
