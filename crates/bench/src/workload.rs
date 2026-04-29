@@ -9,7 +9,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::config::{RunSpec, WorkloadKind};
 use crate::engine::{self, BenchConn, BenchEngine, CellValue};
-use crate::metrics::Metrics;
+use crate::metrics::{FailureKind, Metrics};
 use crate::process_metrics;
 use crate::report::{MetricsSummary, RunRecord};
 
@@ -50,7 +50,12 @@ pub fn run_once(spec: &RunSpec) -> Result<RunRecord> {
         metrics: MetricsSummary {
             operations: metrics.operations(),
             failures: metrics.failures(),
-            busy_errors: metrics.busy_errors(),
+            // Backward-compat: surfaces the original (busy + locked)
+            // count for one minor cycle while consumers migrate to the
+            // split fields below.
+            busy_errors: metrics.busy_errors() + metrics.locked_errors(),
+            locked_errors: metrics.locked_errors(),
+            timeout_errors: metrics.timeout_errors(),
             elapsed_ms: elapsed.as_millis() as u64,
             throughput_ops_per_sec: throughput(metrics.operations(), elapsed),
             latency: metrics.latency(),
@@ -111,7 +116,7 @@ fn run_workload(engine: &dyn BenchEngine, spec: &RunSpec) -> Result<Metrics> {
                     };
                     match result {
                         Ok(()) => metrics.record_success(start.elapsed()),
-                        Err(err) => metrics.record_failure(is_busy_error(&err)),
+                        Err(err) => metrics.record_failure(classify_failure(&err)),
                     }
                 }
                 Ok::<Metrics, anyhow::Error>(metrics)
@@ -252,9 +257,49 @@ fn blob_for(seed: usize) -> Vec<u8> {
     format!("value-{seed:08}").into_bytes()
 }
 
+/// Classify an error string into one of the four [`FailureKind`]
+/// buckets. The classes are evaluated in priority order (locked first,
+/// then timeout, then busy) so the same error never lands in more than
+/// one bucket — Reviewer Finding #7 specifically called out that the
+/// previous implementation collapsed LOCKED into BUSY.
+fn classify_failure(err: &anyhow::Error) -> FailureKind {
+    let text = err.to_string().to_ascii_lowercase();
+    if is_locked_error_str(&text) {
+        FailureKind::Locked
+    } else if is_timeout_error_str(&text) {
+        FailureKind::Timeout
+    } else if is_busy_error_str(&text) {
+        FailureKind::Busy
+    } else {
+        FailureKind::Other
+    }
+}
+
+#[allow(dead_code)]
 fn is_busy_error(err: &anyhow::Error) -> bool {
-    err.to_string().to_ascii_lowercase().contains("busy")
-        || err.to_string().to_ascii_lowercase().contains("locked")
+    matches!(classify_failure(err), FailureKind::Busy)
+}
+
+#[allow(dead_code)]
+fn is_locked_error(err: &anyhow::Error) -> bool {
+    matches!(classify_failure(err), FailureKind::Locked)
+}
+
+#[allow(dead_code)]
+fn is_timeout_error(err: &anyhow::Error) -> bool {
+    matches!(classify_failure(err), FailureKind::Timeout)
+}
+
+fn is_busy_error_str(text: &str) -> bool {
+    text.contains("busy")
+}
+
+fn is_locked_error_str(text: &str) -> bool {
+    text.contains("locked") || text.contains("database is locked") || text.contains("lock_wait")
+}
+
+fn is_timeout_error_str(text: &str) -> bool {
+    text.contains("timeout") || text.contains("timed out") || text.contains("deadline")
 }
 
 fn throughput(operations: u64, elapsed: Duration) -> f64 {
@@ -263,5 +308,80 @@ fn throughput(operations: u64, elapsed: Duration) -> f64 {
         operations as f64 / seconds
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(text: &str) -> anyhow::Error {
+        anyhow::anyhow!(text.to_owned())
+    }
+
+    #[test]
+    fn classify_locked_does_not_collapse_into_busy() {
+        // Reviewer Finding #7: "locked" must NOT also classify as busy.
+        let e = err("database is locked: lock_wait expired");
+        assert_eq!(classify_failure(&e), FailureKind::Locked);
+        assert!(!is_busy_error(&e));
+        assert!(is_locked_error(&e));
+        assert!(!is_timeout_error(&e));
+    }
+
+    #[test]
+    fn classify_busy_remains_busy() {
+        let e = err("SQLITE_BUSY: database is busy");
+        assert_eq!(classify_failure(&e), FailureKind::Busy);
+        assert!(is_busy_error(&e));
+        assert!(!is_locked_error(&e));
+    }
+
+    #[test]
+    fn classify_timeout_separate_bucket() {
+        let cases = [
+            "operation timed out",
+            "deadline exceeded",
+            "lock acquire timeout after 100ms",
+        ];
+        for raw in cases {
+            let e = err(raw);
+            assert_eq!(
+                classify_failure(&e),
+                FailureKind::Timeout,
+                "expected timeout for {raw}"
+            );
+            assert!(is_timeout_error(&e));
+        }
+    }
+
+    #[test]
+    fn classify_other_is_default() {
+        let e = err("unique constraint violation");
+        assert_eq!(classify_failure(&e), FailureKind::Other);
+        assert!(!is_busy_error(&e));
+        assert!(!is_locked_error(&e));
+        assert!(!is_timeout_error(&e));
+    }
+
+    #[test]
+    fn classify_buckets_are_disjoint() {
+        // No single message ever populates more than one named bucket.
+        let messages = [
+            "locked while holding row lock",
+            "busy throttled",
+            "deadline exceeded waiting for fsync",
+            "permission denied",
+        ];
+        for raw in messages {
+            let e = err(raw);
+            let busy = is_busy_error(&e) as u8;
+            let locked = is_locked_error(&e) as u8;
+            let timeout = is_timeout_error(&e) as u8;
+            assert!(
+                busy + locked + timeout <= 1,
+                "{raw} classified into multiple buckets: busy={busy} locked={locked} timeout={timeout}"
+            );
+        }
     }
 }
