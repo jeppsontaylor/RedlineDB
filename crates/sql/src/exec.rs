@@ -33,6 +33,7 @@ use crate::value::{SqlValue, canonicalize, compare_values, is_truthy};
 
 mod expr;
 use expr::*;
+mod index_access;
 mod index_dml;
 mod tail;
 use tail::*;
@@ -509,10 +510,44 @@ fn execute_select(
             match &plan.source {
                 SelectSource::Table(table) => {
                     if plan.order_by.is_empty() {
+                        // Lane C access-path resolution. Order of
+                        // preference matches the planner:
+                        //   1. rowid PK fast path (already covered by
+                        //      `selection_rowid_eq` / RowIdGet).
+                        //   2. physical-index probe (point or range).
+                        //   3. fallback: full heap scan.
                         let rowids = if let Some(rowid) =
                             selection_rowid_eq(table, &plan.selection, bindings)?
                         {
                             vec![rowid]
+                        } else if let Some(matched) = index_access::try_match_index_access(
+                            table,
+                            &plan.selection,
+                            bindings,
+                        ) {
+                            let tx = tx.as_mut().expect("tx present");
+                            // Conservatism: if the kernel can't honor
+                            // the probe (e.g. the index has no live
+                            // physical handle yet), fall through to a
+                            // table scan rather than returning an empty
+                            // result. The planner only emits
+                            // IndexPointLookup/IndexRangeScan when the
+                            // executor can satisfy them, but stale
+                            // schema snapshots still exist as a
+                            // possibility.
+                            if index_access::open_handle(conn.engine(), &matched.index)
+                                .is_some()
+                            {
+                                index_access::execute_index_probe(
+                                    conn.engine(),
+                                    tx,
+                                    table,
+                                    &matched.index,
+                                    &matched.probe,
+                                )?
+                            } else {
+                                collect_table_rowids(conn.engine(), tx, table)?
+                            }
                         } else {
                             let tx = tx.as_mut().expect("tx present");
                             collect_table_rowids(conn.engine(), tx, table)?
