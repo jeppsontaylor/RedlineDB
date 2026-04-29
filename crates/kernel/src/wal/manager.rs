@@ -76,6 +76,10 @@ impl WalManager<StdFileSystem> {
             return Ok(0);
         }
 
+        // Lane E failpoint: armed before any WAL segment removal so harnesses
+        // can crash between checkpoint completion and prune, observing whether
+        // recovery still succeeds with stale segments on disk.
+        crate::fail_point!("wal::prune");
         let mut removed = 0_usize;
         for candidate in self.segment_numbers()? {
             if candidate < segment && candidate < self.active_segment {
@@ -213,6 +217,9 @@ impl WalCoordinator {
     }
 
     pub fn flush_until(&self, target_lsn: Lsn) -> Result<Lsn> {
+        // Lane E failpoint: coordinator entry to the durability barrier; any
+        // injection here aborts before the writer thread is signalled.
+        crate::fail_point!("wal::flush_until");
         let mut state = self
             .shared
             .state
@@ -239,6 +246,9 @@ impl WalCoordinator {
     }
 
     pub fn flush_all(&self) -> Result<Lsn> {
+        // Lane E failpoint: full-WAL flush is the checkpoint barrier; injection
+        // here lets harnesses crash between commit-fsync and checkpoint-fsync.
+        crate::fail_point!("wal::flush_all");
         let written_lsn = self
             .shared
             .state
@@ -678,6 +688,10 @@ impl<Fs: FileSystem> WalManager<Fs> {
     }
 
     pub fn flush(&mut self) -> Result<Lsn> {
+        // Lane E failpoint: armed before the fsync that establishes WAL
+        // durability so the harness can simulate "fsync skipped" or kernel
+        // crash mid-fsync.
+        crate::fail_point!("wal::flush");
         self.active_file.sync_data()?;
         self.durable_lsn = self.written_lsn;
         Ok(self.durable_lsn)
@@ -696,6 +710,10 @@ impl<Fs: FileSystem> WalManager<Fs> {
     }
 
     pub fn write_encoded(&mut self, append: WalAppend, encoded: &[u8]) -> Result<()> {
+        // Lane E failpoint: armed before the WAL segment write so harnesses
+        // can inject torn-write or panic faults at the precise moment the
+        // record would land on disk.
+        crate::fail_point!("wal::write_encoded");
         if encoded.len() > self.config.segment_bytes as usize {
             return Err(Error::CorruptWal("record larger than wal segment"));
         }
