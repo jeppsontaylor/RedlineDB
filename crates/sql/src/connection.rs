@@ -461,6 +461,15 @@ impl Connection {
         &self.db.engine
     }
 
+    /// Read-only access to the underlying kernel engine. Exposed for SQL
+    /// smoke tests and tooling that need to inspect physical indexes /
+    /// catalog state directly. Production code paths must continue to use
+    /// the SQL execution surface.
+    #[doc(hidden)]
+    pub fn engine_for_tests(&self) -> Arc<Engine> {
+        Arc::clone(&self.db.engine)
+    }
+
     pub(crate) fn unique_locks(&self) -> &Arc<UniqueLockTable> {
         &self.db.unique_locks
     }
