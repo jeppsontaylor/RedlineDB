@@ -390,9 +390,16 @@ fn eval_binary(
             _ => return Err(Error::DatatypeMismatch),
         },
         BinaryOperator::Eq => compare_binary(left_value, right_value, |o| o == Ordering::Equal)?,
-        BinaryOperator::NotEq | BinaryOperator::Spaceship => {
-            compare_binary(left_value, right_value, |o| o != Ordering::Equal)?
-        }
+        // Phase-10 Lane V1: pgvector borrows `<=>` for cosine distance. We
+        // overload it the same way: if BOTH operands decode as vector blobs,
+        // emit `vector_distance_cosine`. Otherwise we fall back to the
+        // historical SQLite-flavoured null-safe inequality so we don't break
+        // existing comparison tests. (See `vector_pair_or_compare`.)
+        BinaryOperator::Spaceship => match try_vector_pair(&left_value, &right_value) {
+            Some((a, b)) => vector_distance_to_value(VectorOpMetric::Cosine, &a, &b)?,
+            None => compare_binary(left_value, right_value, |o| o != Ordering::Equal)?,
+        },
+        BinaryOperator::NotEq => compare_binary(left_value, right_value, |o| o != Ordering::Equal)?,
         BinaryOperator::Gt => compare_binary(left_value, right_value, |o| o == Ordering::Greater)?,
         BinaryOperator::GtEq => compare_binary(left_value, right_value, |o| o != Ordering::Less)?,
         BinaryOperator::Lt => compare_binary(left_value, right_value, |o| o == Ordering::Less)?,
@@ -872,10 +879,135 @@ fn eval_function(
             Some(SqlValue::Text(_)) => "text",
             Some(SqlValue::Blob(_)) => "blob",
         }))),
+        // -- Phase-10 Lane V1: VECTOR functions ----------------------------
+        // J1 (JSON) lives above this section. Coordinate by adding above the
+        // VECTOR block so the diff stays clean.
+        "vector" | "vector_blob" | "vector_from_json" => {
+            // Construct a vector blob from a JSON-array-style literal:
+            //   vector('[1.0, 2.0, 3.0]')
+            // The three names are aliases — `vector_blob` was the
+            // baseline-stub spelling; `vector_from_json` is the audit
+            // name; `vector` matches pgvector's idiomatic call site.
+            let arg = values.first().unwrap_or(&SqlValue::Null);
+            vector_construct_from_value(arg)
+        }
+        "vector_dims" => {
+            // Inspect a stored vector blob and return its declared dimension.
+            let arg = values.first().unwrap_or(&SqlValue::Null);
+            vector_dims_value(arg)
+        }
+        "vector_distance_l2" => vector_pair_distance(&values, VectorOpMetric::L2),
+        "vector_distance_cosine" => vector_pair_distance(&values, VectorOpMetric::Cosine),
+        "vector_distance_ip" => vector_pair_distance(&values, VectorOpMetric::InnerProduct),
         _ => Err(Error::UnsupportedSql(format!(
             "unsupported function {name}"
         ))),
     }
+}
+
+// -----------------------------------------------------------------------------
+// VECTOR scalar helpers — Phase-10 Lane V1.
+// -----------------------------------------------------------------------------
+//
+// All vector values flow through the SQL layer as `Blob`s carrying the wire
+// format defined in `kernel::vector::codec`. We deliberately do NOT introduce
+// a `SqlValue::Vector` variant in this lane: keeping the storage class as
+// `Blob` lets every existing code path (record encode, index dml, batch
+// shuffle, sqlite_schema reflection) work unchanged. The cost is one decode
+// per distance call, which is dominated by the SIMD inner loop anyway.
+//
+// Lane V2 / V3 may opt into an in-memory `Arc<[f32]>` cache layered on top
+// of this without a wire-format break.
+
+#[derive(Copy, Clone)]
+pub(crate) enum VectorOpMetric {
+    L2,
+    Cosine,
+    InnerProduct,
+}
+
+impl From<VectorOpMetric> for redlinedb_kernel::vector::VectorMetric {
+    fn from(m: VectorOpMetric) -> Self {
+        match m {
+            VectorOpMetric::L2 => Self::L2,
+            VectorOpMetric::Cosine => Self::Cosine,
+            VectorOpMetric::InnerProduct => Self::InnerProduct,
+        }
+    }
+}
+
+/// Build a vector blob from a JSON-style literal (Text) or pass through an
+/// already-encoded blob unchanged. Null is preserved.
+fn vector_construct_from_value(value: &SqlValue) -> Result<SqlValue> {
+    match value {
+        SqlValue::Null => Ok(SqlValue::Null),
+        SqlValue::Text(s) => {
+            let v = redlinedb_kernel::vector::Vector::from_json_literal(s.as_ref())
+                .map_err(|e| Error::UnsupportedSql(format!("vector(): {e}")))?;
+            Ok(SqlValue::Blob(Arc::from(v.encode())))
+        }
+        SqlValue::Blob(bytes) => {
+            // Round-trip through decode to validate; reject malformed input
+            // so users see a clear error here rather than at distance time.
+            redlinedb_kernel::vector::decode_vector(bytes)
+                .map_err(|e| Error::UnsupportedSql(format!("vector(): {e}")))?;
+            Ok(SqlValue::Blob(bytes.clone()))
+        }
+        _ => Err(Error::DatatypeMismatch),
+    }
+}
+
+/// Return the vector's dimension as INTEGER, or NULL for a Null input.
+fn vector_dims_value(value: &SqlValue) -> Result<SqlValue> {
+    match value {
+        SqlValue::Null => Ok(SqlValue::Null),
+        SqlValue::Blob(bytes) => {
+            let v = redlinedb_kernel::vector::decode_vector(bytes)
+                .map_err(|e| Error::UnsupportedSql(format!("vector_dims: {e}")))?;
+            Ok(SqlValue::Integer(v.len() as i64))
+        }
+        _ => Err(Error::DatatypeMismatch),
+    }
+}
+
+/// Compute `metric(a, b)` for a two-arg function call.
+fn vector_pair_distance(values: &[SqlValue], metric: VectorOpMetric) -> Result<SqlValue> {
+    if values.len() != 2 {
+        return Err(Error::UnsupportedSql(
+            "vector_distance_* requires exactly 2 args".to_owned(),
+        ));
+    }
+    if matches!(values[0], SqlValue::Null) || matches!(values[1], SqlValue::Null) {
+        return Ok(SqlValue::Null);
+    }
+    let (a, b) = match try_vector_pair(&values[0], &values[1]) {
+        Some(p) => p,
+        None => return Err(Error::DatatypeMismatch),
+    };
+    vector_distance_to_value(metric, &a, &b)
+}
+
+/// Try to decode both operands as vectors. Returns `None` if either is not a
+/// blob, or the bytes do not decode — `<=>` falls back to its
+/// scalar-comparison meaning in that case.
+fn try_vector_pair(left: &SqlValue, right: &SqlValue) -> Option<(Vec<f32>, Vec<f32>)> {
+    let SqlValue::Blob(la) = left else {
+        return None;
+    };
+    let SqlValue::Blob(rb) = right else {
+        return None;
+    };
+    let a = redlinedb_kernel::vector::decode_vector(la).ok()?;
+    let b = redlinedb_kernel::vector::decode_vector(rb).ok()?;
+    Some((a, b))
+}
+
+fn vector_distance_to_value(metric: VectorOpMetric, a: &[f32], b: &[f32]) -> Result<SqlValue> {
+    let m: redlinedb_kernel::vector::VectorMetric = metric.into();
+    let d = m
+        .distance(a, b)
+        .map_err(|e| Error::UnsupportedSql(format!("vector distance: {e}")))?;
+    Ok(SqlValue::Real(d as f64))
 }
 
 pub(crate) fn cast_value(
