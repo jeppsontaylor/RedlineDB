@@ -219,31 +219,9 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
     )?;
     conn.execute("CREATE INDEX IF NOT EXISTS kv_tenant_idx ON kv(tenant)", ())?;
 
-    // Open the ack log in append mode. Each successful commit
-    // contractually fsyncs the WAL; only after the commit returns
-    // do we append the row's key. We then call `sync_all()` on the
-    // ack-file handle so the line itself is durable on disk before
-    // proceeding — a `flush()` only drains Rust's `BufWriter`, while
-    // `sync_all()` issues an fsync(2) that flushes the OS page cache.
-    // Without the fsync, a child crash could leave the ack log
-    // shorter on disk than what `read_ack_count` saw in memory and
-    // mask real lost-acked-commits as zero.
-    //
-    // We also fsync the parent directory once after creating the
-    // file so the directory entry that names the ack log is itself
-    // durable (matters when the test kills the child before the
-    // first row commits).
-    let mut ack = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&args.ack_log)?;
-    ack.sync_all()?;
-    if let Some(parent) = args.ack_log.parent()
-        && !parent.as_os_str().is_empty()
-        && let Ok(dir) = File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
+    // Open the ack log with the documented durability contract: see
+    // `open_ack_log` for fsync details.
+    let mut ack = open_ack_log(&args.ack_log)?;
 
     // Every 16 rows the child also calls `Database::checkpoint()` so
     // failpoints that gate the checkpoint path (`engine::checkpoint`,
@@ -279,13 +257,7 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
             // a meaningful ack count up to this point.
             return Ok(());
         }
-        writeln!(ack, "{key}")?;
-        // `flush()` only drains `BufWriter`; `sync_all()` issues a
-        // real fsync(2) so the ack line is durable on disk before
-        // we move on. The parent's `read_ack_count` is the gate
-        // oracle, so any line we count as "acked" must survive a
-        // crash — otherwise the gate is observably false-negative.
-        ack.sync_all()?;
+        ack_row(&mut ack, key)?;
 
         if key > 0 && key.is_multiple_of(CHECKPOINT_EVERY_ROWS) && db.checkpoint().is_err() {
             // The checkpoint failpoint fires here; treat error as
@@ -429,6 +401,68 @@ fn engine_name(engine: EngineKind) -> &'static str {
         EngineKind::Redline => "redline",
         EngineKind::Sqlite => "sqlite",
     }
+}
+
+/// Open the ack log used by the failpoint-matrix child to record
+/// contractually-durable rows.
+///
+/// Durability semantics:
+///
+/// - The file is opened with `create=true, append=true`. Append mode
+///   gives us atomic per-line semantics on POSIX so concurrent writers
+///   would not interleave (the matrix runner is single-threaded but
+///   this matches the recovery-matrix child's ack-log convention).
+/// - We `sync_all()` the file handle once after opening so the inode
+///   metadata (size = 0, length zero) is on disk before the first
+///   write. This matters when the workload crashes before the first
+///   commit: without the initial fsync the directory entry might not
+///   exist on disk and `read_ack_count` would return zero even when
+///   the on-disk WAL contains acked rows.
+/// - We `sync_all()` the parent directory so the directory entry that
+///   names the ack log is itself durable. macOS HFS+/APFS and Linux
+///   ext4 both require this for the file to survive a crash that
+///   happens between `creat()` and the first fsync.
+///
+/// The returned [`File`] handle MUST be passed to [`ack_row`] for each
+/// subsequent commit. Reopening the file per-write would defeat the
+/// fsync contract and cost an extra `open(2)` per row.
+pub fn open_ack_log(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open ack log {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("initial sync of ack log {}", path.display()))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(dir) = File::open(parent)
+    {
+        // Best-effort directory fsync: not all filesystems support it
+        // (e.g. tmpfs on some kernels returns EINVAL) so we ignore the
+        // result. Real on-disk filesystems used by the matrix harness
+        // do support it.
+        let _ = dir.sync_all();
+    }
+    Ok(file)
+}
+
+/// Append `{key}\n` to the ack log and fsync the file.
+///
+/// This is the per-row gate-oracle write. Every entry that returns
+/// `Ok(())` is contractually durable: a subsequent process crash MUST
+/// leave the line on disk for `read_ack_count` to discover. If the
+/// engine then fails to recover the row, that constitutes a
+/// lost-acked-commit and the strict gate fails.
+///
+/// `flush()` would only drain Rust's `BufWriter`; we use `sync_all()`
+/// to issue a real fsync(2) that flushes the OS page cache. The
+/// failpoint matrix's correctness depends on this distinction.
+pub fn ack_row(file: &mut File, key: usize) -> Result<()> {
+    writeln!(file, "{key}").with_context(|| format!("write ack row {key}"))?;
+    file.sync_all()
+        .with_context(|| format!("sync ack row {key}"))?;
+    Ok(())
 }
 
 fn apply_kill_count(raw: &str, kill_after_n_hits: u64) -> String {

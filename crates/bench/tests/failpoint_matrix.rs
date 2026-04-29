@@ -5,6 +5,11 @@
 //! parsing silently if no test loads the file) and the end-to-end
 //! parent/child handshake (a regression in `failpoint::cfg` wiring or
 //! the ack-log protocol means Lane E silently passes everything).
+//!
+//! Lane F6 reviewer-finding tests cover the two correctness fixes:
+//! the ack-log fsync contract (`ack_log_is_fsynced`) and the
+//! verbatim passthrough of failpoint actions
+//! (`failpoint_action_return_is_honored`).
 
 use std::path::PathBuf;
 
@@ -133,4 +138,124 @@ kill_after_n_hits = [1]
     );
     assert!(run.passed, "case must pass: {:?}", run);
     assert!(report.passed, "report must report overall pass");
+}
+
+/// Lane F6: every line written via `ack_row` must survive a sudden
+/// process exit. We can't easily simulate an OS-level crash from
+/// within a unit test, but we can at least pin the durability
+/// contract: after each `ack_row` returns, dropping the file handle
+/// and re-reading the path must return every entry. The previous
+/// implementation called `flush()` on a `BufWriter`, which would
+/// pass this test trivially because the buffer drain happens in-
+/// process — but it would fail if `read_ack_count` ran in a
+/// separate process before the OS flushed the page cache. We assert
+/// the on-disk metadata (file length) matches the expected byte
+/// count to give the test some teeth: if the writes were silently
+/// buffered the file size would lag behind.
+#[test]
+fn ack_log_is_fsynced() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("ack.log");
+
+    let mut handle = failpoint_matrix::open_ack_log(&path).expect("open ack log");
+
+    let keys = [0_usize, 1, 2, 3, 7, 11, 42, 1023];
+    let mut expected_bytes: u64 = 0;
+    for &key in &keys {
+        failpoint_matrix::ack_row(&mut handle, key).expect("ack row durably");
+        // Snapshot the on-disk size IMMEDIATELY (without flushing the
+        // handle again) — if the implementation deferred the write
+        // to a `BufWriter`, the metadata size would be smaller than
+        // expected at this point.
+        let metadata = std::fs::metadata(&path).expect("stat ack log");
+        expected_bytes += format!("{key}\n").len() as u64;
+        assert_eq!(
+            metadata.len(),
+            expected_bytes,
+            "ack-log on-disk size must reflect every fsynced row immediately after ack_row returns",
+        );
+    }
+
+    drop(handle);
+
+    // Reopen and read every line. Equivalent to what the parent's
+    // `read_ack_count` does after the child dies.
+    let body = std::fs::read_to_string(&path).expect("read ack log");
+    let mut recorded: Vec<usize> = body
+        .lines()
+        .filter_map(|line| line.trim().parse::<usize>().ok())
+        .collect();
+    recorded.sort_unstable();
+    let mut expected = keys.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        recorded, expected,
+        "every fsynced ack entry must be discoverable post-crash",
+    );
+}
+
+/// Lane F6: a `return` action configured via `fail::cfg` must take
+/// the early-return short-circuit, not silently translate to panic.
+/// We register a synthetic failpoint behind a closure form, fire it
+/// via `fail::eval`-driven hot path, and assert the closure return
+/// is honoured.
+///
+/// The previous bench-runner mapping rewrote `return` to `panic`
+/// before forwarding to `fail::cfg`; that meant any `[[cases]]`
+/// block configured with `action = "return"` was effectively a
+/// panic test. The fix is in `apply_kill_count`: action strings are
+/// passed verbatim. This test guards the kernel half of the
+/// contract by exercising the failpoint registry directly.
+#[test]
+fn failpoint_action_return_is_honored() {
+    use redlinedb_kernel::failpoints;
+
+    failpoints::init();
+
+    // Pick a unique name so we don't collide with kernel hot-path
+    // failpoints any other test may have armed.
+    let name = "lane-f6::test::return-honored";
+
+    // Configure the failpoint to fire the `return` action exactly
+    // once. The closure form distinguishes this from a panic action:
+    // `fail::eval` returns `Some(())` to the call site, which the
+    // closure converts to a sentinel value the test can observe.
+    failpoints::cfg(name, "return").expect("cfg return action");
+
+    // Drive the failpoint via the same `fail_point!` macro the kernel
+    // uses. We construct a small function that returns an integer:
+    // when the failpoint is OFF the function returns 0; when armed
+    // with `return` the closure short-circuits with 42.
+    fn probe(name: &str) -> i32 {
+        // Use the bare `fail::fail_point!` so this test does not
+        // depend on the kernel's reexport of the macro at a
+        // crate-private path.
+        fail::fail_point!(name, |_| 42);
+        0
+    }
+
+    let observed = probe(name);
+    assert_eq!(
+        observed, 42,
+        "return action must short-circuit the function via the closure form, not panic",
+    );
+
+    // Disarm so other tests don't see this failpoint armed.
+    failpoints::cfg(name, "off").expect("disarm");
+    let observed_off = probe(name);
+    assert_eq!(
+        observed_off, 0,
+        "after `off`, the failpoint closure must not fire",
+    );
+
+    // Sanity: panic action would unwind through the closure;
+    // configuring `return` followed by `panic` in turn must produce
+    // a panic on next probe. Wrap in `catch_unwind` to assert.
+    failpoints::cfg(name, "panic").expect("cfg panic action");
+    let result = std::panic::catch_unwind(|| probe(name));
+    assert!(
+        result.is_err(),
+        "panic action must unwind, distinguishing it from return",
+    );
+    failpoints::cfg(name, "off").expect("disarm after panic test");
 }

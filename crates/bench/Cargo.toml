@@ -24,3 +24,10 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 toml = "0.8"
+
+[dev-dependencies]
+# Lane F6: integration tests in `tests/failpoint_matrix.rs` drive
+# the `fail` crate directly to assert that a `return` action takes
+# the early-return path (and not the panic path the previous bench
+# action-mapping silently routed it through).
+fail = { version = "0.5", features = ["failpoints"] }

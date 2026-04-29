@@ -765,6 +765,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossbeam-utils",
+ "fail",
  "hdrhistogram",
  "libc",
  "rand 0.9.4",
