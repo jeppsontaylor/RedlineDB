@@ -1,3 +1,4 @@
+pub mod combiner;
 pub mod lanes;
 pub mod manager;
 pub mod payload;

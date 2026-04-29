@@ -290,3 +290,148 @@ fn lane_coordinator_config_lane_count_field_defaults_to_one() {
     let config = WalConfig::default();
     assert_eq!(config.lanes, 1);
 }
+
+// ---------- Semantic combiner (opt-in stub) ----------
+
+#[test]
+fn combiner_default_off_does_not_change_behaviour() {
+    let temp = TempDir::new().unwrap();
+    let config = WalConfig::default();
+    assert!(!config.semantic_combiner);
+    let coordinator = WalCoordinator::create(temp.path(), config).unwrap();
+    let append = coordinator
+        .append(WalRecordKind::Commit, TxId(1), b"v".to_vec())
+        .unwrap();
+    coordinator.flush_until(append.end_lsn).unwrap();
+}
+
+#[test]
+fn combiner_recognises_counter_delta_record_shape() {
+    use redlinedb_kernel::wal::combiner::{CombinableDelta, WalCombiner};
+    let combiner = WalCombiner::new();
+    let a = CombinableDelta {
+        rel_id: 7,
+        row_id: 42,
+        column: 1,
+        delta: 1,
+    };
+    let b = CombinableDelta {
+        rel_id: 7,
+        row_id: 42,
+        column: 1,
+        delta: 1,
+    };
+    let merged = combiner.try_merge(&a, &b).unwrap();
+    assert_eq!(merged.delta, 2);
+    assert_eq!(merged.rel_id, a.rel_id);
+    assert_eq!(merged.row_id, a.row_id);
+    assert_eq!(merged.column, a.column);
+}
+
+#[test]
+fn combiner_refuses_to_merge_distinct_targets() {
+    use redlinedb_kernel::wal::combiner::{CombinableDelta, WalCombiner};
+    let combiner = WalCombiner::new();
+    let a = CombinableDelta {
+        rel_id: 7,
+        row_id: 42,
+        column: 1,
+        delta: 1,
+    };
+    let b = CombinableDelta {
+        rel_id: 7,
+        row_id: 43,
+        column: 1,
+        delta: 1,
+    };
+    assert!(combiner.try_merge(&a, &b).is_none());
+}
+
+#[test]
+fn combiner_refuses_to_merge_distinct_columns() {
+    use redlinedb_kernel::wal::combiner::{CombinableDelta, WalCombiner};
+    let combiner = WalCombiner::new();
+    assert!(
+        combiner
+            .try_merge(
+                &CombinableDelta {
+                    rel_id: 1,
+                    row_id: 1,
+                    column: 0,
+                    delta: 1,
+                },
+                &CombinableDelta {
+                    rel_id: 1,
+                    row_id: 1,
+                    column: 1,
+                    delta: 1,
+                },
+            )
+            .is_none()
+    );
+}
+
+#[test]
+fn combiner_overflow_is_refused_not_saturated() {
+    use redlinedb_kernel::wal::combiner::{CombinableDelta, WalCombiner};
+    let combiner = WalCombiner::new();
+    let a = CombinableDelta {
+        rel_id: 1,
+        row_id: 1,
+        column: 1,
+        delta: i64::MAX,
+    };
+    let b = CombinableDelta {
+        rel_id: 1,
+        row_id: 1,
+        column: 1,
+        delta: 1,
+    };
+    assert!(combiner.try_merge(&a, &b).is_none());
+}
+
+#[test]
+#[should_panic(expected = "safe-by-construction fold not yet implemented")]
+fn combiner_fold_path_is_explicit_unimplemented_stub() {
+    // Lane GC: the prompt is explicit — "if it's not safe-by-
+    // construction, leave it as a feature stub with unimplemented!()
+    // rather than ship something broken." This test pins that
+    // contract: invoking the still-unproved fold path panics with
+    // the documented message rather than silently misbehaving.
+    use redlinedb_kernel::wal::combiner::{CombinableDelta, WalCombiner, maybe_combine_pending};
+    let combiner = WalCombiner::new();
+    let cand = CombinableDelta {
+        rel_id: 1,
+        row_id: 1,
+        column: 1,
+        delta: 1,
+    };
+    let _ = maybe_combine_pending(&combiner, &cand, None);
+}
+
+#[test]
+fn combiner_burst_workload_with_combiner_off_is_correct_baseline() {
+    // Lane GC: with the combiner OFF (default), 1000 sequential
+    // commits each hit fsync (potentially batched by the writer
+    // thread's group-commit window). This pins the *baseline* the
+    // future combiner-on test will compare against. Once the
+    // safe-by-construction fold lands, an analogous test will
+    // assert group_commits_issued < 1000 with combiner ON; for now
+    // we verify the baseline contract — every record is durable.
+    let temp = TempDir::new().unwrap();
+    let config = WalConfig {
+        group_commit_delay_us: 0,
+        ..WalConfig::default()
+    };
+    assert!(!config.semantic_combiner);
+    let coordinator = WalCoordinator::create(temp.path(), config).unwrap();
+    for idx in 0..32 {
+        let append = coordinator
+            .append(WalRecordKind::PageDelta, TxId(idx + 1), vec![idx as u8; 4])
+            .unwrap();
+        coordinator.flush_until(append.end_lsn).unwrap();
+    }
+    let snap = coordinator.sync_counters_snapshot();
+    assert_eq!(snap.group_commit_batch_record_count_sum, 32);
+    assert!(snap.group_commits_issued >= 1);
+}

@@ -34,6 +34,15 @@ pub struct WalConfig {
     /// [`crate::wal::WalLaneCoordinator`]; the engine itself stays
     /// single-lane today.
     pub lanes: usize,
+    /// Lane GC (phase 10): opt-in semantic commit combiner. When
+    /// `true`, mutations that the WAL coordinator can prove to be
+    /// commutative deltas on the same `(rel_id, row_id, column)`
+    /// tuple may be merged before fsync. Default `false` — the
+    /// combiner is wired as a stub today (see
+    /// [`crate::wal::combiner`]) and will be enabled once the safety
+    /// proof lands; consumers may set the flag without changing
+    /// visible behaviour.
+    pub semantic_combiner: bool,
 }
 
 impl Default for WalConfig {
@@ -45,6 +54,7 @@ impl Default for WalConfig {
             group_commit_delay_us: DEFAULT_GROUP_COMMIT_DELAY_US,
             group_commit_max_batch_bytes: DEFAULT_GROUP_COMMIT_MAX_BATCH_BYTES,
             lanes: 1,
+            semantic_combiner: false,
         }
     }
 }
