@@ -557,11 +557,9 @@ impl BtreeIndex {
             // No match here. If duplicates of this logical_key may continue on
             // the right sibling, walk right and keep looking.
             drop(page);
-            if last_key_matches_search {
-                if let Some(right) = header.right {
-                    leaf_id = right;
-                    continue;
-                }
+            if last_key_matches_search && let Some(right) = header.right {
+                leaf_id = right;
+                continue;
             }
             return Ok(());
         }
