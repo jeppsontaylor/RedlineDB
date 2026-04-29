@@ -691,7 +691,18 @@ impl<Fs: FileSystem> WalManager<Fs> {
         // Lane E failpoint: armed before the fsync that establishes WAL
         // durability so the harness can simulate "fsync skipped" or kernel
         // crash mid-fsync.
-        crate::fail_point!("wal::flush");
+        //
+        // The closure form lets the bench-matrix runner inject the
+        // `return` action with meaningful semantics: it short-circuits
+        // the fsync entirely and reports `Ok(written_lsn)` to the
+        // caller, simulating a kernel that *claimed* the WAL was
+        // durable while skipping the actual fsync(2). That is the
+        // wal-fsync-skipped scenario; the strict gate must catch it
+        // by detecting acked rows that are missing post-recovery.
+        // `panic`/`abort` actions still kill the thread before
+        // `sync_data` runs, exactly like the original site.
+        let written = self.written_lsn;
+        crate::fail_point!("wal::flush", |_| { Ok(written) });
         self.active_file.sync_data()?;
         self.durable_lsn = self.written_lsn;
         Ok(self.durable_lsn)

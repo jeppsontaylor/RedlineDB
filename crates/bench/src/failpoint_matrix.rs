@@ -183,8 +183,20 @@ pub fn run_child(args: &FailpointChildArgs) -> Result<()> {
     // succeeds when the `failpoints` feature was enabled at compile
     // time, which we guarantee via the bench's direct dep on
     // `redlinedb-kernel = { features = ["failpoints"] }`.
+    //
+    // The action string is forwarded VERBATIM to `fail::cfg`. The only
+    // transformation we apply is prepending the `K*` count when
+    // `kill_after_n_hits > 1` so the failpoint fires the K-th time
+    // rather than immediately. Previous revisions silently rewrote
+    // `return` and `abort` to `panic`, which made the
+    // `wal-fsync-skipped` case test panic-mid-fsync rather than
+    // skipped-fsync semantics. See `apply_kill_count`.
     redlinedb_kernel::failpoints::init();
-    let action = translate_action(&args.action, args.kill_after_n_hits);
+    let action = apply_kill_count(&args.action, args.kill_after_n_hits);
+    eprintln!(
+        "failpoint-child: arming failpoint={} action={} (raw={})",
+        args.failpoint, action, args.action
+    );
     redlinedb_kernel::failpoints::cfg(&args.failpoint, &action)
         .map_err(|err| anyhow::anyhow!("arm failpoint {}: {}", args.failpoint, err))?;
 
@@ -419,32 +431,24 @@ fn engine_name(engine: EngineKind) -> &'static str {
     }
 }
 
-fn translate_action(raw: &str, kill_after_n_hits: u64) -> String {
+fn apply_kill_count(raw: &str, kill_after_n_hits: u64) -> String {
     // The `fail` crate accepts `K*action` to fire `K` times before
-    // disarming. We only pass the count when > 1 so the common
+    // disarming. We only prepend the count when > 1 so the common
     // single-shot case stays readable in logs.
-    let suffix = match raw.trim() {
-        // `abort` and `panic` both translate to a Rust panic that kills
-        // the process under typical bench-runner conditions. The runner
-        // does not link `panic = "abort"`, but a panicking thread that
-        // holds locks tends to abort the process via the unwind guard
-        // in the WAL writer thread; either way the parent observes the
-        // child terminate.
-        "panic" | "abort" => "panic".to_string(),
-        // `return` makes the failpoint short-circuit the function with
-        // the type's default. Most kernel hot paths return `Result<_>`
-        // so `Default::default()` evaluates to `Ok(_)` only when the
-        // inner type has a sensible default — for now we map `return`
-        // to `panic` to keep the semantics consistent across cases.
-        "return" => "panic".to_string(),
-        // Forward verbatim; the fail crate accepts `K%`, `sleep(N)`,
-        // `pause`, `print`, etc.
-        other => other.to_string(),
-    };
+    //
+    // Action strings are NOT rewritten here. The `fail` crate honours
+    // `panic`, `return(value)`, `off`, `print(msg)`, `pause`,
+    // `sleep(N)`, and `yield` directly. In particular `return` makes
+    // the failpoint short-circuit the function, which the kernel's
+    // `wal::flush` hook accepts via its closure form (returns
+    // `Ok(written_lsn)` without fsync). Translating `return` to
+    // `panic` here would silently change a "skipped fsync" test into
+    // a "panic mid-fsync" test, which is the wrong semantics.
+    let action = raw.trim();
     if kill_after_n_hits <= 1 {
-        suffix
+        action.to_string()
     } else {
-        format!("{kill_after_n_hits}*{suffix}")
+        format!("{kill_after_n_hits}*{action}")
     }
 }
 
@@ -461,16 +465,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn translate_action_maps_keywords_to_panic() {
-        assert_eq!(translate_action("panic", 1), "panic");
-        assert_eq!(translate_action("abort", 1), "panic");
-        assert_eq!(translate_action("return", 1), "panic");
-        assert_eq!(translate_action("panic", 5), "5*panic");
+    fn apply_kill_count_passes_actions_verbatim() {
+        // Every action keyword the `fail` crate accepts must round-trip
+        // unchanged at single-hit count.
+        assert_eq!(apply_kill_count("panic", 1), "panic");
+        assert_eq!(apply_kill_count("abort", 1), "abort");
+        assert_eq!(apply_kill_count("return", 1), "return");
+        assert_eq!(apply_kill_count("off", 1), "off");
+        assert_eq!(apply_kill_count("pause", 1), "pause");
+        assert_eq!(apply_kill_count("yield", 1), "yield");
+        assert_eq!(apply_kill_count("sleep(10)", 1), "sleep(10)");
+        assert_eq!(apply_kill_count("print(hello)", 1), "print(hello)");
+        assert_eq!(apply_kill_count("return(7)", 1), "return(7)");
     }
 
     #[test]
-    fn translate_action_passes_through_unknown_directives() {
-        assert_eq!(translate_action("sleep(10)", 1), "sleep(10)");
-        assert_eq!(translate_action("50%panic", 1), "50%panic");
+    fn apply_kill_count_prepends_multiplier_when_count_exceeds_one() {
+        assert_eq!(apply_kill_count("panic", 5), "5*panic");
+        assert_eq!(apply_kill_count("return", 25), "25*return");
+        // 50%action probability strings are also forwarded verbatim
+        // when count==1; they compose with the `K*` prefix when count>1
+        // (the `fail` crate parses both layered).
+        assert_eq!(apply_kill_count("50%panic", 1), "50%panic");
+        assert_eq!(apply_kill_count("50%panic", 3), "3*50%panic");
+    }
+
+    #[test]
+    fn apply_kill_count_trims_whitespace() {
+        assert_eq!(apply_kill_count("  panic  ", 1), "panic");
+        assert_eq!(apply_kill_count("\treturn\n", 2), "2*return");
     }
 }
