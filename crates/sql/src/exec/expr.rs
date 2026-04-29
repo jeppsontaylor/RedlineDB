@@ -209,6 +209,12 @@ pub(crate) fn eval_scalar(
             if matches!(value, SqlValue::Null) {
                 SqlValue::Null
             } else {
+                // SQLite semantics: compute the base IN as TRUE / FALSE / NULL,
+                // then apply NOT only on TRUE / FALSE — NULL must propagate
+                // through unchanged.
+                //   `5 NOT IN (1, NULL)`  → NULL  (cannot prove 5 != NULL)
+                //   `1 NOT IN (1, NULL)`  → FALSE (we found a match)
+                //   `5 NOT IN (1, 2, 3)`  → TRUE  (no NULL, no match)
                 let mut found = false;
                 let mut saw_null = false;
                 for item in list {
@@ -222,14 +228,17 @@ pub(crate) fn eval_scalar(
                         _ => {}
                     }
                 }
-                let mut ok = found;
-                if *negated {
-                    ok = !ok;
-                }
-                if !ok && saw_null {
-                    SqlValue::Null
+                let base_in: Option<bool> = if found {
+                    Some(true)
+                } else if saw_null {
+                    None
                 } else {
-                    SqlValue::Integer(if ok { 1 } else { 0 })
+                    Some(false)
+                };
+                match (base_in, *negated) {
+                    (Some(b), false) => SqlValue::Integer(if b { 1 } else { 0 }),
+                    (Some(b), true) => SqlValue::Integer(if !b { 1 } else { 0 }),
+                    (None, _) => SqlValue::Null,
                 }
             }
         }
@@ -266,14 +275,19 @@ pub(crate) fn eval_scalar(
                         _ => {}
                     }
                 }
-                let mut ok = found;
-                if *negated {
-                    ok = !ok;
-                }
-                if !ok && saw_null {
-                    SqlValue::Null
+                // Same NOT-IN-with-NULL semantics as InList: compute base IN as
+                // TRUE / FALSE / NULL, then apply NOT only on TRUE / FALSE.
+                let base_in: Option<bool> = if found {
+                    Some(true)
+                } else if saw_null {
+                    None
                 } else {
-                    SqlValue::Integer(if ok { 1 } else { 0 })
+                    Some(false)
+                };
+                match (base_in, *negated) {
+                    (Some(b), false) => SqlValue::Integer(if b { 1 } else { 0 }),
+                    (Some(b), true) => SqlValue::Integer(if !b { 1 } else { 0 }),
+                    (None, _) => SqlValue::Null,
                 }
             }
         }

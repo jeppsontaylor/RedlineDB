@@ -111,4 +111,38 @@ mod phase10_sqla_correctness {
         }
         assert_eq!(distinct_rows, vec![1, 2, 3]);
     }
+
+    // --- Bug 2: NOT IN with NULL --------------------------------------------
+
+    #[test]
+    fn not_in_with_null_returns_null_when_no_match() {
+        // SQLite: 5 NOT IN (1, NULL) is NULL because we cannot prove 5 != NULL.
+        assert_null(&run_scalar("SELECT 5 NOT IN (1, NULL)"));
+    }
+
+    #[test]
+    fn not_in_with_null_returns_false_when_match() {
+        // SQLite: 1 NOT IN (1, NULL) is FALSE (we found a match).
+        assert_int(&run_scalar("SELECT 1 NOT IN (1, NULL)"), 0);
+    }
+
+    #[test]
+    fn in_with_null_regression() {
+        // Regression: 1 IN (1, NULL) must remain TRUE (match found).
+        assert_int(&run_scalar("SELECT 1 IN (1, NULL)"), 1);
+    }
+
+    #[test]
+    fn in_with_only_null_is_null() {
+        // 5 IN (NULL) is NULL; 5 NOT IN (NULL) is also NULL.
+        assert_null(&run_scalar("SELECT 5 IN (NULL)"));
+        assert_null(&run_scalar("SELECT 5 NOT IN (NULL)"));
+    }
+
+    #[test]
+    fn not_in_no_null_returns_true() {
+        // 5 NOT IN (1, 2, 3) is TRUE; 1 NOT IN (1, 2, 3) is FALSE.
+        assert_int(&run_scalar("SELECT 5 NOT IN (1, 2, 3)"), 1);
+        assert_int(&run_scalar("SELECT 1 NOT IN (1, 2, 3)"), 0);
+    }
 }
