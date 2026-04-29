@@ -11,8 +11,19 @@ pub(crate) fn bind_query(
         body,
         order_by,
         limit_clause,
+        with,
         ..
     } = query;
+    if let Some(with) = with {
+        // Lane SQL-D phase 10 Tier-2: WITH ... SELECT (CTE) parses but is
+        // not yet planner-integrated. We surface a structured error so SQL
+        // text round-trips without becoming a parse-error and so future
+        // planner work can swap this branch for a materialisation pass.
+        let _ = with.cte_tables.len();
+        return Err(Error::UnsupportedSql(
+            "CTEs (WITH clauses) are parsed-only; execution not yet implemented".to_owned(),
+        ));
+    }
     match *body {
         SetExpr::Query(query) => {
             if order_by.is_some() || limit_clause.is_some() {
@@ -494,6 +505,10 @@ pub(crate) fn normalize_expr(expr: Expr, params: &mut ParamLayout) -> Result<Exp
             expr: Box::new(normalize_expr(*expr, params)?),
         },
         Expr::Nested(expr) => Expr::Nested(Box::new(normalize_expr(*expr, params)?)),
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(normalize_expr(*expr, params)?),
+            collation,
+        },
         Expr::Function(mut func) => {
             normalize_function_args(&mut func.args, params)?;
             normalize_function_args(&mut func.parameters, params)?;

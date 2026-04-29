@@ -65,9 +65,12 @@ pub(crate) fn compare_row_ordering(
     bindings: &[Option<SqlValue>],
 ) -> Result<Ordering> {
     for order in order_by {
+        let collation = collation_from_expr(&order.expr);
         let left_value = eval_scalar(&order.expr, &left.context(), bindings)?;
         let right_value = eval_scalar(&order.expr, &right.context(), bindings)?;
-        let mut ord = compare_values(&left_value, &right_value);
+        let mut ord = collation
+            .and_then(|c| c.compare_values(&left_value, &right_value))
+            .unwrap_or_else(|| compare_values(&left_value, &right_value));
         if matches!(order.options.asc, Some(false)) {
             ord = ord.reverse();
         }
@@ -141,6 +144,18 @@ pub(crate) fn eval_scalar(
             }
         }
         Expr::BinaryOp { left, op, right } => eval_binary(left, op, right, row, bindings)?,
+        Expr::Collate { expr, collation } => {
+            // The COLLATE wrapper is transparent for value evaluation; the
+            // collation only affects comparisons performed in eval_binary or
+            // ORDER BY. Validate the name here so unknown collations error.
+            let name = collation.to_string();
+            if crate::collation::Collation::parse(&name).is_none() {
+                return Err(Error::UnsupportedSql(format!(
+                    "unsupported collation: {name}"
+                )));
+            }
+            eval_scalar(expr, row, bindings)?
+        }
         Expr::Cast {
             expr, data_type, ..
         } => cast_value(eval_scalar(expr, row, bindings)?, data_type)?,
@@ -380,8 +395,12 @@ fn eval_binary(
     row: &RowContext<'_>,
     bindings: &[Option<SqlValue>],
 ) -> Result<SqlValue> {
+    let collation = collation_from_expr(left).or_else(|| collation_from_expr(right));
     let left_value = eval_scalar(left, row, bindings)?;
     let right_value = eval_scalar(right, row, bindings)?;
+    let compare_with_collation = |a: SqlValue, b: SqlValue, accept: fn(Ordering) -> bool| {
+        compare_binary_with(a, b, accept, collation)
+    };
     Ok(match op {
         BinaryOperator::And => match (truthy_opt(&left_value), truthy_opt(&right_value)) {
             (Some(false), _) | (_, Some(false)) => SqlValue::Integer(0),
@@ -415,42 +434,35 @@ fn eval_binary(
             left_value,
             right_value,
             |a, b| if b == 0 { None } else { a.checked_div(b) },
-            |a, b| {
-                if b == 0.0 {
-                    None
-                } else {
-                    Some(a / b)
-                }
-            },
+            |a, b| if b == 0.0 { None } else { Some(a / b) },
         )?,
         BinaryOperator::Modulo => arithmetic(
             left_value,
             right_value,
             |a, b| if b == 0 { None } else { a.checked_rem(b) },
-            |a, b| {
-                if b == 0.0 {
-                    None
-                } else {
-                    Some(a % b)
-                }
-            },
+            |a, b| if b == 0.0 { None } else { Some(a % b) },
         )?,
-        BinaryOperator::Eq => compare_binary(left_value, right_value, |o| o == Ordering::Equal)?,
-        // Phase-10 Lane V1: pgvector borrows `<=>` for cosine distance. We
-        // overload it the same way: if BOTH operands decode as vector blobs,
-        // emit `vector_distance_cosine`. Otherwise we fall back to the
-        // historical SQLite-flavoured null-safe inequality so we don't break
-        // existing comparison tests. (See `vector_pair_or_compare`.)
+        BinaryOperator::Eq => {
+            compare_with_collation(left_value, right_value, |o| o == Ordering::Equal)?
+        }
         BinaryOperator::Spaceship => match try_vector_pair(&left_value, &right_value) {
             Some((a, b)) => vector_distance_to_value(VectorOpMetric::Cosine, &a, &b)?,
-            None => compare_binary(left_value, right_value, |o| o != Ordering::Equal)?,
+            None => compare_with_collation(left_value, right_value, |o| o != Ordering::Equal)?,
         },
-        BinaryOperator::NotEq => compare_binary(left_value, right_value, |o| o != Ordering::Equal)?,
-        BinaryOperator::Gt => compare_binary(left_value, right_value, |o| o == Ordering::Greater)?,
-        BinaryOperator::GtEq => compare_binary(left_value, right_value, |o| o != Ordering::Less)?,
-        BinaryOperator::Lt => compare_binary(left_value, right_value, |o| o == Ordering::Less)?,
+        BinaryOperator::NotEq => {
+            compare_with_collation(left_value, right_value, |o| o != Ordering::Equal)?
+        }
+        BinaryOperator::Gt => {
+            compare_with_collation(left_value, right_value, |o| o == Ordering::Greater)?
+        }
+        BinaryOperator::GtEq => {
+            compare_with_collation(left_value, right_value, |o| o != Ordering::Less)?
+        }
+        BinaryOperator::Lt => {
+            compare_with_collation(left_value, right_value, |o| o == Ordering::Less)?
+        }
         BinaryOperator::LtEq => {
-            compare_binary(left_value, right_value, |o| o != Ordering::Greater)?
+            compare_with_collation(left_value, right_value, |o| o != Ordering::Greater)?
         }
         BinaryOperator::StringConcat => {
             if matches!(left_value, SqlValue::Null) || matches!(right_value, SqlValue::Null) {
@@ -465,6 +477,7 @@ fn eval_binary(
         }
         BinaryOperator::Arrow => crate::json::scalar::arrow_json(&left_value, &right_value)?,
         BinaryOperator::LongArrow => crate::json::scalar::arrow_sql(&left_value, &right_value)?,
+        BinaryOperator::Regexp => regexp_result(left_value, right_value, false)?,
         other => {
             return Err(Error::UnsupportedSql(format!(
                 "unsupported binary op {other:?}"
@@ -473,21 +486,54 @@ fn eval_binary(
     })
 }
 
+/// Lane SQL-D: SQLite-style `value REGEXP pattern`. NULL on either side
+/// propagates; an invalid pattern errors out.
+pub(crate) fn regexp_result(value: SqlValue, pattern: SqlValue, negated: bool) -> Result<SqlValue> {
+    if matches!(value, SqlValue::Null) || matches!(pattern, SqlValue::Null) {
+        return Ok(SqlValue::Null);
+    }
+    let text = value_to_string(&value);
+    let pattern_str = value_to_string(&pattern);
+    let matched = crate::regexp::regex_match(&text, &pattern_str)?;
+    Ok(SqlValue::Integer(if matched ^ negated { 1 } else { 0 }))
+}
+
 pub(crate) fn compare_binary(
     left: SqlValue,
     right: SqlValue,
     accept: impl FnOnce(Ordering) -> bool,
 ) -> Result<SqlValue> {
+    compare_binary_with(left, right, accept, None)
+}
+
+/// Like `compare_binary` but optionally applies a `Collation` to the
+/// comparison. When the collation cannot be applied to the value pair (for
+/// example, a number compared to text) we fall through to the default
+/// type-precedence comparison.
+pub(crate) fn compare_binary_with(
+    left: SqlValue,
+    right: SqlValue,
+    accept: impl FnOnce(Ordering) -> bool,
+    collation: Option<crate::collation::Collation>,
+) -> Result<SqlValue> {
     if matches!(left, SqlValue::Null) || matches!(right, SqlValue::Null) {
         return Ok(SqlValue::Null);
     }
-    Ok(SqlValue::Integer(
-        if accept(compare_values(&left, &right)) {
-            1
-        } else {
-            0
-        },
-    ))
+    let ord = collation
+        .and_then(|c| c.compare_values(&left, &right))
+        .unwrap_or_else(|| compare_values(&left, &right));
+    Ok(SqlValue::Integer(if accept(ord) { 1 } else { 0 }))
+}
+
+/// Walk a possibly-`Collate(...)` wrapper to extract the collation choice.
+pub(crate) fn collation_from_expr(expr: &Expr) -> Option<crate::collation::Collation> {
+    match expr {
+        Expr::Collate { collation, .. } => {
+            crate::collation::Collation::parse(&collation.to_string())
+        }
+        Expr::Nested(inner) => collation_from_expr(inner),
+        _ => None,
+    }
 }
 
 pub(crate) fn sql_truth_result(value: SqlValue) -> SqlValue {
@@ -948,6 +994,15 @@ fn eval_function(
     row: &RowContext<'_>,
     bindings: &[Option<SqlValue>],
 ) -> Result<SqlValue> {
+    if func.over.is_some() {
+        // Lane SQL-D phase 10 Tier-3: window functions parse but no runtime
+        // pipeline yet. Surface a structured error so the planner work can
+        // pick this up cleanly later.
+        return Err(Error::UnsupportedSql(format!(
+            "window functions are parsed-only; execution not yet implemented: {}",
+            func.name
+        )));
+    }
     let mut values = Vec::new();
     if let FunctionArguments::List(list) = &func.args {
         for arg in &list.args {
@@ -1067,13 +1122,24 @@ fn eval_function(
         "vector_distance_l2" => vector_pair_distance(&values, VectorOpMetric::L2),
         "vector_distance_cosine" => vector_pair_distance(&values, VectorOpMetric::Cosine),
         "vector_distance_ip" => vector_pair_distance(&values, VectorOpMetric::InnerProduct),
+        "date" => datetime_function(&values, DateTimeKind::Date),
+        "time" => datetime_function(&values, DateTimeKind::Time),
+        "datetime" => datetime_function(&values, DateTimeKind::Datetime),
+        "julianday" => datetime_function(&values, DateTimeKind::JulianDay),
+        "unixepoch" => datetime_function(&values, DateTimeKind::Unix),
+        "strftime" => strftime_function(&values),
+        "regexp" => {
+            if values.len() != 2 {
+                return Err(Error::UnsupportedSql("regexp requires 2 args".to_owned()));
+            }
+            crate::exec::expr::regexp_result(values[1].clone(), values[0].clone(), false)
+        }
         _ => Err(Error::UnsupportedSql(format!(
             "unsupported function {name}"
         ))),
     }
 }
 
-#[derive(Copy, Clone)]
 pub(crate) enum VectorOpMetric {
     L2,
     Cosine,
@@ -1107,7 +1173,6 @@ fn vector_construct_from_value(value: &SqlValue) -> Result<SqlValue> {
     }
 }
 
-/// Return the vector's dimension as INTEGER, or NULL for a Null input.
 fn vector_dims_value(value: &SqlValue) -> Result<SqlValue> {
     match value {
         SqlValue::Null => Ok(SqlValue::Null),
@@ -1154,6 +1219,51 @@ fn vector_distance_to_value(metric: VectorOpMetric, a: &[f32], b: &[f32]) -> Res
         .distance(a, b)
         .map_err(|e| Error::UnsupportedSql(format!("vector distance: {e}")))?;
     Ok(SqlValue::Real(d as f64))
+}
+
+#[derive(Copy, Clone)]
+enum DateTimeKind {
+    Date,
+    Time,
+    Datetime,
+    JulianDay,
+    Unix,
+}
+
+fn datetime_function(values: &[SqlValue], kind: DateTimeKind) -> Result<SqlValue> {
+    let dt = parse_dt_args(values)?;
+    Ok(match kind {
+        DateTimeKind::Date => SqlValue::Text(Arc::from(dt.format_date())),
+        DateTimeKind::Time => SqlValue::Text(Arc::from(dt.format_time())),
+        DateTimeKind::Datetime => SqlValue::Text(Arc::from(dt.format_datetime())),
+        DateTimeKind::JulianDay => SqlValue::Real(dt.julian_day()),
+        DateTimeKind::Unix => SqlValue::Integer(dt.to_unix()),
+    })
+}
+
+fn strftime_function(values: &[SqlValue]) -> Result<SqlValue> {
+    if values.is_empty() {
+        return Err(Error::UnsupportedSql("strftime requires format".to_owned()));
+    }
+    let format = value_to_string(&values[0]);
+    let dt = parse_dt_args(&values[1..])?;
+    Ok(SqlValue::Text(Arc::from(crate::datetime::strftime(
+        &format, &dt,
+    ))))
+}
+
+fn parse_dt_args(values: &[SqlValue]) -> Result<crate::datetime::DateTime> {
+    let base = match values.first() {
+        Some(v) => value_to_string(v),
+        None => "now".to_owned(),
+    };
+    let dt = crate::datetime::parse_timestring(&base)?;
+    if values.len() <= 1 {
+        return Ok(dt);
+    }
+    let mods: Vec<String> = values[1..].iter().map(value_to_string).collect();
+    let refs: Vec<&str> = mods.iter().map(String::as_str).collect();
+    crate::datetime::apply_modifiers(dt, &refs)
 }
 
 pub(crate) fn cast_value(

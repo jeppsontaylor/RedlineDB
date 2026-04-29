@@ -1,10 +1,13 @@
 mod batch;
+mod collation;
 mod connection;
+mod datetime;
 mod error;
 mod exec;
 mod json;
 mod parser;
 mod planner;
+mod regexp;
 mod session;
 mod statement;
 mod value;

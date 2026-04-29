@@ -89,7 +89,6 @@ pub(crate) fn bind_create_index(
         || !create_index.include.is_empty()
         || create_index.nulls_distinct.is_some()
         || !create_index.with.is_empty()
-        || create_index.predicate.is_some()
         || !create_index.index_options.is_empty()
         || !create_index.alter_options.is_empty()
     {
@@ -103,8 +102,36 @@ pub(crate) fn bind_create_index(
     let (schema, name) = split_name(name)?;
     let table = parse_qualified_name(create_index.table_name)?;
     let mut columns = Vec::with_capacity(create_index.columns.len());
+    let mut has_expression_column = false;
     for column in create_index.columns {
-        columns.push(convert_index_column(column)?);
+        match convert_index_column(column.clone()) {
+            Ok(c) => columns.push(c),
+            Err(_) => {
+                // Lane SQL-D phase 10: parse-only acceptance of expression
+                // indexes. We record a placeholder column so the catalog
+                // operation can be rejected at execute time with a clear
+                // diagnostic, while CREATE INDEX still parses for tools that
+                // round-trip schema text.
+                has_expression_column = true;
+                columns.push(IndexColumnSpec {
+                    name: DbName::new(format!("__expr_{}", columns.len())),
+                    sort_dir: SortDir::Asc,
+                    collation: None,
+                });
+            }
+        }
+    }
+
+    let has_predicate = create_index.predicate.is_some();
+    if has_predicate || has_expression_column {
+        // Both partial and expression indexes are parser-only in this lane:
+        // the kernel does not yet thread the predicate / expression through
+        // index DML. Surface a clear unsupported error so callers know the
+        // syntax is recognised but not yet enforced.
+        return Err(Error::UnsupportedSql(
+            "partial and expression indexes are parsed-only; execution not yet implemented"
+                .to_owned(),
+        ));
     }
 
     Ok(PreparedTemplate {
@@ -236,6 +263,31 @@ pub(crate) fn bind_alter_table(
             redlinedb_kernel::catalog::AlterTableOperationSpec::AddColumn {
                 column,
                 if_not_exists,
+            }
+        }
+        AlterTableOperation::DropColumn {
+            has_column_keyword: _,
+            column_names,
+            if_exists,
+            drop_behavior,
+        } => {
+            if drop_behavior.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "ALTER TABLE DROP COLUMN CASCADE/RESTRICT is not supported".to_owned(),
+                ));
+            }
+            if column_names.len() != 1 {
+                return Err(Error::UnsupportedSql(
+                    "ALTER TABLE DROP COLUMN supports a single column at a time".to_owned(),
+                ));
+            }
+            // Parser-only Tier-1 stub: catalog mutation is rejected. We still
+            // accept and validate the syntax so callers can build prepared
+            // templates and schema migration tools surface the correct
+            // unsupported-execution error instead of a parse error.
+            redlinedb_kernel::catalog::AlterTableOperationSpec::DropColumn {
+                column_name: DbName::new(column_names.into_iter().next().unwrap().value),
+                if_exists,
             }
         }
         other => {

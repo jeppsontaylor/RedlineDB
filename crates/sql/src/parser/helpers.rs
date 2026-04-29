@@ -60,12 +60,23 @@ pub(crate) fn convert_column_def(
             ColumnOption::Collation(name) => {
                 collation = Some(name.to_string());
             }
-            ColumnOption::ForeignKey(_)
-            | ColumnOption::DialectSpecific(_)
+            ColumnOption::ForeignKey(_) => {
+                // Lane SQL-D phase 10: column-level REFERENCES is accepted
+                // for parser-only compatibility. The kernel does not yet
+                // enforce the FK constraint at write time; the declaration
+                // is recorded only by being present in the CREATE TABLE
+                // text we round-trip through `normalized_sql`.
+            }
+            ColumnOption::Generated { .. } => {
+                // Lane SQL-D phase 10: GENERATED columns parse-only. Stored
+                // and virtual variants are accepted but not yet computed;
+                // INSERT/UPDATE will leave the column at its declared
+                // default until execution support lands.
+            }
+            ColumnOption::DialectSpecific(_)
             | ColumnOption::CharacterSet(_)
             | ColumnOption::Comment(_)
             | ColumnOption::OnUpdate(_)
-            | ColumnOption::Generated { .. }
             | ColumnOption::Options(_)
             | ColumnOption::Identity(_)
             | ColumnOption::OnConflict(_)
@@ -122,8 +133,20 @@ pub(crate) fn convert_table_constraint(
             expr: expr_to_kernel_ast(&check.expr, column_lookup)?,
             normalized_sql: check.expr.to_string(),
         }),
-        sqlparser::ast::TableConstraint::ForeignKey(_)
-        | sqlparser::ast::TableConstraint::Index(_)
+        sqlparser::ast::TableConstraint::ForeignKey(fk) => {
+            // Lane SQL-D phase 10: FK declarations parse-only. We synthesize
+            // a CHECK(1) so the existing TableConstraintSpec surface accepts
+            // the constraint without altering the kernel API. Enforcement
+            // remains TODO; the declaration text round-trips via the
+            // CREATE TABLE normalized_sql.
+            let _ = fk; // referenced metadata kept for future use
+            Ok(TableConstraintSpec::Check {
+                name: None,
+                expr: ExprAst::Const(OwnedValue::Integer(1)),
+                normalized_sql: "1 /* foreign key parsed-only */".to_owned(),
+            })
+        }
+        sqlparser::ast::TableConstraint::Index(_)
         | sqlparser::ast::TableConstraint::FulltextOrSpatial(_) => Err(Error::UnsupportedSql(
             "table constraint not supported yet".to_owned(),
         )),
