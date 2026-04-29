@@ -698,6 +698,15 @@ fn glob_result(value: SqlValue, pattern: SqlValue, negated: bool) -> Result<SqlV
 }
 
 fn glob_match(text: &[u8], pattern: &[u8]) -> bool {
+    // SQLite GLOB grammar:
+    //   *           — matches zero or more characters
+    //   ?           — matches exactly one character
+    //   [abc]       — character class (any of)
+    //   [a-z]       — character range
+    //   [!abc]      — negated class (matches one char NOT in abc)
+    //   [^abc]      — also a negated class (compatibility)
+    //   anything else — literal (case-sensitive, unlike LIKE)
+    // An unterminated `[` is treated as a literal `[`.
     fn inner(text: &[u8], pattern: &[u8]) -> bool {
         let mut ti = 0usize;
         let mut pi = 0usize;
@@ -726,6 +735,23 @@ fn glob_match(text: &[u8], pattern: &[u8]) -> bool {
                     ti += 1;
                     pi += 1;
                 }
+                b'[' => {
+                    if let Some((matched, advance)) = match_glob_class(&pattern[pi..], text.get(ti))
+                    {
+                        if !matched {
+                            return false;
+                        }
+                        ti += 1;
+                        pi += advance;
+                    } else {
+                        // Unterminated class: treat `[` as a literal.
+                        if ti >= text.len() || text[ti] != b'[' {
+                            return false;
+                        }
+                        ti += 1;
+                        pi += 1;
+                    }
+                }
                 ch => {
                     if ti >= text.len() || text[ti] != ch {
                         return false;
@@ -738,6 +764,68 @@ fn glob_match(text: &[u8], pattern: &[u8]) -> bool {
         ti == text.len()
     }
     inner(text, pattern)
+}
+
+/// Try to match a `[...]` character class at the start of `pattern` against
+/// the optional next byte of the input. Returns `(matched, pattern_advance)`
+/// on success; `None` when the class is unterminated (caller should treat
+/// the leading `[` as a literal).
+fn match_glob_class(pattern: &[u8], target: Option<&u8>) -> Option<(bool, usize)> {
+    debug_assert!(pattern.first() == Some(&b'['));
+    let mut idx = 1usize;
+    let negate = matches!(pattern.get(idx), Some(&b'!') | Some(&b'^'));
+    if negate {
+        idx += 1;
+    }
+    let class_start = idx;
+    let mut matched = false;
+    let target_byte = match target {
+        Some(&b) => b,
+        None => 0,
+    };
+
+    // SQLite allows a literal `]` only as the first character of the class.
+    // So `[]abc]` matches `]`, `a`, `b`, or `c`.
+    if pattern.get(idx) == Some(&b']') {
+        if target.is_some() && target_byte == b']' {
+            matched = true;
+        }
+        idx += 1;
+    }
+
+    while idx < pattern.len() && pattern[idx] != b']' {
+        let lo = pattern[idx];
+        if idx + 2 < pattern.len() && pattern[idx + 1] == b'-' && pattern[idx + 2] != b']' {
+            let hi = pattern[idx + 2];
+            if target.is_some() && target_byte >= lo.min(hi) && target_byte <= lo.max(hi) {
+                matched = true;
+            }
+            idx += 3;
+        } else {
+            if target.is_some() && target_byte == lo {
+                matched = true;
+            }
+            idx += 1;
+        }
+    }
+
+    if idx >= pattern.len() {
+        // No closing `]` — pattern is malformed. Caller falls back to literal.
+        if class_start == idx {
+            return None;
+        }
+        return None;
+    }
+
+    let final_match = if target.is_none() {
+        false
+    } else if negate {
+        !matched
+    } else {
+        matched
+    };
+
+    Some((final_match, idx + 1))
 }
 
 fn round_function(values: &[SqlValue]) -> Result<SqlValue> {

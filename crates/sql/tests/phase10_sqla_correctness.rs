@@ -274,6 +274,45 @@ mod phase10_sqla_correctness {
         assert_text(&run_scalar("SELECT CAST(42 AS TEXT)"), "42");
     }
 
+    // --- Bug 7: GLOB bracket / range / negation ----------------------------
+
+    // GLOB is exposed as a builtin function in this parser; the `x GLOB y`
+    // infix form is not yet supported. Use the function form for tests.
+    // Argument order in this codebase is `glob(value, pattern)` (NOT the
+    // SQLite-standard `glob(pattern, value)` order — see existing test
+    // `sqlite_core_functions_cover_round_hex_quote_random_and_glob`).
+
+    #[test]
+    fn glob_class_any_of() {
+        // 'cat' GLOB 'c[ao]t' → 1 (matches `a`).
+        assert_int(&run_scalar("SELECT glob('cat', 'c[ao]t')"), 1);
+        // 'cot' GLOB 'c[ao]t' → 1 (matches `o`).
+        assert_int(&run_scalar("SELECT glob('cot', 'c[ao]t')"), 1);
+        // 'cit' GLOB 'c[ao]t' → 0.
+        assert_int(&run_scalar("SELECT glob('cit', 'c[ao]t')"), 0);
+    }
+
+    #[test]
+    fn glob_class_range() {
+        assert_int(&run_scalar("SELECT glob('cot', 'c[a-o]t')"), 1);
+        assert_int(&run_scalar("SELECT glob('cpt', 'c[a-o]t')"), 0);
+    }
+
+    #[test]
+    fn glob_class_negation() {
+        // 'c0t' GLOB 'c[!0-9]t' → 0 (negated class excludes digits).
+        assert_int(&run_scalar("SELECT glob('c0t', 'c[!0-9]t')"), 0);
+        // 'cat' GLOB 'c[!0-9]t' → 1.
+        assert_int(&run_scalar("SELECT glob('cat', 'c[!0-9]t')"), 1);
+    }
+
+    #[test]
+    fn glob_star_and_question_regression() {
+        assert_int(&run_scalar("SELECT glob('hello', 'h*o')"), 1);
+        assert_int(&run_scalar("SELECT glob('hi', 'h?')"), 1);
+        assert_int(&run_scalar("SELECT glob('hi', 'h?i')"), 0);
+    }
+
     // Round-trip: combination of fixes — divide-by-zero in WHERE filter must
     // not panic, and propagated NULL must filter out the row.
     #[test]
