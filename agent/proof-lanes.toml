@@ -99,6 +99,19 @@ commands = [
   "./scripts/bench/xbabe1_fetch.sh certify-strace",
 ]
 
+# Phase 10 closing certification — runs the full matrix on the
+# 128-core xbabe1 host against the phase10-wave2-fused tree (12 lanes
+# fused: SQL-A/B/C, GC, INT, VE, J1, J2, V1, V2, V3, SQL-D). The
+# docker image runs plain cargo (no rtk wrapper, which only exists on
+# the host). Output preserves the `phase10-cert` stamp so it doesn't
+# overwrite phase-9 artifacts.
+[phase10-xbabe1-certification]
+commands = [
+  "./scripts/bench/xbabe1_sync.sh",
+  "./scripts/bench/xbabe1_run.sh cargo run -p redlinedb-bench --release -- certify --config crates/bench/bench/certification.toml --out-dir target/bench/xbabe1/phase10-cert --seed 7 --repetitions 5 --warmup 1",
+  "./scripts/bench/xbabe1_fetch.sh phase10-cert",
+]
+
 [security]
 commands = [
   "rtk cargo audit",
