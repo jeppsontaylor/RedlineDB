@@ -78,6 +78,8 @@ pub(crate) fn kv_checksum(conn: &mut dyn BenchConn) -> Result<crate::report::Che
     let mut hasher = Sha256::new();
     let mut version_sum = 0_i64;
     let mut payload_bytes = 0_i64;
+    let mut row_bytes_for_hash: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
+    let mut keys_for_xor: Vec<u64> = Vec::with_capacity(rows.len());
 
     for row in &rows {
         hasher.update(b"row\0");
@@ -90,6 +92,21 @@ pub(crate) fn kv_checksum(conn: &mut dyn BenchConn) -> Result<crate::report::Che
         if let Some(CellValue::Integer(version)) = row.get(3) {
             version_sum = version_sum.saturating_add(*version);
         }
+        // Lane INT: build a deterministic per-row buffer for the dataset
+        // checksum. Order-sensitive payload hash + order-independent key
+        // XOR catch row-shape, key-set, and value drift independently.
+        let key = match row.first() {
+            Some(CellValue::Integer(k)) => *k as u64,
+            _ => 0,
+        };
+        keys_for_xor.push(key);
+        let mut row_buf = Vec::with_capacity(64);
+        row_buf.extend_from_slice(&key.to_le_bytes());
+        if let Some(CellValue::Blob(bytes)) = row.get(2) {
+            row_buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            row_buf.extend_from_slice(bytes);
+        }
+        row_bytes_for_hash.push(row_buf);
     }
 
     let rows_count = rows.len() as i64;
@@ -99,12 +116,21 @@ pub(crate) fn kv_checksum(conn: &mut dyn BenchConn) -> Result<crate::report::Che
         tenant_index_consistency(conn, rows_count)?,
     );
 
+    let dataset = crate::checksum::DatasetChecksum {
+        row_count: rows_count as u64,
+        key_xor: crate::checksum::key_xor(keys_for_xor.iter().copied()),
+        payload_hash: crate::checksum::payload_hash(
+            row_bytes_for_hash.iter().map(|v| v.as_slice()),
+        ),
+    };
+
     Ok(crate::report::Checksum {
         rows: rows_count,
         version_sum,
         payload_bytes,
         content_hash: format!("{:x}", hasher.finalize()),
         index_consistency,
+        dataset: Some(dataset),
     })
 }
 

@@ -19,6 +19,14 @@ pub struct Checksum {
     pub payload_bytes: i64,
     pub content_hash: String,
     pub index_consistency: BTreeMap<String, String>,
+    /// Lane INT: deterministic three-axis dataset fingerprint
+    /// (`row_count` / `key_xor` / `payload_hash`). Replaces the old
+    /// `MAX(k)` / `COUNT(*)` placeholder for the certification manifest's
+    /// `checksums` field with something that surfaces row drift,
+    /// key drift, and value drift independently. Optional so older
+    /// JSONL records still round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<crate::checksum::DatasetChecksum>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
