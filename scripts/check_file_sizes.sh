@@ -7,7 +7,7 @@ status=0
 
 while IFS= read -r file; do
   case "$file" in
-    docs/archive/*|target/*)
+    docs/archive/*|paper/figs/*.eps|target/*)
       continue
       ;;
   esac
