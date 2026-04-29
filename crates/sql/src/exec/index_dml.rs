@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use redlinedb_kernel::catalog::{
-    EncodedIndexKey, IndexDef, IndexKeySource, SortDir, TableDef, encode_index_key,
+    EncodedIndexKey, IndexDef, IndexId, IndexKeySource, SortDir, TableDef, encode_index_key,
 };
 use redlinedb_kernel::engine::{Engine, Txn};
 use redlinedb_kernel::format::{PageGeneration, PageId, RowId, TuplePtr};
@@ -24,6 +24,58 @@ use redlinedb_kernel::index::{BtreeIndex, IndexRowRef, UniqueKeyGuard};
 
 use crate::error::Result;
 use crate::value::SqlValue;
+
+/// One per-tx index mutation, recorded so SQL-side rollback can replay the
+/// inverse and restore the index pages. The kernel does not undo physical
+/// index mutations on rollback (insert_tx/delete_mark_tx flip durable bytes
+/// on the leaf page), so without this log a rolled-back DELETE would hide
+/// committed rows from indexed reads and a rolled-back INSERT could leak a
+/// stale unique-conflict witness.
+#[derive(Debug, Clone)]
+pub enum IndexUndoOp {
+    /// `insert_tx` was issued; rollback inverts it via a dead-marking pass.
+    Insert {
+        index_id: IndexId,
+        key: Vec<u8>,
+        row: IndexRowRef,
+    },
+    /// `delete_mark_tx` was issued; rollback inverts it via the new
+    /// `undelete_mark_tx` (re-clears the dead flag).
+    DeleteMark {
+        index_id: IndexId,
+        key: Vec<u8>,
+        row: IndexRowRef,
+    },
+}
+
+impl IndexUndoOp {
+    /// Apply the inverse of this op against the live index handle. Errors are
+    /// returned to the caller — index undo runs while the transaction is
+    /// still live, so a failure here surfaces as a rollback error.
+    pub fn replay_inverse(&self, engine: &Engine, tx: &Txn) -> Result<()> {
+        match self {
+            IndexUndoOp::Insert {
+                index_id,
+                key,
+                row,
+            } => {
+                if let Some(handle) = engine.index_handle(*index_id) {
+                    handle.delete_mark_tx(tx.id(), key, *row)?;
+                }
+            }
+            IndexUndoOp::DeleteMark {
+                index_id,
+                key,
+                row,
+            } => {
+                if let Some(handle) = engine.index_handle(*index_id) {
+                    handle.undelete_mark_tx(tx.id(), key, *row)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// The result of building an index key for one row's values. `contains_null`
 /// reports whether any leading-key part was NULL, which lets callers honor
@@ -82,16 +134,19 @@ pub(crate) fn synthetic_row_ref(rowid: RowId) -> IndexRowRef {
 /// (used by UPDATE so a row's own existing entry is not a self-conflict).
 ///
 /// The kernel `UniqueKeyGuard` is acquired before the lookup so concurrent
-/// writers serialize against this key; the caller drops the guard once the
-/// caller's transaction commits or rolls back. SQLite NULL parity is the
-/// caller's responsibility — this routine only runs when the key has no
-/// NULL parts.
-pub(crate) fn probe_unique_for_conflict<'a>(
-    handle: &'a BtreeIndex,
+/// writers serialize against this key; callers MUST keep the guard alive
+/// until either the heap+index inserts complete (so the durable index entry
+/// becomes the conflict witness) or the SQL transaction commits/rolls back.
+/// Dropping the guard between probe and insert reopens the original race —
+/// two writers both saw "no duplicate" and both committed two rows for the
+/// same UNIQUE key. SQLite NULL parity is the caller's responsibility — this
+/// routine only runs when the key has no NULL parts.
+pub(crate) fn probe_unique_for_conflict(
+    handle: &BtreeIndex,
     tx: &Txn,
     skip_rowid: Option<RowId>,
     key: &BuiltIndexKey,
-) -> Result<(UniqueKeyGuard<'a>, Option<RowId>)> {
+) -> Result<(UniqueKeyGuard, Option<RowId>)> {
     let guard = handle.lock_unique_key(tx.id().0, &key.bytes)?;
     let rows = handle.point_lookup(&key.bytes)?;
     for row in rows {
@@ -107,21 +162,31 @@ pub(crate) fn probe_unique_for_conflict<'a>(
 /// the heap insert so a heap-side failure aborts cleanly; the kernel rolls
 /// both back via WAL replay if a crash hits between the heap insert and
 /// these index inserts (recovery atomicity).
+///
+/// Each successful kernel `insert_tx` is recorded in `undo_log` so SQL-side
+/// rollback can replay the inverse (delete-mark) and restore the index pages.
 pub(crate) fn maintain_indexes_on_insert(
     engine: &Engine,
     tx: &Txn,
     table: &TableDef,
     values: &[SqlValue],
     rowid: RowId,
+    undo_log: &mut Vec<IndexUndoOp>,
 ) -> Result<()> {
     for index in &table.indexes {
         let Some(handle) = open_index_handle(engine, index) else {
             continue;
         };
         let key = build_index_key(index, values);
+        let row_ref = synthetic_row_ref(rowid);
         // SQLite NULL parity for unique indexes: NULL key parts are not
         // duplicates, so we still insert them but never block on conflict.
-        handle.insert_tx(tx.id(), &key.bytes, synthetic_row_ref(rowid))?;
+        handle.insert_tx(tx.id(), &key.bytes, row_ref)?;
+        undo_log.push(IndexUndoOp::Insert {
+            index_id: index.index_id,
+            key: key.bytes,
+            row: row_ref,
+        });
     }
     Ok(())
 }
@@ -134,13 +199,20 @@ pub(crate) fn maintain_indexes_on_delete(
     table: &TableDef,
     old_values: &[SqlValue],
     rowid: RowId,
+    undo_log: &mut Vec<IndexUndoOp>,
 ) -> Result<()> {
     for index in &table.indexes {
         let Some(handle) = open_index_handle(engine, index) else {
             continue;
         };
         let key = build_index_key(index, old_values);
-        handle.delete_mark_tx(tx.id(), &key.bytes, synthetic_row_ref(rowid))?;
+        let row_ref = synthetic_row_ref(rowid);
+        handle.delete_mark_tx(tx.id(), &key.bytes, row_ref)?;
+        undo_log.push(IndexUndoOp::DeleteMark {
+            index_id: index.index_id,
+            key: key.bytes,
+            row: row_ref,
+        });
     }
     Ok(())
 }
@@ -156,6 +228,7 @@ pub(crate) fn maintain_indexes_on_update(
     new_values: &[SqlValue],
     old_rowid: RowId,
     new_rowid: RowId,
+    undo_log: &mut Vec<IndexUndoOp>,
 ) -> Result<()> {
     for index in &table.indexes {
         let Some(handle) = open_index_handle(engine, index) else {
@@ -169,8 +242,20 @@ pub(crate) fn maintain_indexes_on_update(
         if old_key.bytes == new_key.bytes && old_rowid == new_rowid {
             continue;
         }
-        handle.delete_mark_tx(tx.id(), &old_key.bytes, synthetic_row_ref(old_rowid))?;
-        handle.insert_tx(tx.id(), &new_key.bytes, synthetic_row_ref(new_rowid))?;
+        let old_row = synthetic_row_ref(old_rowid);
+        let new_row = synthetic_row_ref(new_rowid);
+        handle.delete_mark_tx(tx.id(), &old_key.bytes, old_row)?;
+        undo_log.push(IndexUndoOp::DeleteMark {
+            index_id: index.index_id,
+            key: old_key.bytes,
+            row: old_row,
+        });
+        handle.insert_tx(tx.id(), &new_key.bytes, new_row)?;
+        undo_log.push(IndexUndoOp::Insert {
+            index_id: index.index_id,
+            key: new_key.bytes,
+            row: new_row,
+        });
     }
     Ok(())
 }

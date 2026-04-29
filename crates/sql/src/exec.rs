@@ -34,7 +34,7 @@ use crate::value::{SqlValue, canonicalize, compare_values, is_truthy};
 mod expr;
 use expr::*;
 pub(crate) mod index_access;
-mod index_dml;
+pub(crate) mod index_dml;
 mod tail;
 use tail::*;
 
@@ -289,18 +289,48 @@ fn with_write_tx<T>(
             match result {
                 Ok(value) => {
                     let commit_result = conn.engine().commit(tx);
+                    session.index_undo.clear();
+                    session.kernel_unique_guards.clear();
                     session.unique_guards.clear();
                     commit_result?;
                     Ok(value)
                 }
                 Err(err) => {
+                    // SQL DML mutates physical index pages immediately
+                    // (insert_tx / delete_mark_tx are not MVCC-aware), so
+                    // the kernel rollback alone leaves stale entries
+                    // visible. Replay the inverse of every recorded index
+                    // op against the still-live tx BEFORE we ask the
+                    // engine to abort it; that lets the inverses ride the
+                    // same WAL records and the in-memory page state ends
+                    // at the inverse's view (no entry visible).
+                    replay_index_undo(conn.engine(), session, &mut tx);
                     let _ = conn.engine().rollback(tx);
+                    session.kernel_unique_guards.clear();
                     session.unique_guards.clear();
                     Err(err)
                 }
             }
         }
     })
+}
+
+/// Drain `session.index_undo` and replay each op's inverse against the live
+/// `tx`. Errors from the inverse path are best-effort: if undelete_mark or
+/// the inverse delete-mark fails we fall through to the normal rollback —
+/// the caller's transaction is already on the error path. Each replayed op
+/// is dropped from the log regardless of outcome.
+pub(crate) fn replay_index_undo(
+    engine: &redlinedb_kernel::engine::Engine,
+    session: &mut SessionState,
+    tx: &mut Txn,
+) {
+    let ops = std::mem::take(&mut session.index_undo);
+    for op in ops.into_iter().rev() {
+        // Replay inverses in reverse order: a tx that did insert(A) then
+        // delete_mark(A) must un-delete_mark(A) first, then delete-mark(A).
+        let _ = op.replay_inverse(engine, tx);
+    }
 }
 
 pub(crate) fn finalize_runtime(conn: &Connection, runtime: &mut RuntimeState) -> Result<()> {

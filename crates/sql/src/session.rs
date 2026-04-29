@@ -5,6 +5,9 @@ use std::time::Duration;
 use redlinedb_kernel::engine::Txn;
 use redlinedb_kernel::error::Error as KernelError;
 use redlinedb_kernel::format::RowId;
+use redlinedb_kernel::index::UniqueKeyGuard as KernelUniqueKeyGuard;
+
+use crate::exec::index_dml::IndexUndoOp;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BeginMode {
@@ -22,6 +25,17 @@ pub struct SessionState {
     pub foreign_keys: bool,
     pub last_insert_rowid: Option<i64>,
     pub unique_guards: Vec<UniqueKeyGuard>,
+    /// Kernel-level unique-key reservations held until end-of-transaction.
+    /// We must keep these alive across the heap insert AND the SQL-side
+    /// commit/rollback to close the probe-then-insert race; dropping them
+    /// inside the SQL `collect_unique_conflicts` helper reopened the race
+    /// (two writers both saw "no duplicate" and both committed).
+    pub kernel_unique_guards: Vec<KernelUniqueKeyGuard>,
+    /// Per-tx index-mutation log used to reverse SQL DML index writes when
+    /// the surrounding transaction rolls back. Each successful index probe
+    /// pushes one [`IndexUndoOp`]; on rollback we replay the inverse, on
+    /// commit we just drop the log.
+    pub index_undo: Vec<IndexUndoOp>,
 }
 
 impl SessionState {
@@ -34,6 +48,8 @@ impl SessionState {
         self.foreign_keys = false;
         self.last_insert_rowid = None;
         self.unique_guards.clear();
+        self.kernel_unique_guards.clear();
+        self.index_undo.clear();
     }
 }
 

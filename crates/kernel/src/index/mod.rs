@@ -122,8 +122,12 @@ struct UniqueKeyLockState {
     depth: usize,
 }
 
-pub struct UniqueKeyGuard<'a> {
-    table: &'a UniqueKeyLockTable,
+/// Owns its lock table via `Arc` so the guard can be stored across SQL-side
+/// transaction state (e.g. inside `SessionState`) without lifetime gymnastics.
+/// The guard's `Drop` releases the per-key reservation for `owner`.
+#[derive(Debug)]
+pub struct UniqueKeyGuard {
+    table: Arc<UniqueKeyLockTable>,
     shard: usize,
     key: Vec<u8>,
     owner: u64,
@@ -144,7 +148,7 @@ impl UniqueKeyLockTable {
         }
     }
 
-    pub fn lock(&self, key: &[u8], owner: u64) -> Result<UniqueKeyGuard<'_>> {
+    pub fn lock(self: &Arc<Self>, key: &[u8], owner: u64) -> Result<UniqueKeyGuard> {
         let shard = self.shard(key);
         let mut map = self.shards[shard]
             .lock()
@@ -157,7 +161,7 @@ impl UniqueKeyLockTable {
                     state.owner = Some(owner);
                     state.depth = 1;
                     return Ok(UniqueKeyGuard {
-                        table: self,
+                        table: Arc::clone(self),
                         shard,
                         key,
                         owner,
@@ -166,7 +170,7 @@ impl UniqueKeyLockTable {
                 Some(current) if current == owner => {
                     state.depth += 1;
                     return Ok(UniqueKeyGuard {
-                        table: self,
+                        table: Arc::clone(self),
                         shard,
                         key,
                         owner,
@@ -204,7 +208,7 @@ impl UniqueKeyLockTable {
     }
 }
 
-impl Drop for UniqueKeyGuard<'_> {
+impl Drop for UniqueKeyGuard {
     fn drop(&mut self) {
         self.table
             .unlock(self.shard, std::mem::take(&mut self.key), self.owner);
@@ -596,7 +600,7 @@ impl BtreeIndex {
         Ok(())
     }
 
-    pub fn lock_unique_key(&self, owner: u64, logical_key: &[u8]) -> Result<UniqueKeyGuard<'_>> {
+    pub fn lock_unique_key(&self, owner: u64, logical_key: &[u8]) -> Result<UniqueKeyGuard> {
         self.inner.unique_locks.lock(logical_key, owner)
     }
 
