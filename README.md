@@ -37,22 +37,21 @@ RedlineDB is a ground-up rewrite in safe Rust that keeps the SQLite API contract
 
 ## Bench headlines
 
-The headline numbers below are the mean of five repetitions per cell on **xbabe1 (128 vCPU, Linux 6.8, ext4, Docker 29.2.1, Rust 1.95.0, SQLite via rusqlite 0.37 bundled)**, strict durability, mid-1700-child cert matrix, manifest hashed and reproducible.
+The headline numbers below are from the **`phase10-xbabe1-certified`** run (median of five reps per cell on **xbabe1: 128 vCPU, Linux 6.8, ext4, Docker 29.2.1, Rust 1.95.0, SQLite via rusqlite bundled**, strict durability, ~1700-child cert matrix, manifest hashed and reproducible).
 
-| Workload | Threads | RedlineDB qps | SQLite qps | **Ratio** |
-|---|---:|---:|---:|---:|
-| writers-disjoint | 64 | **656** | 79 | **8.32×** |
-| mixed-80/20 OLTP | 64 | **3,270** | 408 | **8.01×** |
-| mixed-95/5 OLTP | 64 | **13,037** | 1,646 | **7.92×** |
-| mixed-50/50 OLTP | 64 | **1,283** | 162 | **7.90×** |
-| point-read-pk | 4 | **14,716** | 1,959 | **7.51×** |
-| mixed-95/5 OLTP | 32 | 8,578 | 1,361 | **6.30×** |
-| point-read-pk | 128 | 52,478 | 48,056 | 1.09× |
-| point-read-pk | 64 | 122,049 | 122,689 | 0.99× |
-| hot-row-update | 64 | 17 | 79 | 0.21× |
-| secondary-index-range | 64 | 1,363 | 118,416 | 0.012× |
+| Workload | Threads | RedlineDB qps | SQLite qps | **Phase-10 Ratio** | Phase-9 |
+|---|---:|---:|---:|---:|---:|
+| writers-disjoint | 64 | **1,256** | 79 | **15.89×** | 8.32× |
+| mixed-95/5 OLTP | 64 | **24,763** | 1,680 | **14.74×** | 7.92× |
+| mixed-80/20 OLTP | 64 | **6,154** | 405 | **15.21×** | 8.01× |
+| mixed-50/50 OLTP | 64 | **2,483** | 160 | **15.55×** | 7.90× |
+| point-read-pk | 64 | 121,268 | 122,221 | 0.99× (parity) | 0.99× |
+| point-read-pk | 32 | 32,611 | 23,371 | 1.40× | — |
+| hot-row-update | 64 | 35 | 79 | 0.44× | 0.21× |
+| secondary-index-range | 64 | 5,598 | 117,088 | 0.048× | 0.012× |
+| secondary-index-read | 64 | 16,245 | 121,030 | 0.13× | — |
 
-**Reading the table.** Where Redline scales, it scales hard: 7–8× SQLite on every mixed-OLTP point at 32–64 threads, parity at 64-thread point reads, and a slight edge at 128. Where it trails — single-row hot contention and large range scans — it trails honestly and visibly. The bench harness emits the full cell × engine × thread × repetition grid; we publish the wins **and** the losses.
+**Reading the table.** Phase 10's MVCC index format and the SQL-side index-undo removal **roughly doubled** the contended-write headlines vs phase-9: writers-disjoint goes 8.32× → **15.89×**, and the three mixed-OLTP cells move from 7.9–8.0× into the 14.7–15.6× band. The two contention-bound losses also improve (hot-row-update 0.21× → 0.44×, range scan 0.012× → 0.048×) but still trail SQLite — those are honest engineering items, not headline material. Point-read-pk at 64 threads holds parity (0.99×) where the SQLite reader path is already near-optimal.
 
 ### Throughput vs threads
 
